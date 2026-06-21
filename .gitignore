@@ -1,0 +1,11 @@
+# Ignore everything by default
+*
+
+# Keep this file and the source tree
+!.gitignore
+!src/
+!src/**
+
+# Allow git metadata to remain visible locally
+!.git/
+!.git/**
