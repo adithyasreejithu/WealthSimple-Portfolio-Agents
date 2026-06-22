@@ -3,5 +3,8 @@
 
 # Keep the ignore file itself and the source tree.
 !.gitignore
+!instructions.md
 !src/
 !src/**
+!docs/
+!docs/**
