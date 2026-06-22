@@ -1,0 +1,6 @@
+pandas
+pdfplumber
+camelot-py
+opencv-python
+keyring
+pyotp
