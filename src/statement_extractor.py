@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -35,6 +36,7 @@ MONEY_AT_END_PATTERN = re.compile(
 )
 GLOSSARY_ENTRY_PATTERN = re.compile(r"^(?P<code>[A-Z0-9]+)\s+-\s+(?P<description>.+)$")
 DEFAULT_DATA_FOLDER = Path(__file__).resolve().parents[1] / "Data"
+DEFAULT_EXPORT_FOLDER = Path(__file__).resolve().parents[1] / "exports"
 
 logger = get_logger(__name__)
 
@@ -403,6 +405,17 @@ def extract_folder(folder: Path | str, include_glossary: bool = False) -> tuple[
     return transactions.reset_index(drop=True), glossary.reset_index(drop=True)
 
 
+def export_run_csv(data: pd.DataFrame, export_folder: Path | str = DEFAULT_EXPORT_FOLDER) -> Path:
+    export_folder = Path(export_folder)
+    export_folder.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    export_path = export_folder / f"statement_transactions_{timestamp}.csv"
+    data.to_csv(export_path, index=False)
+    logger.info("Exported statement transactions | file=%s | rows=%d", export_path, len(data))
+    return export_path
+
+
 def camelot_extraction_pipeline(file: Path) -> pd.DataFrame:
     return extract_statement_pdf(file)
 
@@ -411,6 +424,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract Wealthsimple PDF statement activity.")
     parser.add_argument("--folder", type=Path, default=DEFAULT_DATA_FOLDER)
     parser.add_argument("--include-glossary", action="store_true")
+    parser.add_argument("--export", action="store_true", help="Write this run's transaction data to exports/*.csv.")
+    parser.add_argument("--export-folder", type=Path, default=DEFAULT_EXPORT_FOLDER)
     return parser.parse_args()
 
 
@@ -423,6 +438,9 @@ def main() -> None:
     if args.include_glossary:
         print("\nStatement code glossary:")
         print(glossary.to_string(index=False))
+    if args.export:
+        export_path = export_run_csv(transactions, args.export_folder)
+        print(f"\nExported transactions to {export_path}")
 
 
 if __name__ == "__main__":
