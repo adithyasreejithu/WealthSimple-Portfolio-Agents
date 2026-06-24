@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -14,6 +15,10 @@ EXPORT_FOLDER = BASE_DIR / "exports"
 DEFAULT_DATA_FOLDER = DATA_FOLDER
 DEFAULT_EXPORT_FOLDER = EXPORT_FOLDER
 LOG_FOLDER = BASE_DIR / "logs"
+DATABASE_PATH = Path(
+    os.getenv("DB_PATH", str(DATA_FOLDER / "PRD_WealthSimple.duckdb"))
+).expanduser()
+DATABASE_SCHEMA_VERSION = 2
 
 """
 Logging config used by `system_logger.py`.
@@ -116,16 +121,25 @@ REQUIRED_COLUMNS = {
     "commission",
     "net_cash_amount",
 }
-DROP_COLUMNS = {"account_id", "account_type", "activity_sub_type", "direction", "symbol", "name"}
+ACTIVITY_EXPORT_COLUMNS = [
+    "transaction_date",
+    "settlement_date",
+    "account_id",
+    "account_type",
+    "activity_type",
+    "activity_sub_type",
+    "direction",
+    "symbol",
+    "name",
+    "currency",
+    "quantity",
+    "unit_price",
+    "commission",
+    "net_cash_amount",
+]
+DROP_COLUMNS: set[str] = set()
 COLUMN_RENAMES = {
-    "transaction_date": "Transaction Date",
-    "settlement_date": "Settlement Date",
-    "activity_type": "Activity Type",
-    "currency": "Currency",
-    "quantity": "Quantity",
-    "unit_price": "Unit Price",
-    "commission": "Commission",
-    "net_cash_amount": "Net Cash Amount",
+    column: column for column in ACTIVITY_EXPORT_COLUMNS
 }
 ACTIVITY_TYPE_MAPPING = {
     "MoneyMovement": "CONT",
