@@ -12,14 +12,10 @@ import database
 class AppPipelineTest(unittest.TestCase):
     def setUp(self):
         database.close_connection()
-        self.temp_dir = tempfile.TemporaryDirectory(
-            dir=Path(__file__).resolve().parent
-        )
-        self.data_dir = Path(self.temp_dir.name)
+        self.data_dir = Path(tempfile.mkdtemp(dir=Path.cwd()))
 
     def tearDown(self):
         database.close_connection()
-        self.temp_dir.cleanup()
 
     def test_rename_monthly_documents_only_renames_pdf(self):
         pdf = self.data_dir / "Wealthsimple account statement 2025-04 final.pdf"
@@ -72,6 +68,56 @@ class AppPipelineTest(unittest.TestCase):
         ).execute("SELECT source_type FROM staged_files ORDER BY file_sequence").fetchall()]
         self.assertEqual(staged_order, ["statement", "email", "export"])
         self.assertTrue(result.succeeded)
+
+    def test_analytics_command_prints_report(self):
+        report = {
+            "portfolio_value": 1234,
+            "cash": {"balance": 250, "source": "explicit_balance"},
+            "holdings": [
+                {
+                    "ticker_symbol": "AAPL",
+                    "exchange": "NASDAQ",
+                    "quantity": 3,
+                    "market_value": 984,
+                }
+            ],
+        }
+
+        with patch.object(app, "run_analytics", return_value=report), patch(
+            "sys.stdout.write"
+        ) as write:
+            output = app.main(["analytics", "--database", str(self.data_dir / "db.duckdb")])
+
+        self.assertEqual(output, 0)
+        printed = "".join(call.args[0] for call in write.call_args_list)
+        self.assertIn("Portfolio Analytics", printed)
+        self.assertIn("Cash source     : explicit_balance", printed)
+        self.assertIn("Positions", printed)
+        self.assertIn("AAPL", printed)
+        self.assertIn("NASDAQ", printed)
+        self.assertIn("3.00", printed)
+        self.assertIn("984.00", printed)
+
+    def test_analytics_command_exports_json(self):
+        report = {
+            "portfolio_value": 1234,
+            "cash": {"balance": 250, "source": "explicit_balance"},
+            "holdings": [],
+        }
+
+        with patch.object(app, "run_analytics", return_value=report), patch(
+            "sys.stdout.write"
+        ) as write:
+            output = app.main([
+                "analytics",
+                "--export",
+                "--database",
+                str(self.data_dir / "db.duckdb"),
+            ])
+
+        self.assertEqual(output, 0)
+        printed = "".join(call.args[0] for call in write.call_args_list)
+        self.assertIn('"portfolio_value": 1234', printed)
 
 
 if __name__ == "__main__":

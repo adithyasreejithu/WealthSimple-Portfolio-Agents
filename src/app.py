@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 
@@ -21,6 +23,7 @@ from database_command import (
     upload_email_transactions,
     upload_statement_transactions,
 )
+from analytics import portfolio_report
 from email_extractor import fetch_email_transactions
 from statement_extractor import extract_statement_pdf
 from staging import (
@@ -506,11 +509,115 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _print_portfolio_report(report: dict[str, object]) -> None:
+    def _format_value(value: object) -> str:
+        if isinstance(value, (int, float, Decimal)):
+            return f"{value:,.2f}"
+        return str(value)
+
+    def _section_title(title: str) -> None:
+        print()
+        print(title)
+        print("-" * len(title))
+
+    print("Portfolio Analytics")
+    print("=" * len("Portfolio Analytics"))
+    print(f"Portfolio value : {_format_value(report['portfolio_value'])}")
+
+    cash = report["cash"]
+    if isinstance(cash, dict):
+        print(f"Cash balance    : {_format_value(cash.get('balance', 0))}")
+        print(f"Cash source     : {cash.get('source', 'unknown')}")
+
+    holdings = report.get("holdings", [])
+    print(f"Holdings        : {len(holdings)}")
+
+    if not holdings:
+        _section_title("Positions")
+        print("No open positions.")
+        return
+
+    _section_title("Positions")
+    headers = ("Ticker", "Exchange", "Quantity", "Market Value")
+    rows: list[tuple[str, str, str, str]] = []
+    for holding in holdings:
+        if isinstance(holding, dict):
+            rows.append(
+                (
+                    str(holding.get("ticker_symbol", "")),
+                    str(holding.get("exchange", "")),
+                    _format_value(holding.get("quantity", 0)),
+                    _format_value(holding.get("market_value", 0)),
+                )
+            )
+
+    if not rows:
+        print("No open positions.")
+        return
+
+    widths = [
+        max(len(headers[0]), *(len(row[0]) for row in rows)),
+        max(len(headers[1]), *(len(row[1]) for row in rows)),
+        max(len(headers[2]), *(len(row[2]) for row in rows)),
+        max(len(headers[3]), *(len(row[3]) for row in rows)),
+    ]
+    header_line = (
+        f"{headers[0]:<{widths[0]}}  "
+        f"{headers[1]:<{widths[1]}}  "
+        f"{headers[2]:>{widths[2]}}  "
+        f"{headers[3]:>{widths[3]}}"
+    )
+    print(header_line)
+    print(
+        f"{'-' * widths[0]}  {'-' * widths[1]}  {'-' * widths[2]}  {'-' * widths[3]}"
+    )
+    for ticker, exchange, quantity, market_value in rows:
+        print(
+            f"{ticker:<{widths[0]}}  "
+            f"{exchange:<{widths[1]}}  "
+            f"{quantity:>{widths[2]}}  "
+            f"{market_value:>{widths[3]}}"
+        )
+
+
+def _json_default(value: object) -> object:
+    if isinstance(value, (date, Path)):
+        return str(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _print_portfolio_report_json(report: dict[str, object]) -> None:
+    print(json.dumps(report, default=_json_default, indent=2, sort_keys=True))
+
+
+def run_analytics(db_path: Path | str = DATABASE_PATH) -> dict[str, object]:
+    """Return the current read-only analytics report."""
+    initialize_database(db_path)
+    return portfolio_report(db_path)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     if raw_args and raw_args[0] == "ticker-map":
         from ticker_mapping import main as ticker_mapping_main
         return ticker_mapping_main(raw_args[1:])
+    if raw_args and raw_args[0] == "analytics":
+        parser = argparse.ArgumentParser(description="Show a read-only portfolio analytics report.")
+        parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+        parser.add_argument("--export", action="store_true", help="Export the report as JSON.")
+        args = parser.parse_args(raw_args[1:])
+        try:
+            report = run_analytics(args.database)
+        except Exception:
+            logger.exception("Analytics report failed")
+            return 1
+        if args.export:
+            _print_portfolio_report_json(report)
+        else:
+            _print_portfolio_report(report)
+        return 0
     args = parse_args(raw_args)
     try:
         result = run_pipeline(args.source, args.data_folder, args.database)
