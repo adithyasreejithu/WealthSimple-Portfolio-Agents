@@ -21,6 +21,11 @@ REQUIRED_TABLES = frozenset(
         "tickers",
         "stock_details",
         "etf_details",
+        "ticker_provider_mappings",
+        "ticker_symbol_history",
+        "ingestion_batches",
+        "staged_files",
+        "staged_records",
         "transactions",
         "cash_transactions",
         "historical_records",
@@ -140,6 +145,8 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
                 ticker_symbol VARCHAR NOT NULL,
                 exchange VARCHAR NOT NULL,
                 currency VARCHAR(10) NOT NULL,
+                financial_currency VARCHAR(10),
+                contains_fx_rate VARCHAR(3),
                 security_name VARCHAR NOT NULL,
                 security_type VARCHAR NOT NULL,
                 CHECK (ticker_symbol = UPPER(TRIM(ticker_symbol))),
@@ -171,6 +178,104 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
                 top_holdings JSON,
                 sector_weights JSON,
                 FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE ticker_provider_mappings (
+                ticker_id BIGINT NOT NULL,
+                provider VARCHAR NOT NULL,
+                provider_symbol VARCHAR NOT NULL,
+                verification_status VARCHAR NOT NULL,
+                mapping_source VARCHAR NOT NULL DEFAULT 'automatic',
+                effective_from DATE,
+                effective_to DATE,
+                reason VARCHAR,
+                created_by VARCHAR NOT NULL DEFAULT 'pipeline',
+                verified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ticker_id, provider),
+                UNIQUE (provider, provider_symbol),
+                FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id),
+                CHECK (provider = LOWER(TRIM(provider))),
+                CHECK (provider_symbol = UPPER(TRIM(provider_symbol)))
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE ticker_symbol_history (
+                ticker_id BIGINT NOT NULL,
+                source_symbol VARCHAR NOT NULL,
+                provider_symbol VARCHAR NOT NULL,
+                currency VARCHAR(10),
+                exchange VARCHAR,
+                effective_from DATE,
+                effective_to DATE,
+                reason VARCHAR NOT NULL,
+                mapping_source VARCHAR NOT NULL,
+                created_by VARCHAR NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id),
+                UNIQUE (source_symbol, currency, effective_from)
+            )
+            """
+        )
+        connection.execute("CREATE SEQUENCE ingestion_batch_id_sequence START 1")
+        connection.execute(
+            """
+            CREATE TABLE ingestion_batches (
+                batch_id BIGINT PRIMARY KEY DEFAULT nextval('ingestion_batch_id_sequence'),
+                started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                status VARCHAR NOT NULL,
+                error_message VARCHAR
+            )
+            """
+        )
+        connection.execute("CREATE SEQUENCE staged_file_id_sequence START 1")
+        connection.execute(
+            """
+            CREATE TABLE staged_files (
+                staged_file_id BIGINT PRIMARY KEY DEFAULT nextval('staged_file_id_sequence'),
+                batch_id BIGINT NOT NULL,
+                source_type VARCHAR NOT NULL,
+                source_path VARCHAR,
+                source_hash VARCHAR NOT NULL,
+                file_sequence INTEGER NOT NULL,
+                status VARCHAR NOT NULL,
+                error_message VARCHAR,
+                staged_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                published_at TIMESTAMP,
+                FOREIGN KEY (batch_id) REFERENCES ingestion_batches(batch_id),
+                UNIQUE (batch_id, file_sequence)
+            )
+            """
+        )
+        connection.execute("CREATE SEQUENCE staged_record_id_sequence START 1")
+        connection.execute(
+            """
+            CREATE TABLE staged_records (
+                staged_record_id BIGINT PRIMARY KEY DEFAULT nextval('staged_record_id_sequence'),
+                staged_file_id BIGINT NOT NULL,
+                record_sequence INTEGER NOT NULL,
+                transaction_date DATE,
+                transaction_type VARCHAR,
+                source_symbol VARCHAR,
+                security_name VARCHAR,
+                fx_rate DECIMAL(18, 8),
+                contains_fx_rate VARCHAR(3),
+                price_currency VARCHAR(10),
+                inferred_listing_currency VARCHAR(10),
+                listing_evidence VARCHAR,
+                ticker_id BIGINT,
+                resolution_method VARCHAR,
+                resolution_status VARCHAR NOT NULL DEFAULT 'pending',
+                raw_payload JSON NOT NULL,
+                normalized_payload JSON NOT NULL,
+                FOREIGN KEY (staged_file_id) REFERENCES staged_files(staged_file_id),
+                FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id),
+                UNIQUE (staged_file_id, record_sequence)
             )
             """
         )
@@ -391,6 +496,191 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
             return False
 
         existing_tables = _get_table_names(connection)
+        if "schema_metadata" in existing_tables:
+            row = connection.execute(
+                "SELECT schema_version FROM schema_metadata WHERE component = ?",
+                [SCHEMA_COMPONENT],
+            ).fetchone()
+            if row and row[0] == 2:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    connection.execute(
+                        """
+                        CREATE TABLE ticker_provider_mappings (
+                            ticker_id BIGINT NOT NULL,
+                            provider VARCHAR NOT NULL,
+                            provider_symbol VARCHAR NOT NULL,
+                            verification_status VARCHAR NOT NULL,
+                            verified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (ticker_id, provider),
+                            UNIQUE (provider, provider_symbol),
+                            FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id),
+                            CHECK (provider = LOWER(TRIM(provider))),
+                            CHECK (provider_symbol = UPPER(TRIM(provider_symbol)))
+                        )
+                        """
+                    )
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [3, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 2 failed")
+                    raise
+                logger.info("Database migrated from schema version 2 to 3")
+                row = (3,)
+            if row and row[0] == 3:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    for definition in (
+                        "mapping_source VARCHAR DEFAULT 'automatic'",
+                        "effective_from DATE",
+                        "effective_to DATE",
+                        "reason VARCHAR",
+                        "created_by VARCHAR DEFAULT 'pipeline'",
+                    ):
+                        connection.execute(f"ALTER TABLE ticker_provider_mappings ADD COLUMN {definition}")
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS ticker_symbol_history (
+                            ticker_id BIGINT NOT NULL, source_symbol VARCHAR NOT NULL,
+                            provider_symbol VARCHAR NOT NULL, currency VARCHAR(10), exchange VARCHAR,
+                            effective_from DATE, effective_to DATE, reason VARCHAR NOT NULL,
+                            mapping_source VARCHAR NOT NULL, created_by VARCHAR NOT NULL,
+                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id),
+                            UNIQUE (source_symbol, currency, effective_from)
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO ticker_symbol_history (
+                            ticker_id, source_symbol, provider_symbol, currency, exchange,
+                            reason, mapping_source, created_by
+                        )
+                        SELECT t.ticker_id, t.ticker_symbol, m.provider_symbol, t.currency,
+                               t.exchange, 'migrated provider mapping', 'migration', 'schema-v4'
+                        FROM ticker_provider_mappings m JOIN tickers t USING (ticker_id)
+                        """
+                    )
+                    connection.execute("CREATE SEQUENCE IF NOT EXISTS ingestion_batch_id_sequence START 1")
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS ingestion_batches (
+                            batch_id BIGINT PRIMARY KEY DEFAULT nextval('ingestion_batch_id_sequence'),
+                            started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            completed_at TIMESTAMP, status VARCHAR NOT NULL, error_message VARCHAR
+                        )
+                        """
+                    )
+                    connection.execute("CREATE SEQUENCE IF NOT EXISTS staged_file_id_sequence START 1")
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS staged_files (
+                            staged_file_id BIGINT PRIMARY KEY DEFAULT nextval('staged_file_id_sequence'),
+                            batch_id BIGINT NOT NULL, source_type VARCHAR NOT NULL, source_path VARCHAR,
+                            source_hash VARCHAR NOT NULL, file_sequence INTEGER NOT NULL,
+                            status VARCHAR NOT NULL, error_message VARCHAR,
+                            staged_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, published_at TIMESTAMP,
+                            FOREIGN KEY (batch_id) REFERENCES ingestion_batches(batch_id),
+                            UNIQUE (batch_id, file_sequence)
+                        )
+                        """
+                    )
+                    connection.execute("CREATE SEQUENCE IF NOT EXISTS staged_record_id_sequence START 1")
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS staged_records (
+                            staged_record_id BIGINT PRIMARY KEY DEFAULT nextval('staged_record_id_sequence'),
+                            staged_file_id BIGINT NOT NULL, record_sequence INTEGER NOT NULL,
+                            transaction_date DATE, transaction_type VARCHAR, source_symbol VARCHAR,
+                            security_name VARCHAR, fx_rate DECIMAL(18,8), price_currency VARCHAR(10),
+                            ticker_id BIGINT, resolution_method VARCHAR,
+                            resolution_status VARCHAR NOT NULL DEFAULT 'pending',
+                            raw_payload JSON NOT NULL, normalized_payload JSON NOT NULL,
+                            FOREIGN KEY (staged_file_id) REFERENCES staged_files(staged_file_id),
+                            FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id),
+                            UNIQUE (staged_file_id, record_sequence)
+                        )
+                        """
+                    )
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 3 failed")
+                    raise
+                logger.info("Database migrated from schema version 3 to %d", DATABASE_SCHEMA_VERSION)
+                row = (4,)
+            if row and row[0] == 4:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    connection.execute("ALTER TABLE tickers ADD COLUMN IF NOT EXISTS financial_currency VARCHAR(10)")
+                    connection.execute("ALTER TABLE staged_records ADD COLUMN IF NOT EXISTS inferred_listing_currency VARCHAR(10)")
+                    connection.execute("ALTER TABLE staged_records ADD COLUMN IF NOT EXISTS listing_evidence VARCHAR")
+                    connection.execute(
+                        """
+                        UPDATE tickers SET currency = 'CAD'
+                        WHERE ticker_id IN (
+                            SELECT ticker_id FROM ticker_provider_mappings
+                            WHERE provider_symbol LIKE '%.TO'
+                               OR provider_symbol LIKE '%.V'
+                               OR provider_symbol LIKE '%.CN'
+                               OR provider_symbol LIKE '%.NE'
+                        )
+                        """
+                    )
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 4 failed")
+                    raise
+                logger.info("Database migrated from schema version 4 to %d", DATABASE_SCHEMA_VERSION)
+                row = (5,)
+            if row and row[0] == 5:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    connection.execute(
+                        "ALTER TABLE staged_records ADD COLUMN IF NOT EXISTS contains_fx_rate VARCHAR(3)"
+                    )
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 5 failed")
+                    raise
+                logger.info("Database migrated from schema version 5 to %d", DATABASE_SCHEMA_VERSION)
+                row = (6,)
+            if row and row[0] == 6:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    connection.execute(
+                        "ALTER TABLE tickers ADD COLUMN IF NOT EXISTS contains_fx_rate VARCHAR(3)"
+                    )
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 6 failed")
+                    raise
+                logger.info("Database migrated from schema version 6 to %d", DATABASE_SCHEMA_VERSION)
+                return False
         if existing_tables:
             raise RuntimeError(
                 "Database contains an incomplete or incompatible schema. "

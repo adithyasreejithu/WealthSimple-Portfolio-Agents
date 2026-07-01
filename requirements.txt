@@ -4,3 +4,8 @@ camelot-py
 opencv-python
 keyring
 pyotp
+python-dotenv
+imap-tools
+yfinance
+curl_cffi
+duckdb

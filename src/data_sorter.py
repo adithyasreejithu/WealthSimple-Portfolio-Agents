@@ -32,7 +32,9 @@ from config import (
     SOURCE_PREFIX,
 )
 from database import get_shared_connection, initialize_database
+from database_command import SecurityFetcher, ensure_tickers
 from system_logger import get_logger
+from ticker_pipeline import base_ticker_symbol, listing_currency_from_fx
 
 logger = get_logger(__name__)
 
@@ -233,7 +235,7 @@ def _resolve_ticker_id(
     row: dict[str, str],
     candidates: dict[str, list[dict[str, Any]]],
 ) -> tuple[int | None, str | None]:
-    symbol = row["symbol"].strip().upper()
+    symbol = base_ticker_symbol(row["symbol"])
     if not symbol:
         return None, None
 
@@ -254,16 +256,6 @@ def _resolve_ticker_id(
             return int(name_matches[0]["ticker_id"]), None
         if name_matches:
             matches = name_matches
-
-    source_currency = row["currency"].strip().upper()
-    if source_currency:
-        currency_matches = [
-            candidate
-            for candidate in matches
-            if candidate["currency"].strip().upper() == source_currency
-        ]
-        if len(currency_matches) == 1:
-            return int(currency_matches[0]["ticker_id"]), None
 
     exchanges = ", ".join(sorted(candidate["exchange"] for candidate in matches))
     return None, f"Symbol {symbol} is ambiguous across exchanges: {exchanges}"
@@ -499,6 +491,9 @@ def sort_data(
     source_file: Path | None = None,
     data_dir: Path | None = None,
     db_path: Path | str = DATABASE_PATH,
+    enrich_tickers: bool = False,
+    ticker_fetcher: SecurityFetcher | None = None,
+    processed_dir: Path | None = None,
 ) -> SortResult:
     """Import one full activity export and archive it after successful publication."""
     base_dir = Path(__file__).resolve().parents[1]
@@ -513,6 +508,9 @@ def sort_data(
         )
 
     ensure_csv_file(source_file)
+    resolved_processed_dir = processed_dir or (
+        resolved_data_dir / PROCESSED_FOLDER_NAME
+    )
     rows = _read_source_rows(source_file)
     if not rows:
         raise ValueError("CSV contains no data rows")
@@ -548,7 +546,7 @@ def sort_data(
             connection.execute("COMMIT")
             processed_path = move_to_processed_folder(
                 source_file,
-                resolved_data_dir / PROCESSED_FOLDER_NAME,
+                resolved_processed_dir,
             )
             return SortResult(
                 source_file=source_file,
@@ -596,6 +594,22 @@ def sort_data(
             )
             _insert_raw_rows(connection, import_id, rows)
 
+        if enrich_tickers:
+            ticker_hints = [
+                {
+                    "symbol": base_ticker_symbol(row["symbol"]),
+                    "currency": listing_currency_from_fx(False),
+                    "name": row["name"],
+                }
+                for row in rows
+                if row["symbol"]
+            ]
+            ensure_tickers(
+                ticker_hints,
+                db_path,
+                **({"fetcher": ticker_fetcher} if ticker_fetcher is not None else {}),
+                require_all=False,
+            )
         candidates = _ticker_candidates(connection)
         normalized_rows: list[dict[str, Any]] = []
         unresolved_rows: list[dict[str, Any]] = []
@@ -677,7 +691,7 @@ def sort_data(
 
     processed_path = move_to_processed_folder(
         source_file,
-        resolved_data_dir / PROCESSED_FOLDER_NAME,
+        resolved_processed_dir,
     )
     dataframe = pd.DataFrame(normalized_rows)
     logger.info(
@@ -703,7 +717,7 @@ def sort_data(
 
 def main() -> None:
     try:
-        result = sort_data()
+        result = sort_data(enrich_tickers=True)
         print(f"Import status: {result.status}")
         print(f"Import ID: {result.import_id}")
         print(f"Normalized rows: {result.rows_written}")

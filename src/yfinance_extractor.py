@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import re
 import os
 import tempfile
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
@@ -13,6 +16,7 @@ import pandas as pd
 
 from config import (
     YFINANCE_CANADIAN_SUFFIX,
+    YFINANCE_CANADIAN_SUFFIXES,
     YFINANCE_DOWNLOAD_AUTO_ADJUST,
     YFINANCE_DOWNLOAD_GROUP_BY,
     YFINANCE_DOWNLOAD_THREADS,
@@ -22,6 +26,7 @@ from config import (
     YFINANCE_RETRY_QUOTE_TYPES,
     YFINANCE_SESSION_IMPERSONATE,
     YFINANCE_STOCK_INFO_COLUMNS,
+    YFINANCE_SYMBOL_OVERRIDES,
 )
 from system_logger import get_logger
 
@@ -41,6 +46,27 @@ ETF_INFO_COLUMNS = YFINANCE_ETF_INFO_COLUMNS
 HISTORY_COLUMNS = YFINANCE_HISTORY_COLUMNS
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class TickerHint:
+    symbol: str
+    currency: str = ""
+    name: str = ""
+
+
+def _normalize_hint(value: str | TickerHint | dict[str, Any]) -> TickerHint:
+    if isinstance(value, TickerHint):
+        hint = value
+    elif isinstance(value, dict):
+        hint = TickerHint(
+            str(value.get("symbol") or value.get("ticker") or ""),
+            str(value.get("currency") or ""),
+            str(value.get("name") or value.get("company_name") or ""),
+        )
+    else:
+        hint = TickerHint(str(value or ""))
+    return TickerHint(hint.symbol.strip().upper(), hint.currency.strip().upper(), hint.name.strip())
 
 
 def _empty_frame(columns: list[str]) -> pd.DataFrame:
@@ -88,45 +114,101 @@ def _safe_getattr(value: object, attr: str) -> object | None:
         return None
 
 
-def _resolve_ticker_info(ticker: str, yf_module: Any, session: object | None) -> tuple[Any, dict[str, Any]] | None:
-    client = _create_ticker(yf_module, ticker, session)
-    info = client.get_info() or {}
-    quote_type = info.get("quoteType")
+def _candidate_symbols(hint: TickerHint) -> list[str]:
+    override = YFINANCE_SYMBOL_OVERRIDES.get((hint.symbol, hint.currency))
+    if override:
+        return [override.upper()]
+    if any(hint.symbol.endswith(suffix) for suffix in YFINANCE_CANADIAN_SUFFIXES):
+        return [hint.symbol]
+    if hint.currency == "CAD":
+        return [f"{hint.symbol}{YFINANCE_CANADIAN_SUFFIX}"]
+    if hint.currency == "USD":
+        return [hint.symbol]
+    # With no listing evidence, use the bare symbol as the portfolio default.
+    return [hint.symbol]
 
-    if quote_type not in YFINANCE_RETRY_QUOTE_TYPES:
-        return client, info
 
-    if ticker.endswith(YFINANCE_CANADIAN_SUFFIX):
+def _valid_candidate(hint: TickerHint, provider_symbol: str, info: dict[str, Any]) -> bool:
+    if info.get("quoteType") in YFINANCE_RETRY_QUOTE_TYPES:
+        return False
+    returned_currency = str(info.get("currency") or "").upper()
+    if hint.currency and returned_currency and returned_currency != hint.currency:
+        return False
+    if not returned_currency and not hint.currency:
+        return False
+    if hint.currency == "CAD" and provider_symbol == hint.symbol and returned_currency != "CAD":
+        return False
+    if info.get("quoteType") not in {"EQUITY", "ETF"}:
+        return False
+    provider_name = info.get("longName") or info.get("shortName")
+    if hint.name and not provider_name:
+        return False
+    if hint.name and provider_name:
+        normalize = lambda value: re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+        if SequenceMatcher(None, normalize(hint.name), normalize(provider_name)).ratio() < 0.55:
+            return False
+    exchange = str(info.get("fullExchangeName") or info.get("exchange") or "").upper()
+    if not returned_currency:
+        if not hint.name or not exchange:
+            return False
+        is_canadian_symbol = any(provider_symbol.endswith(suffix) for suffix in YFINANCE_CANADIAN_SUFFIXES)
+        if hint.currency == "CAD" and not is_canadian_symbol:
+            return False
+        if hint.currency == "USD" and is_canadian_symbol:
+            return False
+    expected_exchange_tokens = {
+        ".TO": ("TORONTO", "TSX"),
+        ".V": ("VENTURE", "TSXV"),
+        ".CN": ("CANADIAN", "CSE"),
+        ".NE": ("NEO", "CBOE"),
+    }
+    for suffix, tokens in expected_exchange_tokens.items():
+        if provider_symbol.endswith(suffix) and exchange and not any(token in exchange for token in tokens):
+            return False
+    return True
+
+
+def _resolve_ticker_info(
+    ticker: str | TickerHint | dict[str, Any], yf_module: Any, session: object | None
+) -> tuple[Any, dict[str, Any], str] | None:
+    hint = _normalize_hint(ticker)
+    valid: list[tuple[Any, dict[str, Any], str]] = []
+    for provider_symbol in _candidate_symbols(hint):
+        client = _create_ticker(yf_module, provider_symbol, session)
+        info = client.get_info() or {}
+        if _valid_candidate(hint, provider_symbol, info):
+            valid.append((client, info, provider_symbol))
+    if len(valid) != 1:
+        logger.warning(
+            "Ticker resolution is %s | ticker=%s | currency=%s | matches=%s",
+            "ambiguous" if valid else "unresolved",
+            hint.symbol,
+            hint.currency,
+            ",".join(item[2] for item in valid),
+        )
         return None
-
-    fallback_ticker = f"{ticker}{YFINANCE_CANADIAN_SUFFIX}"
-    fallback_client = _create_ticker(yf_module, fallback_ticker, session)
-    fallback_info = fallback_client.get_info() or {}
-    fallback_quote_type = fallback_info.get("quoteType")
-    if fallback_quote_type in YFINANCE_RETRY_QUOTE_TYPES:
-        logger.warning("No usable yfinance quote type found for %s or %s", ticker, fallback_ticker)
-        return None
-
-    logger.debug("Resolved %s with yfinance fallback ticker %s", ticker, fallback_ticker)
-    return fallback_client, fallback_info
+    return valid[0]
 
 
-def _fetch_one_security_info(ticker: str, yf_module: Any, session: object | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def _fetch_one_security_info(ticker: str | TickerHint | dict[str, Any], yf_module: Any, session: object | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     try:
+        hint = _normalize_hint(ticker)
         resolved = _resolve_ticker_info(ticker, yf_module, session)
         if resolved is None:
             return None, None
 
-        client, info = resolved
+        client, info, provider_symbol = resolved
         quote_type = info.get("quoteType")
         if quote_type == "EQUITY":
             return (
                 {
-                    "ticker": ticker,
-                    "company_name": info.get("longName"),
+                    "ticker": hint.symbol,
+                    "provider_symbol": provider_symbol,
+                    "company_name": info.get("longName") or info.get("shortName") or hint.name,
                     "asset": quote_type,
                     "exchange": info.get("fullExchangeName"),
-                    "currency": info.get("financialCurrency") or info.get("currency"),
+                    "currency": info.get("currency") or hint.currency or None,
+                    "financial_currency": info.get("financialCurrency"),
                     "sector": info.get("sector"),
                     "industry": info.get("industry"),
                 },
@@ -138,9 +220,12 @@ def _fetch_one_security_info(ticker: str, yf_module: Any, session: object | None
             return (
                 None,
                 {
-                    "ticker": ticker,
-                    "company_name": info.get("longName"),
-                    "currency": info.get("financialCurrency") or info.get("currency"),
+                    "ticker": hint.symbol,
+                    "provider_symbol": provider_symbol,
+                    "company_name": info.get("longName") or info.get("shortName") or hint.name,
+                    "exchange": info.get("fullExchangeName"),
+                    "currency": info.get("currency") or hint.currency or None,
+                    "financial_currency": info.get("financialCurrency"),
                     "fund_family": info.get("fundFamily"),
                     "asset": info.get("category") or info.get("fundCategory"),
                     "yield": info.get("yield"),
@@ -159,9 +244,16 @@ def _fetch_one_security_info(ticker: str, yf_module: Any, session: object | None
         return None, None
 
 
-def fetch_security_info(tickers: Iterable[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    normalized_tickers = _normalize_tickers(tickers)
-    if not normalized_tickers:
+def fetch_security_info(tickers: Iterable[str | TickerHint | dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    normalized_hints = []
+    seen = set()
+    for value in tickers:
+        hint = _normalize_hint(value)
+        key = (hint.symbol, hint.currency, hint.name)
+        if hint.symbol and key not in seen:
+            normalized_hints.append(hint)
+            seen.add(key)
+    if not normalized_hints:
         logger.info("No tickers provided for yfinance security info fetch")
         return _empty_frame(STOCK_INFO_COLUMNS), _empty_frame(ETF_INFO_COLUMNS)
 
@@ -170,9 +262,9 @@ def fetch_security_info(tickers: Iterable[str]) -> tuple[pd.DataFrame, pd.DataFr
     stock_records: list[dict[str, Any]] = []
     etf_records: list[dict[str, Any]] = []
 
-    worker_count = min(YFINANCE_MAX_WORKERS, len(normalized_tickers))
+    worker_count = min(YFINANCE_MAX_WORKERS, len(normalized_hints))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        results = list(executor.map(lambda ticker: _fetch_one_security_info(ticker, yf_module, session), normalized_tickers))
+        results = list(executor.map(lambda ticker: _fetch_one_security_info(ticker, yf_module, session), normalized_hints))
 
     for stock_record, etf_record in results:
         if stock_record is not None:
@@ -182,7 +274,7 @@ def fetch_security_info(tickers: Iterable[str]) -> tuple[pd.DataFrame, pd.DataFr
 
     logger.info(
         "YFinance security info fetch complete | tickers=%d | stocks=%d | etfs=%d",
-        len(normalized_tickers),
+        len(normalized_hints),
         len(stock_records),
         len(etf_records),
     )

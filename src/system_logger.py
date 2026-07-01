@@ -3,15 +3,9 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
+from config import DATE_FORMAT, LOG_FORMAT, LOG_PATH
 
-LOG_PATH = Path(__file__).resolve().parents[1] / "logs" / "SystemLogs.txt"
-LOG_FORMAT = (
-    "%(asctime)s.%(msecs)03d | %(levelname)-8s | pid=%(process)d | "
-    "%(name)s:%(funcName)s:%(lineno)d | %(message)s"
-)
-DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def get_logger(name: str) -> logging.Logger:

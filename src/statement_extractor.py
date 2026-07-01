@@ -8,35 +8,22 @@ from typing import Iterable
 
 import pandas as pd
 
+from config import (
+    ACTIVITY_HEADING,
+    DATE_CODE_PATTERN,
+    DEFAULT_DATA_FOLDER as CONFIG_DEFAULT_DATA_FOLDER,
+    DEFAULT_EXPORT_FOLDER as CONFIG_DEFAULT_EXPORT_FOLDER,
+    FUTURE_SETTLEMENT_HEADING,
+    GLOSSARY_ENTRY_PATTERN,
+    GLOSSARY_HEADING,
+    MONEY_AT_END_PATTERN,
+    STATEMENT_OUTPUT_COLUMNS,
+)
 from system_logger import get_logger
 
-
-ACTIVITY_HEADING = "Activity - Current period"
-FUTURE_SETTLEMENT_HEADING = "Transactions for Future Settlement"
-GLOSSARY_HEADING = "Information about Statement Codes"
-OUTPUT_COLUMNS = [
-    "date",
-    "transaction",
-    "ticker_id",
-    "quantity",
-    "execDate",
-    "fx_rate",
-    "debit",
-    "credit",
-    "balance",
-    "statement_code",
-    "description",
-]
-DATE_CODE_PATTERN = re.compile(r"^\s*(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<code>[A-Z0-9]+)\b")
-MONEY_AT_END_PATTERN = re.compile(
-    r"^(?P<prefix>.*?)\s+"
-    r"(?P<debit>\$[\d,]+\.\d{2})\s+"
-    r"(?P<credit>\$[\d,]+\.\d{2})\s+"
-    r"(?P<balance>\$[\d,]+\.\d{2})\s*$"
-)
-GLOSSARY_ENTRY_PATTERN = re.compile(r"^(?P<code>[A-Z0-9]+)\s+-\s+(?P<description>.+)$")
-DEFAULT_DATA_FOLDER = Path(__file__).resolve().parents[1] / "Data"
-DEFAULT_EXPORT_FOLDER = Path(__file__).resolve().parents[1] / "exports"
+OUTPUT_COLUMNS = STATEMENT_OUTPUT_COLUMNS
+DEFAULT_DATA_FOLDER = CONFIG_DEFAULT_DATA_FOLDER
+DEFAULT_EXPORT_FOLDER = CONFIG_DEFAULT_EXPORT_FOLDER
 
 logger = get_logger(__name__)
 
@@ -92,7 +79,6 @@ def trim_activity_table(df: pd.DataFrame) -> pd.DataFrame:
 
     if start_index is None:
         return rows.iloc[0:0].copy()
-
     return rows.iloc[start_index:stop_index].reset_index(drop=True)
 
 
@@ -376,9 +362,7 @@ def extract_statement_glossary_pdf(file: Path) -> pd.DataFrame:
         logger.info("Reading glossary page %s from %s", page, file.name)
         tables.extend(camelot.read_pdf(str(file), pages=page, flavor="stream"))
 
-    glossary = extract_glossary_from_tables(tables)
-    logger.info("Glossary extraction complete | file=%s | rows=%d", file.name, len(glossary))
-    return glossary
+    return extract_glossary_from_tables(tables)
 
 
 def extract_folder(folder: Path | str, include_glossary: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:

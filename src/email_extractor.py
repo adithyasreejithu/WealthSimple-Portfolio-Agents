@@ -10,6 +10,14 @@ import pandas as pd
 from dotenv import load_dotenv
 from imap_tools import AND, OR, MailBox
 
+from config import (
+    EMAIL_OUTPUT_COLUMNS,
+    EXPORT_FOLDER,
+    INTERAC_SENDER,
+    INTERAC_SUBJECT_PATTERN,
+    WEALTHSIMPLE_DATE_PATTERNS,
+    WEALTHSIMPLE_SENDERS,
+)
 from system_logger import get_logger
 
 
@@ -22,40 +30,12 @@ load_dotenv()
 GMAIL = os.getenv("GMAIL_USER")
 PASS = os.getenv("GMAIL_PASS")
 DEFAULT_START_DATE = os.getenv("START_DATE")
-DEFAULT_EXPORT_FOLDER = Path(__file__).resolve().parents[1] / "exports"
+DEFAULT_EXPORT_FOLDER = EXPORT_FOLDER
 
 """
 Define the combined output contract that both email sources normalize into.
 """
-OUTPUT_COLUMNS = [
-    "account",
-    "transaction",
-    "ticker_id",
-    "ticker",
-    "quantity",
-    "avg_price",
-    "total_cost",
-    "debit",
-    "date",
-]
-
-"""
-Keep the Wealthsimple sender list and subject matching rules in one place.
-"""
-WEALTHSIMPLE_SENDERS = (
-    "support@wealthsimple.com",
-    "notifications@o.wealthsimple.com",
-)
-
-"""
-Keep the Interac sender and strict subject pattern aligned with the
-existing reference script.
-"""
-INTERAC_SENDER = "catch@payments.interac.ca"
-INTERAC_SUBJECT_PATTERN = re.compile(
-    r"^Interac e-Transfer:\s*ADITHYA SREEJITHU PANICKER\b",
-    flags=re.IGNORECASE,
-)
+OUTPUT_COLUMNS = EMAIL_OUTPUT_COLUMNS
 
 logger = get_logger(__name__)
 
@@ -94,19 +74,7 @@ Read Wealthsimple order dates from the different labels used across order
 email variants such as market buys, limit buys, and filled orders.
 """
 def extract_wealthsimple_date(text: str) -> date | None:
-    patterns = [
-        r"Time:\s*(.+)",
-        r"Filled at:\s*(.+)",
-        r"Placed at:\s*(.+)",
-        r"Submitted at:\s*(.+)",
-        r"Executed at:\s*(.+)",
-        r"Order date:\s*(.+)",
-        r"Date:\s*(.+)",
-        r"([A-Z][a-z]{2,8}\s+\d{1,2},\s+\d{4}(?:,\s+\d{1,2}:\d{2}\s*(?:AM|PM))?)",
-        r"(\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
-    ]
-
-    for pattern in patterns:
+    for pattern in WEALTHSIMPLE_DATE_PATTERNS:
         value = extract_first(pattern, text)
         if not value:
             continue
@@ -125,6 +93,7 @@ def resolve_email_date(parsed_date: date | None, received_date: date | None, sou
     if parsed_date is not None:
         return parsed_date
     if received_date is not None:
+        logger.debug("Using received-date fallback for %s email", source_name)
         return received_date
     logger.warning("No date could be resolved for %s email", source_name)
     return ""
@@ -170,6 +139,13 @@ def parse_wealthsimple_email(email: str, subject: str, received_date: date | Non
     try:
         parsed_date = extract_wealthsimple_date(text)
         transaction = "Dividend" if wealthsimple_subject_type(subject) == "dividend" else extract_first(r"Type:\s*(.+)", text)
+        if not transaction:
+            logger.warning("Parsed Wealthsimple email without transaction type | subject=%s", subject)
+        currency_match = re.search(r"(?:Average price|Total cost|Amount):\s*(US\$|CA\$)", text, flags=re.IGNORECASE)
+        price_currency = (
+            "USD" if currency_match and currency_match.group(1).upper() == "US$"
+            else "CAD" if currency_match else ""
+        )
         row = {
             "account": extract_first(r"Account:\s*(.+)", text) or "",
             "transaction": transaction or "",
@@ -180,6 +156,7 @@ def parse_wealthsimple_email(email: str, subject: str, received_date: date | Non
             "total_cost": extract_first(r"Total cost:\s*(?:US\$|\$)?(.+)", text) or "",
             "debit": extract_first(r"Amount:\s*(?:CA\$|US\$|\$)?(\d+(?:\.\d{1,2})?)", text) or "",
             "date": resolve_email_date(parsed_date, received_date, "Wealthsimple"),
+            "price_currency": price_currency,
         }
         logger.debug(
             "Parsed Wealthsimple email | transaction=%s | ticker=%s | quantity=%s | date=%s",
@@ -252,6 +229,7 @@ def parse_interac_email(email: str, subject: str = "", received_date: date | Non
             "total_cost": "",
             "debit": extract_interac_money(text),
             "date": resolve_email_date(extract_interac_date(text), received_date, "Interac"),
+            "price_currency": "",
         }
         logger.debug("Parsed Interac email | debit=%s | date=%s", row["debit"], row["date"])
         return pd.DataFrame([row], columns=OUTPUT_COLUMNS)
@@ -271,6 +249,8 @@ def fetch_email_transactions(
     normalized_start = start_date if start_date is not None else normalize_start_date(DEFAULT_START_DATE)
     if normalized_start is None:
         logger.info("No email start date configured yet; reading all matching emails")
+    else:
+        logger.info("Resolved email start date to %s", normalized_start)
 
     own_mailbox = mailbox is None
     if own_mailbox:
@@ -280,6 +260,10 @@ def fetch_email_transactions(
         mailbox.login(GMAIL, PASS, "Inbox")
 
     rows: list[pd.DataFrame] = []
+    wealthsimple_messages_seen = 0
+    wealthsimple_rows_added = 0
+    interac_messages_seen = 0
+    interac_rows_added = 0
 
     try:
         wealthsimple_query_parts: list[object] = [OR(*(AND(from_=sender) for sender in WEALTHSIMPLE_SENDERS))]
@@ -289,6 +273,7 @@ def fetch_email_transactions(
             interac_query_parts.append(AND(date_gte=normalized_start))
 
         for msg in mailbox.fetch(AND(*wealthsimple_query_parts)):
+            wealthsimple_messages_seen += 1
             if not message_from_wealthsimple(msg):
                 continue
             subject = str(getattr(msg, "subject", "") or "")
@@ -298,8 +283,10 @@ def fetch_email_transactions(
             parsed = parse_wealthsimple_email(getattr(msg, "text", "") or "", subject, received_date)
             if parsed is not None:
                 rows.append(parsed)
+                wealthsimple_rows_added += len(parsed)
 
         for msg in mailbox.fetch(AND(*interac_query_parts)):
+            interac_messages_seen += 1
             if not message_from_interac(msg):
                 continue
             if not message_subject_matches_interac(msg):
@@ -308,9 +295,18 @@ def fetch_email_transactions(
             parsed = parse_interac_email(getattr(msg, "text", "") or "", getattr(msg, "subject", "") or "", received_date)
             if parsed is not None:
                 rows.append(parsed)
+                interac_rows_added += len(parsed)
     finally:
         if own_mailbox:
             mailbox.logout()
+
+    logger.info(
+        "Email fetch summary | wealthsimple_messages=%d | wealthsimple_rows=%d | interac_messages=%d | interac_rows=%d",
+        wealthsimple_messages_seen,
+        wealthsimple_rows_added,
+        interac_messages_seen,
+        interac_rows_added,
+    )
 
     if not rows:
         logger.info("Combined email extraction complete | rows=0")
@@ -363,19 +359,29 @@ def parse_args() -> argparse.Namespace:
 Print the full combined dataset at the end of each run for visibility.
 """
 def main() -> None:
-    args = parse_args()
-    start_date = normalize_start_date(args.date_from)
-    data = fetch_email_transactions(start_date=start_date)
+    try:
+        args = parse_args()
+        logger.info(
+            "Running email extractor CLI | date_from=%s | export=%s",
+            args.date_from,
+            args.export,
+        )
+        start_date = normalize_start_date(args.date_from)
+        data = fetch_email_transactions(start_date=start_date)
+        logger.info("Email extractor produced %d row(s) before print/export", len(data))
 
-    if data.empty:
-        print("No matching emails found.")
-        return
+        if data.empty:
+            print("No matching emails found.")
+            return
 
-    print("Email transactions:")
-    print(data.to_string(index=False))
-    if args.export:
-        export_path = export_run_csv(data, args.export_folder)
-        print(f"\nExported email transactions to {export_path}")
+        print("Email transactions:")
+        print(data.to_string(index=False))
+        if args.export:
+            export_path = export_run_csv(data, args.export_folder)
+            print(f"\nExported email transactions to {export_path}")
+    except Exception:
+        logger.exception("Email extractor failed")
+        raise
 
 
 if __name__ == "__main__":

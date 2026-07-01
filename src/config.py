@@ -18,7 +18,7 @@ LOG_FOLDER = BASE_DIR / "logs"
 DATABASE_PATH = Path(
     os.getenv("DB_PATH", str(DATA_FOLDER / "PRD_WealthSimple.duckdb"))
 ).expanduser()
-DATABASE_SCHEMA_VERSION = 2
+DATABASE_SCHEMA_VERSION = 7
 
 """
 Logging config used by `system_logger.py`.
@@ -43,6 +43,7 @@ EMAIL_OUTPUT_COLUMNS = [
     "total_cost",
     "debit",
     "date",
+    "price_currency",
 ]
 
 WEALTHSIMPLE_SENDERS = (
@@ -152,17 +153,22 @@ YFinance extractor config used by `yfinance_extractor.py`.
 """
 YFINANCE_STOCK_INFO_COLUMNS = [
     "ticker",
+    "provider_symbol",
     "company_name",
     "asset",
     "exchange",
     "currency",
+    "financial_currency",
     "sector",
     "industry",
 ]
 YFINANCE_ETF_INFO_COLUMNS = [
     "ticker",
+    "provider_symbol",
     "company_name",
+    "exchange",
     "currency",
+    "financial_currency",
     "fund_family",
     "asset",
     "yield",
@@ -184,6 +190,10 @@ YFINANCE_HISTORY_COLUMNS = [
 ]
 YFINANCE_RETRY_QUOTE_TYPES = ("ECNQUOTE", None)
 YFINANCE_CANADIAN_SUFFIX = ".TO"
+YFINANCE_CANADIAN_SUFFIXES = (".TO", ".V", ".CN", ".NE")
+# Explicit provider aliases take precedence over saved and automatically resolved
+# mappings. Keys are (canonical Wealthsimple symbol, source currency).
+YFINANCE_SYMBOL_OVERRIDES: dict[tuple[str, str], str] = {}
 YFINANCE_MAX_WORKERS = 10
 YFINANCE_SESSION_IMPERSONATE = "chrome"
 YFINANCE_DOWNLOAD_AUTO_ADJUST = False

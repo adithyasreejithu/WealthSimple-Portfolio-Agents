@@ -1,8 +1,12 @@
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
 from statement_extractor import (
+    OUTPUT_COLUMNS,
+    export_run_csv,
     extract_glossary_from_tables,
     merge_wrapped_activity_rows,
     parse_activity_rows,
@@ -88,6 +92,35 @@ class StatementExtractorTest(unittest.TestCase):
         self.assertEqual(list(glossary.columns), ["code", "description"])
         self.assertEqual(glossary.set_index("code").loc["BUY", "description"], "Purchase of assets")
         self.assertEqual(glossary.set_index("code").loc["LOAN", "description"], "Stocks on loan account")
+
+    def test_export_run_csv_creates_exports_folder_and_writes_current_run_data(self):
+        data = pd.DataFrame(
+            [
+                {
+                    "date": "2025-04-02",
+                    "transaction": "BUY",
+                    "ticker_id": "SPLG",
+                    "quantity": "0.0029",
+                    "execDate": "2025-04-01",
+                    "fx_rate": "1.4664",
+                    "debit": "$0.28",
+                    "credit": "$0.00",
+                    "balance": "$17.52",
+                    "statement_code": "BUY",
+                    "description": "SPDR Portfolio S&P 500 ETF",
+                }
+            ],
+            columns=OUTPUT_COLUMNS,
+        )
+        export_folder = Path("exports")
+
+        with patch.object(pd.DataFrame, "to_csv") as to_csv:
+            export_path = export_run_csv(data, export_folder)
+
+        self.assertTrue(export_path.name.startswith("statement_transactions_"))
+        self.assertEqual(export_path.suffix, ".csv")
+        self.assertEqual(export_path.parent, export_folder)
+        to_csv.assert_called_once_with(export_path, index=False)
 
 
 if __name__ == "__main__":
