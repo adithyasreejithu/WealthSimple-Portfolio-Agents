@@ -11,6 +11,9 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## What We Were Doing
 
+- Consolidated every user-facing command under `src/app.py` while preserving the
+  standalone module entry points.
+- Added a CLI reference and durable documentation/comment-update rules.
 - Consolidated the Wealthsimple PDF statement extraction refactor into one flat runtime file.
 - Removed the Camelot package folder and separate run script from `src/`.
 - Removed the old extracted Camelot reference folder.
@@ -25,6 +28,11 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## Current State
 
+- `src/app.py` is the canonical CLI and exposes `pipeline`, `analytics`,
+  `statements`, `email`, `yfinance`, `ticker-map`, and `import-activities`.
+- Legacy top-level pipeline flags and direct module commands remain compatible.
+- `docs/reference/cli.md` is the command reference and must be updated with CLI changes.
+- This handover is the context file and must be updated after repository-changing tasks.
 - The sorter reads `Data/activities-export-*.csv`.
 - Trailing footer rows are trimmed before processing.
 - Every source field is stored in `raw_activity_exports`.
@@ -64,6 +72,7 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## Important Files
 
+- `src/app.py`
 - `src/data_sorter.py`
 - `src/statement_extractor.py`
 - `src/email_extractor.py`
@@ -72,12 +81,13 @@ Use this document when signing off, clearing context, or resuming work after a b
 - `tests/test_statement_extractor.py`
 - `tests/test_email_extractor.py`
 - `tests/test_yfinance_extractor.py`
-- `docs/SuccessCritera.md`
-- `docs/camelot_extraction_refactor_plan.md`
-- `docs/email_extraction_success_criteria.md`
-- `docs/email_extraction_plan.md`
-- `docs/yfinance_success_criteria.md`
-- `docs/TODO.md`
+- `docs/criteria/camelot_extraction_refactor.md`
+- `docs/plans/camelot_extraction_refactor.md`
+- `docs/criteria/email_extraction.md`
+- `docs/plans/email_extraction.md`
+- `docs/criteria/yfinance_integration.md`
+- `docs/project/todo.md`
+- `docs/reference/cli.md`
 - `instructions.md`
 
 ## Known Constraints
@@ -97,17 +107,23 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## Last Completed Work
 
+- Added canonical `app.py` subcommands for all user-facing runtime features.
+- Kept existing direct extractor, sorter, yfinance, and ticker-mapping commands as wrappers.
+- Added optional argument forwarding and consistent success exit codes to delegated CLIs.
+- Added `docs/reference/cli.md` and linked it from the documentation index.
+- Updated `instructions.md` with feature-comment, CLI-reference, and handover-update rules.
+- Added focused tests for command dispatch, root help, pipeline forwarding, and failures.
 - Added `src/email_extractor.py` as the flat runtime for combined Wealthsimple and Interac email extraction.
 - Added opt-in CSV export to the email extractor and kept statement export in `src/statement_extractor.py`.
 - Tightened email date parsing for non-dividend order emails and kept received-date fallback when no in-email date exists.
 - Added focused email tests in `tests/test_email_extractor.py`.
-- Added email docs in `docs/email_extraction_plan.md`, `docs/email_extraction_success_criteria.md`, and `docs/TODO.md`.
+- Added email docs in `docs/plans/email_extraction.md`, `docs/criteria/email_extraction.md`, and `docs/project/todo.md`.
 - Removed the legacy `email_export/` folder.
 - Expanded balanced stage-level logging across `src/data_sorter.py`, `src/statement_extractor.py`, and `src/email_extractor.py`.
 - Updated `instructions.md` so new runtime code under `src/` should include logger setup by default.
 - Added `src/yfinance_extractor.py` for dataframe-returning stock metadata, ETF metadata, and historical OHLCV fetches.
 - Added mocked yfinance tests in `tests/test_yfinance_extractor.py`.
-- Added `docs/yfinance_success_criteria.md`.
+- Added `docs/criteria/yfinance_integration.md`.
 - Removed the legacy `extracted_yfinance_method/` folder.
 
 ## Open Checks Before Resuming
@@ -128,6 +144,9 @@ Use this document when signing off, clearing context, or resuming work after a b
 ## Last Verification Commands
 
 ```powershell
+$env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m unittest tests.test_app
+$env:PYTHONPATH='src'; .\.venv\Scripts\python.exe src\app.py --help
+$env:PYTHONPATH='src'; .\.venv\Scripts\python.exe src\app.py <command> --help
 $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m unittest discover -s tests -p 'test*.py'
 $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m unittest discover -s tests -p 'test_email_extractor.py'
 $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe src\statement_extractor.py --help
@@ -138,6 +157,12 @@ $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe src\email_extractor.py
 $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe src\email_extractor.py --export
 $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m unittest discover -s tests -p 'test_yfinance_extractor.py'
 ```
+
+Focused CLI and compatibility verification passed all 46 tests. The full suite ran 82 tests with 77 passing and
+5 failures in existing analytics/data-sorter expectations: one reconstructed
+holding quantity assertion and four activity-import ticker/deduplication assertions.
+Those test files were already modified before this CLI task and the failures are
+outside the command-dispatch changes.
 
 ## Sign-Off Checklist
 

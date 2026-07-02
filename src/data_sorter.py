@@ -7,6 +7,7 @@ normalized column names and reference securities through `ticker_id`.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import hashlib
 import json
@@ -715,9 +716,35 @@ def sort_data(
     )
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse direct activity-import options for app and standalone use."""
+    parser = argparse.ArgumentParser(
+        description="Import a Wealthsimple activity export into the database."
+    )
+    parser.add_argument("--source-file", type=Path)
+    parser.add_argument("--data-folder", type=Path, default=DATA_FOLDER)
+    parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    parser.add_argument("--processed-folder", type=Path)
+    parser.add_argument(
+        "--enrich-tickers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fetch metadata for unresolved tickers (enabled by default).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run one activity import as a standalone or delegated CLI command."""
     try:
-        result = sort_data(enrich_tickers=True)
+        args = parse_args(argv)
+        result = sort_data(
+            source_file=args.source_file,
+            data_dir=args.data_folder,
+            db_path=args.database,
+            enrich_tickers=args.enrich_tickers,
+            processed_dir=args.processed_folder,
+        )
         print(f"Import status: {result.status}")
         print(f"Import ID: {result.import_id}")
         print(f"Normalized rows: {result.rows_written}")
@@ -725,10 +752,11 @@ def main() -> None:
         if not result.unresolved_dataframe.empty:
             print("\nUnresolved tickers:")
             print(result.unresolved_dataframe.to_string(index=False))
+        return 0 if result.status == "succeeded" else 1
     except Exception:
         logger.exception("Sorter failed")
         raise
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -498,6 +498,7 @@ def run_pipeline(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse pipeline options, including the legacy top-level invocation."""
     parser = argparse.ArgumentParser(description="Run the Wealthsimple data pipeline.")
     parser.add_argument(
         "--source",
@@ -507,6 +508,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-folder", type=Path, default=DATA_FOLDER)
     parser.add_argument("--database", type=Path, default=DATABASE_PATH)
     return parser.parse_args(argv)
+
+
+def _print_root_help() -> None:
+    """Show the canonical command catalog while retaining legacy pipeline flags."""
+    parser = argparse.ArgumentParser(
+        description="Run Wealthsimple portfolio pipeline and analysis commands.",
+        epilog=(
+            "Legacy pipeline syntax remains supported: "
+            "python src/app.py --source all"
+        ),
+    )
+    commands = parser.add_subparsers(dest="command", title="commands")
+    commands.add_parser("pipeline", help="Run the staged data pipeline.")
+    commands.add_parser("analytics", help="Show a portfolio analytics report.")
+    commands.add_parser("statements", help="Extract PDF statement activity.")
+    commands.add_parser("email", help="Extract email transactions.")
+    commands.add_parser("yfinance", help="Fetch market metadata and history.")
+    commands.add_parser("ticker-map", help="Manage ticker mappings.")
+    commands.add_parser("import-activities", help="Import one activity export.")
+    parser.print_help()
 
 
 def _print_portfolio_report(report: dict[str, object]) -> None:
@@ -598,27 +619,27 @@ def run_analytics(db_path: Path | str = DATABASE_PATH) -> dict[str, object]:
     return portfolio_report(db_path)
 
 
-def main(argv: list[str] | None = None) -> int:
-    raw_args = list(sys.argv[1:] if argv is None else argv)
-    if raw_args and raw_args[0] == "ticker-map":
-        from ticker_mapping import main as ticker_mapping_main
-        return ticker_mapping_main(raw_args[1:])
-    if raw_args and raw_args[0] == "analytics":
-        parser = argparse.ArgumentParser(description="Show a read-only portfolio analytics report.")
-        parser.add_argument("--database", type=Path, default=DATABASE_PATH)
-        parser.add_argument("--export", action="store_true", help="Export the report as JSON.")
-        args = parser.parse_args(raw_args[1:])
-        try:
-            report = run_analytics(args.database)
-        except Exception:
-            logger.exception("Analytics report failed")
-            return 1
-        if args.export:
-            _print_portfolio_report_json(report)
-        else:
-            _print_portfolio_report(report)
-        return 0
-    args = parse_args(raw_args)
+def _run_analytics_command(argv: list[str]) -> int:
+    """Parse and execute the analytics command independently of pipeline flags."""
+    parser = argparse.ArgumentParser(description="Show a read-only portfolio analytics report.")
+    parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    parser.add_argument("--export", action="store_true", help="Export the report as JSON.")
+    args = parser.parse_args(argv)
+    try:
+        report = run_analytics(args.database)
+    except Exception:
+        logger.exception("Analytics report failed")
+        return 1
+    if args.export:
+        _print_portfolio_report_json(report)
+    else:
+        _print_portfolio_report(report)
+    return 0
+
+
+def _run_pipeline_command(argv: list[str]) -> int:
+    """Run the pipeline for canonical and legacy command forms."""
+    args = parse_args(argv)
     try:
         result = run_pipeline(args.source, args.data_folder, args.database)
     except Exception:
@@ -632,6 +653,46 @@ def main(argv: list[str] | None = None) -> int:
             f"({source_result.rows} row(s)){error_text}"
         )
     return 0 if result.succeeded else 1
+
+
+def _run_delegated_command(command: str, argv: list[str]) -> int:
+    """Run a module-owned command while keeping failures at the app boundary."""
+    delegated_commands = {
+        "statements": ("statement_extractor", "main"),
+        "email": ("email_extractor", "main"),
+        "yfinance": ("yfinance_extractor", "main"),
+        "ticker-map": ("ticker_mapping", "main"),
+        "import-activities": ("data_sorter", "main"),
+    }
+    module_name, function_name = delegated_commands[command]
+    module = __import__(module_name, fromlist=[function_name])
+    command_main = getattr(module, function_name)
+    try:
+        return int(command_main(argv))
+    except Exception:
+        logger.exception("CLI command failed | command=%s", command)
+        return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch every user-facing command from the canonical application entry point."""
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if raw_args in (["--help"], ["-h"]):
+        _print_root_help()
+        return 0
+    if raw_args and raw_args[0] == "pipeline":
+        return _run_pipeline_command(raw_args[1:])
+    if raw_args and raw_args[0] == "analytics":
+        return _run_analytics_command(raw_args[1:])
+
+    # Delegate to module entry points so each command keeps one argument contract.
+    delegated_commands = {
+        "statements", "email", "yfinance", "ticker-map", "import-activities"
+    }
+    if raw_args and raw_args[0] in delegated_commands:
+        return _run_delegated_command(raw_args[0], raw_args[1:])
+
+    return _run_pipeline_command(raw_args)
 
 
 if __name__ == "__main__":

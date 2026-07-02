@@ -8,7 +8,7 @@ Call `initialize_database()` when the future end-to-end process starts.
 
 - A database with the complete current schema and matching schema version is active, so initialization returns without changing data.
 - An empty database is initialized with every table in one transaction.
-- A partial, legacy, or version-mismatched database raises an error. Migration is deferred and tracked in `docs/TODO.md`.
+- A partial, legacy, or version-mismatched database raises an error. Migration is deferred and tracked in the [project TODO](../project/todo.md).
 
 The `schema_metadata` table records the active schema version. Startup also verifies that every required table exists, so metadata alone cannot mark a partial schema as active.
 

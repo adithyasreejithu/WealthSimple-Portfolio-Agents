@@ -1,6 +1,6 @@
 # Camelot Extraction Refactor Success Criteria
 
-Use this checklist to decide whether the Camelot extraction refactor is ready to move forward. The detailed implementation plan lives in `docs/camelot_extraction_refactor_plan.md`.
+Use this checklist to decide whether the Camelot extraction refactor is ready to move forward. The detailed implementation plan is [Camelot Extraction Refactor Plan](../plans/camelot_extraction_refactor.md).
 
 ## Scope
 

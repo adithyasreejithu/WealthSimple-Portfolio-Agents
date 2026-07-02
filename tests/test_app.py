@@ -119,6 +119,64 @@ class AppPipelineTest(unittest.TestCase):
         printed = "".join(call.args[0] for call in write.call_args_list)
         self.assertIn('"portfolio_value": 1234', printed)
 
+    def test_pipeline_subcommand_forwards_pipeline_options(self):
+        result = app.PipelineResult((app.SourceResult("email", None, "skipped"),))
+
+        with patch.object(app, "run_pipeline", return_value=result) as run_pipeline:
+            output = app.main([
+                "pipeline",
+                "--source",
+                "email",
+                "--data-folder",
+                str(self.data_dir),
+                "--database",
+                str(self.data_dir / "db.duckdb"),
+            ])
+
+        self.assertEqual(output, 0)
+        run_pipeline.assert_called_once_with(
+            "email", self.data_dir, self.data_dir / "db.duckdb"
+        )
+
+    def test_app_delegates_feature_subcommands(self):
+        commands = {
+            "statements": "statement_extractor.main",
+            "email": "email_extractor.main",
+            "yfinance": "yfinance_extractor.main",
+            "ticker-map": "ticker_mapping.main",
+            "import-activities": "data_sorter.main",
+        }
+
+        for command, target in commands.items():
+            with self.subTest(command=command), patch(target, return_value=0) as delegated:
+                output = app.main([command, "--help"])
+
+            self.assertEqual(output, 0)
+            delegated.assert_called_once_with(["--help"])
+
+    def test_delegated_command_failure_returns_nonzero(self):
+        with patch("statement_extractor.main", side_effect=RuntimeError("failed")):
+            output = app.main(["statements"])
+
+        self.assertEqual(output, 1)
+
+    def test_root_help_lists_all_user_commands(self):
+        with patch("sys.stdout.write") as write:
+            output = app.main(["--help"])
+
+        self.assertEqual(output, 0)
+        printed = "".join(call.args[0] for call in write.call_args_list)
+        for command in (
+            "pipeline",
+            "analytics",
+            "statements",
+            "email",
+            "yfinance",
+            "ticker-map",
+            "import-activities",
+        ):
+            self.assertIn(command, printed)
+
 
 if __name__ == "__main__":
     unittest.main()

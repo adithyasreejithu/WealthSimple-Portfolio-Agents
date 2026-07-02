@@ -404,17 +404,19 @@ def camelot_extraction_pipeline(file: Path) -> pd.DataFrame:
     return extract_statement_pdf(file)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse statement CLI arguments from a caller or the process command line."""
     parser = argparse.ArgumentParser(description="Extract Wealthsimple PDF statement activity.")
     parser.add_argument("--folder", type=Path, default=DEFAULT_DATA_FOLDER)
     parser.add_argument("--include-glossary", action="store_true")
     parser.add_argument("--export", action="store_true", help="Write this run's transaction data to exports/*.csv.")
     parser.add_argument("--export-folder", type=Path, default=DEFAULT_EXPORT_FOLDER)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    """Run statement extraction as a standalone or delegated CLI command."""
+    args = parse_args(argv)
     transactions, glossary = extract_folder(args.folder, include_glossary=args.include_glossary)
 
     print("Transactions:")
@@ -425,7 +427,8 @@ def main() -> None:
     if args.export:
         export_path = export_run_csv(transactions, args.export_folder)
         print(f"\nExported transactions to {export_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
