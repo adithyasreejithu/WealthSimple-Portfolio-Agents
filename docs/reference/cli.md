@@ -34,9 +34,16 @@ The legacy form `python src/app.py --source all` remains supported.
 ```powershell
 python src/app.py analytics
 python src/app.py analytics --database Data/PRD_WealthSimple.duckdb --export
+python src/app.py analytics --date-from 2025-01-01 --date-to 2025-12-31 --dividend-source email
 ```
 
 - `--database PATH` selects the database.
+- `--date-from YYYY-MM-DD` and `--date-to YYYY-MM-DD` apply inclusive filters
+  to cash-flow, income, fees, realized gains, and risk metrics.
+- `--dividend-source {email,activities,statements}` defaults to `email`.
+- `--cash-flow-source {activities,statements}` defaults to `activities`.
+- `--fx-source {statements,exports,email}` defaults to `statements`; exports and
+  email currently report unavailable because they lack complete FX inputs.
 - `--export` prints JSON instead of the formatted report.
 
 ## Statement Extraction

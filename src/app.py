@@ -553,6 +553,24 @@ def _print_portfolio_report(report: dict[str, object]) -> None:
     holdings = report.get("holdings", [])
     print(f"Holdings        : {len(holdings)}")
 
+    dividends = report.get("dividends", {})
+    fees = report.get("fees", {})
+    cash_flow = report.get("cash_flow", {})
+    if isinstance(dividends, dict):
+        print(f"Dividend source : {dividends.get('source', 'unknown')}")
+        totals = dividends.get("totals_by_currency", {})
+        if isinstance(totals, dict):
+            for currency, amount in sorted(totals.items()):
+                print(f"Dividends {currency:<4} : {_format_value(amount)}")
+    if isinstance(fees, dict) and isinstance(fees.get("fx"), dict):
+        fx = fees["fx"]
+        if fx.get("available"):
+            print(f"Estimated FX fee: {_format_value(fx.get('estimated_fx_fee_cad', 0))} CAD")
+        else:
+            print(f"Estimated FX fee: unavailable for {fx.get('source', 'source')}")
+    if isinstance(cash_flow, dict):
+        print(f"Net contributions: {_format_value(cash_flow.get('net_contributions', 0))}")
+
     if not holdings:
         _section_title("Positions")
         print("No open positions.")
@@ -613,20 +631,53 @@ def _print_portfolio_report_json(report: dict[str, object]) -> None:
     print(json.dumps(report, default=_json_default, indent=2, sort_keys=True))
 
 
-def run_analytics(db_path: Path | str = DATABASE_PATH) -> dict[str, object]:
+def run_analytics(
+    db_path: Path | str = DATABASE_PATH,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    dividend_source: str = "email",
+    cash_flow_source: str = "activities",
+    fx_source: str = "statements",
+) -> dict[str, object]:
     """Return the current read-only analytics report."""
     initialize_database(db_path)
-    return portfolio_report(db_path)
+    return portfolio_report(
+        db_path,
+        date_from=date_from,
+        date_to=date_to,
+        dividend_source=dividend_source,
+        cash_flow_source=cash_flow_source,
+        fx_source=fx_source,
+    )
 
 
 def _run_analytics_command(argv: list[str]) -> int:
     """Parse and execute the analytics command independently of pipeline flags."""
     parser = argparse.ArgumentParser(description="Show a read-only portfolio analytics report.")
     parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    parser.add_argument("--date-from", type=date.fromisoformat)
+    parser.add_argument("--date-to", type=date.fromisoformat)
+    parser.add_argument(
+        "--dividend-source", choices=("email", "activities", "statements"), default="email"
+    )
+    parser.add_argument(
+        "--cash-flow-source", choices=("activities", "statements"), default="activities"
+    )
+    parser.add_argument(
+        "--fx-source", choices=("statements", "exports", "email"), default="statements"
+    )
     parser.add_argument("--export", action="store_true", help="Export the report as JSON.")
     args = parser.parse_args(argv)
     try:
-        report = run_analytics(args.database)
+        report = run_analytics(
+            args.database,
+            date_from=args.date_from,
+            date_to=args.date_to,
+            dividend_source=args.dividend_source,
+            cash_flow_source=args.cash_flow_source,
+            fx_source=args.fx_source,
+        )
     except Exception:
         logger.exception("Analytics report failed")
         return 1

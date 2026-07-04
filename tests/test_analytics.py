@@ -11,6 +11,9 @@ from analytics import (
     get_holdings,
     get_position,
     get_portfolio_summary,
+    get_dividend_summary,
+    get_fx_fee_summary,
+    get_realized_gain_summary,
     portfolio_report,
 )
 
@@ -19,12 +22,10 @@ class AnalyticsTest(unittest.TestCase):
     def setUp(self):
         database.close_connection()
         self.temp_dir = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
         self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
         database.initialize_database(self.db_path)
-
-    def tearDown(self):
-        database.close_connection()
-        self.temp_dir.cleanup()
 
     def _ticker(self, symbol="AAPL", exchange="NASDAQ", currency="USD", name="Apple Inc."):
         connection = database.get_shared_connection(self.db_path)
@@ -167,6 +168,72 @@ class AnalyticsTest(unittest.TestCase):
         self.assertIn("cash", report)
         self.assertIn("portfolio_value", report)
         self.assertIn("historical_values", report)
+        self.assertIn("financial_metrics", report)
+        self.assertIn("cash_flow", report)
+        self.assertIn("dividends", report)
+        self.assertIn("fees", report)
+
+    def test_fx_fee_summary_extracts_inclusive_buy_and_sell_fees(self):
+        ticker_id = self._ticker()
+        connection = database.get_shared_connection(self.db_path)
+        connection.executemany(
+            """
+            INSERT INTO transactions (
+                transaction_date, transaction_type, ticker_id, quantity,
+                execution_date, debit, credit, fx_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (date(2025, 1, 2), "BUY", ticker_id, Decimal("1"), date(2025, 1, 2), Decimal("101.50"), None, Decimal("1.4")),
+                (date(2025, 1, 3), "SELL", ticker_id, Decimal("-1"), date(2025, 1, 3), None, Decimal("98.50"), Decimal("1.4")),
+                (date(2025, 1, 4), "BUY", ticker_id, Decimal("1"), date(2025, 1, 4), Decimal("50"), None, None),
+            ],
+        )
+
+        summary = get_fx_fee_summary(self.db_path)
+
+        self.assertEqual(summary["transaction_count"], 2)
+        self.assertEqual(summary["estimated_buy_fee_cad"], Decimal("1.5000"))
+        self.assertEqual(summary["estimated_sell_fee_cad"], Decimal("1.5000"))
+        self.assertEqual(summary["estimated_fx_fee_cad"], Decimal("3.0000"))
+
+    def test_fx_fee_non_statement_source_is_explicitly_unavailable(self):
+        summary = get_fx_fee_summary(self.db_path, source="email")
+        self.assertFalse(summary["available"])
+        self.assertEqual(summary["estimated_fx_fee_cad"], Decimal("0"))
+
+    def test_dividends_default_to_email_and_can_use_activities(self):
+        ticker_id = self._ticker()
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            """INSERT INTO email_transactions (
+                account, transaction_type, ticker_id, debit, transaction_date
+            ) VALUES ('TFSA', 'Dividend', ?, 4.25, '2025-02-01')""",
+            [ticker_id],
+        )
+
+        email = get_dividend_summary(self.db_path)
+
+        self.assertEqual(email["source"], "email")
+        self.assertEqual(email["totals_by_currency"], {"USD": Decimal("4.2500")})
+
+    def test_realized_gain_uses_prior_weighted_average_cost(self):
+        ticker_id = self._ticker()
+        connection = database.get_shared_connection(self.db_path)
+        connection.executemany(
+            """INSERT INTO transactions (
+                transaction_date, transaction_type, ticker_id, quantity,
+                execution_date, debit, credit, fx_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
+            [
+                (date(2024, 1, 1), "BUY", ticker_id, Decimal("10"), date(2024, 1, 1), Decimal("100"), None),
+                (date(2025, 1, 1), "SELL", ticker_id, Decimal("-4"), date(2025, 1, 1), None, Decimal("60")),
+            ],
+        )
+
+        result = get_realized_gain_summary(self.db_path, date_from=date(2025, 1, 1))
+
+        self.assertEqual(result["total_realized_gain"], Decimal("20"))
 
 
 if __name__ == "__main__":

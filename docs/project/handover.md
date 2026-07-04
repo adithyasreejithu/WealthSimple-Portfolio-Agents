@@ -107,6 +107,14 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## Last Completed Work
 
+- Extended the analytics report with non-policy reference metrics, selectable
+  dividend and cash-flow sources, commissions, weighted-average realized gains,
+  XIRR, and on-demand Wealthsimple FX-fee estimates for statement BUY/SELL rows.
+- Kept the schema unchanged because FX fees are derived from existing statement
+  values; email/export FX requests explicitly report unavailable inputs.
+- Centralized financial assumptions in `src/config.py` and documented formulas
+  and source selection in `docs/reference/analytics.md`.
+
 - Added canonical `app.py` subcommands for all user-facing runtime features.
 - Kept existing direct extractor, sorter, yfinance, and ticker-mapping commands as wrappers.
 - Added optional argument forwarding and consistent success exit codes to delegated CLIs.
@@ -156,13 +164,14 @@ $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe src\email_extractor.py --help
 $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe src\email_extractor.py
 $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe src\email_extractor.py --export
 $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m unittest discover -s tests -p 'test_yfinance_extractor.py'
+$env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m unittest tests.test_portfolio_metrics
+$env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m unittest tests.test_analytics tests.test_app
 ```
 
-Focused CLI and compatibility verification passed all 46 tests. The full suite ran 82 tests with 77 passing and
-5 failures in existing analytics/data-sorter expectations: one reconstructed
-holding quantity assertion and four activity-import ticker/deduplication assertions.
-Those test files were already modified before this CLI task and the failures are
-outside the command-dispatch changes.
+The new pure metric tests pass. The full suite now runs 90 tests with 85 passing
+and 5 pre-existing failures: one vetted holdings calculation conflicts with its
+SELL-aware test expectation, and four activity-import ticker/deduplication tests
+remain outside this analytics change. All newly added analytics tests pass.
 
 ## Sign-Off Checklist
 

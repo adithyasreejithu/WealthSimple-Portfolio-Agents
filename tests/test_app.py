@@ -12,10 +12,10 @@ import database
 class AppPipelineTest(unittest.TestCase):
     def setUp(self):
         database.close_connection()
-        self.data_dir = Path(tempfile.mkdtemp(dir=Path.cwd()))
-
-    def tearDown(self):
-        database.close_connection()
+        self.temp_dir = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
+        self.data_dir = Path(self.temp_dir.name)
 
     def test_rename_monthly_documents_only_renames_pdf(self):
         pdf = self.data_dir / "Wealthsimple account statement 2025-04 final.pdf"

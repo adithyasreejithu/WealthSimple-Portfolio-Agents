@@ -12,6 +12,7 @@ import pandas as pd
 
 from config import DATABASE_PATH
 from database import get_shared_connection
+from portfolio_metrics import estimate_wealthsimple_fx_fee_cad
 from system_logger import get_logger
 from yfinance_extractor import TickerHint, configure_yfinance_cache, fetch_security_info
 
@@ -323,6 +324,9 @@ def upload_statement_transactions(
 ) -> int:
     connection = get_shared_connection(db_path)
     written = 0
+    fx_count = 0
+    fx_exposure = Decimal("0")
+    estimated_fx_fees = Decimal("0")
     for row in data.to_dict(orient="records"):
         ticker_id = row.get("ticker_id")
         transaction_date = _optional_date(row.get("date"))
@@ -331,6 +335,12 @@ def upload_statement_transactions(
         debit = _decimal(row.get("debit"))
         credit = _decimal(row.get("credit"))
         fx_rate = _decimal(row.get("fx_rate"))
+        kind = transaction_type.upper()
+        cad_amount = debit if kind == "BUY" else credit if kind == "SELL" else None
+        if fx_rate is not None and fx_rate > 0 and cad_amount is not None and cad_amount > 0:
+            fx_count += 1
+            fx_exposure += cad_amount
+            estimated_fx_fees += estimate_wealthsimple_fx_fee_cad(kind, cad_amount)
         if ticker_id is None or pd.isna(ticker_id):
             balance = _decimal(row.get("balance"))
             cash_values = [
@@ -404,6 +414,12 @@ def upload_statement_transactions(
             )
         written += 1
     logger.info("Statement upload complete | inserted=%d | input=%d", written, len(data))
+    logger.info(
+        "Statement FX summary | transactions=%d | cad_exposure=%s | estimated_fee=%s",
+        fx_count,
+        fx_exposure,
+        estimated_fx_fees,
+    )
     return written
 
 
@@ -452,6 +468,9 @@ def upload_email_transactions(
         )
         written += 1
     logger.info("Email upload complete | inserted=%d | input=%d", written, len(data))
+    logger.info(
+        "Email FX summary unavailable | transactions=0 | reason=missing applied FX rate and confirmed CAD amount"
+    )
     return written
 
 

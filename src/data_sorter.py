@@ -701,6 +701,9 @@ def sort_data(
         len(normalized_rows),
         duplicate_rows,
     )
+    logger.info(
+        "Activity export FX summary unavailable | transactions=0 | reason=missing applied FX rate and confirmed CAD amount"
+    )
     return SortResult(
         source_file=source_file,
         import_id=import_id,

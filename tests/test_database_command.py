@@ -20,12 +20,10 @@ class DatabaseCommandTest(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory(
             dir=Path(__file__).resolve().parent
         )
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
         self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
         database.initialize_database(self.db_path)
-
-    def tearDown(self):
-        database.close_connection()
-        self.temp_dir.cleanup()
 
     def test_first_seen_etf_is_enriched_and_normalized(self):
         calls = []

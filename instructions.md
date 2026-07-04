@@ -30,6 +30,9 @@ This file is the first thing to read before implementing or changing code in thi
 - Reuse shared helpers and avoid duplicating logic when a common utility already exists.
 - Do not rename files or create extra copies unless the task explicitly asks for that behavior.
 - Keep non-secret static values in `src/config.py` so modules share one source of truth.
+- Treat reusable hard-coded business values as configuration. Rates, thresholds,
+  tolerances, annualization periods, source defaults, and similar financial
+  assumptions belong in `src/config.py`, not inline in runtime calculations.
 - Keep secrets, tokens, passwords, and environment-specific values out of `src/config.py`; load those from the environment at runtime instead.
 - Treat `instructions.md` as the repo-wide default context for all implementation work unless a task overrides it.
 - Prefer adding or updating tests in `tests/` when behavior changes.
@@ -63,6 +66,12 @@ Use these sources according to their role and priority:
 3. Email confirmations are the tertiary source for near-real-time transaction information while monthly reports and full data exports are delayed.
 
 When sources conflict, use the entire Wealthsimple data export for verification while preserving additional details, such as FX information, that are available only in monthly reports.
+
+Analytics must select one source explicitly when sources can overlap. Dividend
+analytics defaults to email for near-real-time coverage, cash-flow and commission
+analytics default to activity exports for broad history, and FX analytics defaults
+to statements because only statements currently retain both the applied FX rate
+and CAD cash amount. Do not silently combine these sources and double-count events.
 
 ## Database Normalization
 

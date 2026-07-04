@@ -28,3 +28,4 @@ Repository documentation is grouped by purpose so plans, acceptance criteria, te
 ## Reference
 
 - [CLI command guide](reference/cli.md)
+- [Analytics calculations and sources](reference/analytics.md)

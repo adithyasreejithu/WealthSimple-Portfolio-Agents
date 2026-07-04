@@ -31,6 +31,11 @@ This is a temporary rule and should be replaced later by a security master or ex
 
 `raw_activity_exports` preserves every original Wealthsimple export field for audit and reconciliation. `activities` is the typed analytics table and stores `ticker_id` instead of symbol or security name.
 
+Estimated Wealthsimple FX fees are intentionally not stored as schema fields.
+Analytics derives them from statement `transactions.transaction_type`, `debit`,
+`credit`, and `fx_rate` using the configured fee rate. This avoids stale derived
+values and does not duplicate unavailable fields into activity or email tables.
+
 Ticker-bearing rows must resolve unambiguously before an import is published. Rejected imports retain their raw rows and source file. Successful imports append new activity, update lineage for repeated history, and archive the source CSV.
 
 Identical files are detected by hash. Repeated historical rows are matched by a normalized row fingerprint and duplicate ordinal, allowing legitimate identical rows to remain separate.
