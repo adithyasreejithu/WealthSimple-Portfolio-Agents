@@ -7,6 +7,7 @@ import pandas as pd
 
 import app
 import database
+from market_data import MarketSyncResult
 
 
 class AppPipelineTest(unittest.TestCase):
@@ -68,6 +69,63 @@ class AppPipelineTest(unittest.TestCase):
         ).execute("SELECT source_type FROM staged_files ORDER BY file_sequence").fetchall()]
         self.assertEqual(staged_order, ["statement", "email", "export"])
         self.assertTrue(result.succeeded)
+
+    def test_email_pipeline_syncs_market_data_after_publication(self):
+        events = []
+        email_data = pd.DataFrame(columns=[
+            "account", "transaction", "ticker_id", "ticker", "quantity", "avg_price",
+            "total_cost", "debit", "date", "price_currency", "source_message_id",
+            "received_at",
+        ])
+        with (
+            patch.object(app, "initialize_database"),
+            patch.object(app, "create_batch", return_value=7),
+            patch.object(app, "_stage_statement_files", return_value=([], 1, [])),
+            patch.object(app, "_stage_email_batch", return_value=([(9, email_data)], 2, [])),
+            patch.object(app, "_stage_export_files", return_value=([], 3, [])),
+            patch.object(app, "resolve_batch"),
+            patch.object(app, "_pending_email_symbols", return_value=[]),
+            patch.object(app, "_publish_email_batch", side_effect=lambda *_: events.append("email") or 0),
+            patch.object(app, "complete_batch", side_effect=lambda *_: events.append("batch")),
+            patch.object(
+                app,
+                "sync_market_data",
+                side_effect=lambda *_: events.append("market") or MarketSyncResult(1, 2),
+            ) as sync,
+        ):
+            result = app.run_pipeline("all", self.data_dir, self.data_dir / "db.duckdb")
+
+        self.assertEqual(events, ["email", "market", "batch"])
+        sync.assert_called_once_with(self.data_dir / "db.duckdb")
+        self.assertEqual(result.results[-1], app.SourceResult("email", None, "succeeded", 0))
+
+    def test_source_specific_pipeline_does_not_sync_market_data(self):
+        with (
+            patch.object(app, "initialize_database"),
+            patch.object(app, "create_batch", return_value=7),
+            patch.object(app, "_stage_statement_files", return_value=([], 1, [])),
+            patch.object(app, "complete_batch"),
+            patch.object(app, "sync_market_data") as sync,
+        ):
+            app.run_pipeline("statements", self.data_dir, self.data_dir / "db.duckdb")
+
+        sync.assert_not_called()
+
+    def test_failed_ingestion_does_not_sync_market_data(self):
+        failed = app.SourceResult("statement", None, "failed", error="bad statement")
+        with (
+            patch.object(app, "initialize_database"),
+            patch.object(app, "create_batch", return_value=7),
+            patch.object(app, "_stage_statement_files", return_value=([], 1, [failed])),
+            patch.object(app, "_stage_email_batch", return_value=([], 2, [])),
+            patch.object(app, "_stage_export_files", return_value=([], 3, [])),
+            patch.object(app, "complete_batch"),
+            patch.object(app, "sync_market_data") as sync,
+        ):
+            result = app.run_pipeline("all", self.data_dir, self.data_dir / "db.duckdb")
+
+        sync.assert_not_called()
+        self.assertFalse(result.succeeded)
 
     def test_analytics_command_prints_report(self):
         report = {
@@ -172,10 +230,36 @@ class AppPipelineTest(unittest.TestCase):
             "statements",
             "email",
             "yfinance",
+            "yfinance-sync",
             "ticker-map",
             "import-activities",
         ):
             self.assertIn(command, printed)
+
+    def test_yfinance_sync_command_forwards_database_and_tickers(self):
+        expected = MarketSyncResult(2, 8, 1)
+        with patch.object(app, "sync_market_data", return_value=expected) as sync:
+            output = app.main([
+                "yfinance-sync",
+                "--database",
+                str(self.data_dir / "db.duckdb"),
+                "--tickers",
+                "AAPL",
+                "VFV.TO",
+            ])
+
+        self.assertEqual(output, 0)
+        sync.assert_called_once_with(
+            self.data_dir / "db.duckdb", ["AAPL", "VFV.TO"], full=False
+        )
+
+    def test_yfinance_sync_full_flag_is_forwarded(self):
+        expected = MarketSyncResult(1, 3)
+        with patch.object(app, "sync_market_data", return_value=expected) as sync:
+            output = app.main(["yfinance-sync", "--full"])
+
+        self.assertEqual(output, 0)
+        sync.assert_called_once_with(app.DATABASE_PATH, None, full=True)
 
 
 if __name__ == "__main__":

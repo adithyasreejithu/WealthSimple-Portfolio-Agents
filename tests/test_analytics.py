@@ -77,6 +77,23 @@ class AnalyticsTest(unittest.TestCase):
         self.assertEqual(holding.cost_basis, Decimal("520"))
         self.assertEqual(holding.market_value, Decimal("552"))
 
+    def test_resolved_provisional_email_trade_updates_live_quantity(self):
+        ticker_id = self._ticker()
+        database.get_shared_connection(self.db_path).execute(
+            """INSERT INTO email_transactions (
+                   account, transaction_type, ticker_id, quantity, transaction_date,
+                   source_symbol, price_currency, ticker_resolution_status, reconciliation_status
+               ) VALUES ('TFSA', 'Fractional Buy', ?, 1.25, ?, 'AAPL', 'USD',
+                         'resolved', 'provisional')""",
+            [ticker_id, date(2025, 1, 2)],
+        )
+
+        holding = get_position(ticker_id, self.db_path)
+
+        self.assertEqual(holding.quantity, Decimal("1.25000000"))
+        self.assertEqual(holding.provisional_quantity, Decimal("1.25000000"))
+        self.assertTrue(holding.has_provisional_activity)
+
     def test_latest_explicit_cash_balance_is_preferred(self):
         connection = database.get_shared_connection(self.db_path)
         connection.executemany(

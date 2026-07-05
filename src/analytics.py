@@ -44,6 +44,8 @@ class Holding:
     market_value: Decimal
     last_price: Decimal | None = None
     last_price_date: date | None = None
+    provisional_quantity: Decimal = Decimal("0")
+    has_provisional_activity: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,15 +66,36 @@ def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
     # Reconstruct the current position state from cumulative transaction history.
     rows = connection.execute(
         """
-        WITH net_transactions AS (
+        WITH statement_positions AS (
             SELECT
                 ticker_id,
-                SUM(quantity) AS total_amount,
+                SUM(CASE WHEN UPPER(transaction_type) = 'SELL'
+                         THEN -ABS(quantity) ELSE ABS(quantity) END) AS total_amount,
                 SUM(COALESCE(debit, 0)) AS total_debit,
                 SUM(COALESCE(credit, 0)) AS total_credit
             FROM transactions
-            WHERE transaction_type = 'BUY'
+            WHERE UPPER(transaction_type) IN ('BUY', 'SELL')
             GROUP BY ticker_id
+        ),
+        email_positions AS (
+            SELECT ticker_id,
+                   SUM(CASE WHEN UPPER(transaction_type) LIKE '%SELL%'
+                            THEN -ABS(quantity) ELSE ABS(quantity) END) AS provisional_amount
+            FROM email_transactions
+            WHERE ticker_id IS NOT NULL
+              AND ticker_resolution_status = 'resolved'
+              AND reconciliation_status = 'provisional'
+              AND (UPPER(transaction_type) LIKE '%BUY%'
+                   OR UPPER(transaction_type) LIKE '%SELL%')
+            GROUP BY ticker_id
+        ),
+        net_transactions AS (
+            SELECT COALESCE(s.ticker_id, e.ticker_id) AS ticker_id,
+                   COALESCE(s.total_amount, 0) + COALESCE(e.provisional_amount, 0) AS total_amount,
+                   COALESCE(s.total_debit, 0) AS total_debit,
+                   COALESCE(s.total_credit, 0) AS total_credit,
+                   COALESCE(e.provisional_amount, 0) AS provisional_amount
+            FROM statement_positions s FULL OUTER JOIN email_positions e USING (ticker_id)
         ),
         latest_prices AS (
             SELECT DISTINCT ON (ticker_id)
@@ -92,7 +115,8 @@ def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
             nt.total_debit,
             nt.total_credit,
             lp.record_date,
-            lp.close
+            lp.close,
+            nt.provisional_amount
         FROM net_transactions nt
         JOIN tickers t ON t.ticker_id = nt.ticker_id
         LEFT JOIN latest_prices lp ON lp.ticker_id = nt.ticker_id
@@ -102,7 +126,7 @@ def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
     ).fetchall()
     holdings: list[Holding] = []
     for row in rows:
-        ticker_id, symbol, exchange, name, security_type, total_amount, debit, credit, price_date, close = row
+        ticker_id, symbol, exchange, name, security_type, total_amount, debit, credit, price_date, close, provisional = row
         quantity_value = _decimal(total_amount)
         cost_basis = _decimal(debit) - _decimal(credit)
         last_price = _decimal(close) if close is not None else None
@@ -120,6 +144,8 @@ def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
                 market_value=market_value,
                 last_price=last_price,
                 last_price_date=_date(price_date) if price_date is not None else None,
+                provisional_quantity=_decimal(provisional),
+                has_provisional_activity=_decimal(provisional) != 0,
             )
         )
     return holdings

@@ -11,6 +11,10 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## What We Were Doing
 
+- Added schema v8 live email ingestion with message-level idempotency, pending ticker
+  retention, provisional holdings, deterministic statement reconciliation, and
+  consolidated market synchronization through `src/market_data.py`.
+
 - Consolidated every user-facing command under `src/app.py` while preserving the
   standalone module entry points.
 - Added a CLI reference and durable documentation/comment-update rules.
@@ -29,7 +33,8 @@ Use this document when signing off, clearing context, or resuming work after a b
 ## Current State
 
 - `src/app.py` is the canonical CLI and exposes `pipeline`, `analytics`,
-  `statements`, `email`, `yfinance`, `ticker-map`, and `import-activities`.
+  `statements`, `email`, `yfinance`, `yfinance-sync`, `ticker-map`, and
+  `import-activities`.
 - Legacy top-level pipeline flags and direct module commands remain compatible.
 - `docs/reference/cli.md` is the command reference and must be updated with CLI changes.
 - This handover is the context file and must be updated after repository-changing tasks.
@@ -50,13 +55,22 @@ Use this document when signing off, clearing context, or resuming work after a b
 - The email extractor reads matching Wealthsimple and Interac emails from Gmail.
 - Email extraction runs with `python src/email_extractor.py`.
 - Email export runs with `python src/email_extractor.py --export`.
-- Email output keeps `account`, `transaction`, `ticker_id`, `ticker`, `quantity`, `avg_price`, `total_cost`, `debit`, and `date`.
+- Email output keeps the transaction fields plus `price_currency`,
+  `source_message_id`, and `received_at`.
 - Email `date` is resolved from the email body first and falls back to the IMAP received date when needed.
-- `START_DATE` is a temporary environment-based start-date fallback until a database checkpoint exists.
+- `pipeline --source email` stores messages incrementally. Unknown symbols are retained
+  as pending and reported without blocking known trades.
+- `ticker-map pending` lists unresolved symbols and `ticker-map resolve-pending` runs
+  the explicitly interactive mapping workflow.
+- Resolved email BUY/SELL rows contribute provisional quantities until matching
+  statement transactions supersede them.
 - The yfinance extractor fetches stock metadata, ETF metadata, and historical OHLCV data for caller-supplied tickers.
 - Yfinance metadata output is returned as stock and ETF dataframes with stable columns.
 - Yfinance historical output is returned as a dataframe with `Date`, `Ticker`, `Open`, `High`, `Low`, `Close`, `Adj Close`, and `Volume`.
-- The future pipeline trigger is not implemented yet; it should pass required tickers and date ranges into `src/yfinance_extractor.py`.
+- A committed email branch triggers `src/market_data.py`. It derives each owned
+  ticker's initial or incremental date window and upserts metadata and history.
+- Use `python src/app.py yfinance-sync` for retries or targeted updates and add
+  `--full` to restart from first portfolio activity.
 - All active runtime files under `src/` now use the shared logger and include stage-level usage/error logging.
 - `src/` is intended to stay flat; there should be no Camelot subfolder or separate extractor runner file.
 - `instructions.md` is the repo-wide implementation guide.
@@ -77,6 +91,7 @@ Use this document when signing off, clearing context, or resuming work after a b
 - `src/statement_extractor.py`
 - `src/email_extractor.py`
 - `src/yfinance_extractor.py`
+- `src/market_data.py`
 - `src/system_logger.py`
 - `tests/test_statement_extractor.py`
 - `tests/test_email_extractor.py`
@@ -102,10 +117,27 @@ Use this document when signing off, clearing context, or resuming work after a b
 - Do not recreate `src/wealthsimple_camelot/`, `src/run_camelot_extract.py`, or `extracted_camelot_method/`.
 - Do not recreate `email_export/` after the migration is complete.
 - Do not recreate `extracted_yfinance_method/` after the yfinance migration is complete.
-- Keep yfinance runtime code independent from database helper functions until the pipeline/database layer is introduced.
+- Keep yfinance extraction independent from database writes; `src/market_data.py`
+  owns synchronization and `src/database_command.py` owns persistence.
 - Do not run glossary extraction by default; use the `--include-glossary` flag only when explicitly needed.
 
 ## Last Completed Work
+
+- Verification: `python -m unittest discover -s tests` passes 109 tests.
+- Consolidated yfinance persistence around `src/market_data.py` and `yfinance-sync`;
+  removed the duplicate history-sync command design.
+- Added partial publication for unknown email tickers, timestamp checkpoints,
+  pending mapping activation, provisional analytics, and statement supersession.
+
+- Added automatic yfinance metadata and historical-price synchronization after
+  successful full-source ingestion, plus the standalone `yfinance-sync` retry
+  command.
+- Added owned-period and incremental date selection, verified Yahoo mapping use,
+  atomic metadata/history upserts, and failure isolation from committed source
+  ingestion.
+- Added focused synchronization and orchestration tests. Market-data and
+  extractor tests pass; app/database tests remain affected by the existing
+  Windows temporary-directory access issue.
 
 - Extended the analytics report with non-policy reference metrics, selectable
   dividend and cash-flow sources, commissions, weighted-average realized gains,

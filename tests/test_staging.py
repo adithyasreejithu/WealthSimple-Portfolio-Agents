@@ -53,6 +53,22 @@ class StagingTest(unittest.TestCase):
             ],
         )
 
+    def test_email_price_currency_selects_correct_dual_listing(self):
+        cad_id = self._ticker("DUAL", "TSX", "CAD", "Dual Listed CAD")
+        self._ticker("DUAL", "NYSE", "USD", "Dual Listed USD")
+        batch = staging.create_batch(self.db_path)
+        staged_file = staging.stage_dataframe(batch, "email", None, 1, pd.DataFrame([{
+            "date": "2025-04-01", "transaction": "Market Buy", "ticker": "DUAL",
+            "quantity": "1", "price_currency": "CAD",
+        }]), self.db_path)
+
+        staging.resolve_batch(batch, self.db_path)
+
+        row = database.get_shared_connection(self.db_path).execute(
+            "SELECT ticker_id, inferred_listing_currency, listing_evidence FROM staged_records"
+        ).fetchone()
+        self.assertEqual(row, (cad_id, "CAD", "email_price_currency"))
+
     def test_resolution_uses_ticker_table_and_ignores_symbol_history(self):
         ticker_id = self._ticker("SPLG", "NYSE", "USD", "State Street SPDR Portfolio S&P 500 ETF")
         other_ticker_id = self._ticker("SPYM", "NYSE", "USD", "State Street SPDR Portfolio S&P 500 ETF")

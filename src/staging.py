@@ -203,7 +203,7 @@ def resolve_batch(
         SELECT r.staged_record_id, r.source_symbol, r.security_name, r.transaction_date,
                r.transaction_type, r.fx_rate, r.contains_fx_rate, f.source_type,
                f.staged_file_id,
-               r.inferred_listing_currency, r.listing_evidence
+               r.inferred_listing_currency, r.listing_evidence, r.price_currency
         FROM staged_records r JOIN staged_files f USING (staged_file_id)
         WHERE f.batch_id = ? AND r.source_symbol IS NOT NULL
           AND r.resolution_status <> 'resolved'
@@ -215,7 +215,8 @@ def resolve_batch(
     grouped: dict[tuple[str, str], list[tuple[Any, ...]]] = {}
     for row in rows:
         symbol = str(row[1] or "").strip().upper()
-        currency = listing_currency_from_fx(row[6])
+        email_currency = str(row[11] or "").strip().upper() if row[7] == "email" else ""
+        currency = email_currency if email_currency in {"CAD", "USD"} else listing_currency_from_fx(row[6])
         grouped.setdefault((symbol, currency), []).append(row)
 
     resolutions_by_key: dict[tuple[str, str], dict[str, Any]] = {}
@@ -225,7 +226,9 @@ def resolve_batch(
             symbol,
             currency == "USD",
             primary_name,
-            evidence_rows[0][7],
+            "email_currency"
+            if evidence_rows[0][7] == "email" and str(evidence_rows[0][11] or "").strip()
+            else evidence_rows[0][7],
             db_path,
         )
         method = (
@@ -250,12 +253,17 @@ def resolve_batch(
 
     for row in rows:
         symbol = str(row[1] or "").strip().upper()
-        currency = listing_currency_from_fx(row[6])
+        email_currency = str(row[11] or "").strip().upper() if row[7] == "email" else ""
+        currency = email_currency if email_currency in {"CAD", "USD"} else listing_currency_from_fx(row[6])
         resolution = resolutions_by_key.get((symbol, currency))
         ticker_id = resolution["ticker_id"] if resolution else None
         status = resolution["status"] if resolution else "unresolved"
         method = resolution["method"] if resolution else "unresolved"
-        evidence = row[10] or (f"{row[7]}_{'fx' if row[6] == 'Yes' else 'no_fx'}" if row[7] == "statement" else None)
+        evidence = row[10] or (
+            "email_price_currency" if row[7] == "email" and email_currency
+            else f"{row[7]}_{'fx' if row[6] == 'Yes' else 'no_fx'}" if row[7] == "statement"
+            else None
+        )
         connection.execute(
             """
             UPDATE staged_records SET ticker_id = ?, resolution_method = ?, resolution_status = ?,

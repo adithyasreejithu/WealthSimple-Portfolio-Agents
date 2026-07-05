@@ -129,7 +129,19 @@ def resolve_or_enrich_ticker(
         candidates = existing_ticker_candidates(
             yfinance_query_symbol(base_symbol, contains_fx_rate), db_path
         )
-    if len(candidates) == 1:
+    exact_candidates = [
+        candidate for candidate in candidates
+        if candidate["currency"].upper() == listing_currency
+    ]
+    if len(exact_candidates) == 1:
+        return ResolutionResult(
+            exact_candidates[0]["ticker_id"],
+            base_symbol,
+            listing_currency,
+            "existing_ticker",
+            False,
+        )
+    if source_type != "email_currency" and len(candidates) == 1:
         return ResolutionResult(
             candidates[0]["ticker_id"],
             base_symbol,
@@ -138,7 +150,7 @@ def resolve_or_enrich_ticker(
             False,
         )
 
-    if source_type != "statement":
+    if source_type not in {"statement"}:
         return ResolutionResult(None, base_symbol, listing_currency, "unresolved", False)
 
     hint = TickerHint(base_symbol, listing_currency, _text(name))
@@ -155,18 +167,6 @@ def resolve_or_enrich_ticker(
         )
         return ResolutionResult(
             refreshed_exact[0]["ticker_id"],
-            base_symbol,
-            listing_currency,
-            "enriched_ticker",
-            True,
-        )
-    if len(refreshed) == 1:
-        get_shared_connection(db_path).execute(
-            "UPDATE tickers SET contains_fx_rate = COALESCE(contains_fx_rate, ?) WHERE ticker_id = ?",
-            [contains_fx_rate_label(contains_fx_rate), refreshed[0]["ticker_id"]],
-        )
-        return ResolutionResult(
-            refreshed[0]["ticker_id"],
             base_symbol,
             listing_currency,
             "enriched_ticker",

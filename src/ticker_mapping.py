@@ -71,9 +71,83 @@ def add_mapping(
             reason = excluded.reason, created_by = excluded.created_by, verified_at = now()
         """, [ticker_id, provider, effective_from, effective_to, reason, created_by]
     )
+    resolved_rows = connection.execute(
+        """
+        UPDATE email_transactions
+        SET ticker_id = ?, ticker_resolution_status = 'resolved'
+        WHERE UPPER(source_symbol) = ?
+          AND ticker_resolution_status = 'pending'
+          AND (price_currency IS NULL OR price_currency = '' OR price_currency = ?)
+        RETURNING email_transaction_id
+        """,
+        [ticker_id, source, currency],
+    ).fetchall()
+    reconciled_rows = 0
+    market_error = None
+    if resolved_rows:
+        from database_command import reconcile_email_transactions
+        from market_data import sync_market_data
+
+        reconciled_rows = reconcile_email_transactions(db_path)
+        market_result = sync_market_data(db_path, [canonical])
+        market_error = market_result.error
     return {"ticker_id": ticker_id, "source_symbol": source,
             "canonical_symbol": canonical, "provider_symbol": provider,
-            "currency": currency, "status": "verified"}
+            "currency": currency, "status": "verified",
+            "resolved_email_rows": len(resolved_rows),
+            "reconciled_email_rows": reconciled_rows,
+            "market_sync_error": market_error}
+
+
+def list_pending(db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    rows = get_shared_connection(db_path).execute(
+        """
+        SELECT source_symbol, NULLIF(price_currency, ''), COUNT(*),
+               MIN(transaction_date), MAX(transaction_date)
+        FROM email_transactions
+        WHERE ticker_resolution_status = 'pending'
+          AND source_symbol IS NOT NULL
+        GROUP BY source_symbol, NULLIF(price_currency, '')
+        ORDER BY source_symbol, price_currency
+        """
+    ).fetchall()
+    return [
+        {
+            "source_symbol": symbol,
+            "detected_currency": currency,
+            "trade_count": count,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+        }
+        for symbol, currency, count, first_seen, last_seen in rows
+    ]
+
+
+def resolve_pending_interactively(db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    pending = list_pending(db_path)
+    results: list[dict[str, Any]] = []
+    for item in pending:
+        symbol = str(item["source_symbol"])
+        detected = str(item["detected_currency"] or "")
+        print(f"Resolve {symbol} ({item['trade_count']} pending trade(s))")
+        currency = input(f"Currency [CAD/USD]{f' [{detected}]' if detected else ''}: ").strip().upper() or detected
+        canonical = input(f"Canonical symbol [{symbol}]: ").strip().upper() or symbol
+        default_yahoo = f"{canonical}.TO" if currency == "CAD" else canonical
+        yahoo = input(f"Yahoo symbol [{default_yahoo}]: ").strip().upper() or default_yahoo
+        exchange = input("Exchange (for example TSX or NASDAQ): ").strip().upper()
+        confirmation = input(
+            f"Save {symbol} -> {canonical} ({currency}, {exchange or 'provider exchange'}, {yahoo})? [y/N]: "
+        ).strip().lower()
+        if confirmation not in {"y", "yes"}:
+            results.append({"source_symbol": symbol, "status": "skipped"})
+            continue
+        results.append(add_mapping(
+            symbol, canonical, yahoo, currency, exchange,
+            reason="resolved pending email ticker", created_by="interactive-cli",
+            db_path=db_path,
+        ))
+    return results
 
 
 def list_mappings(db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
@@ -156,6 +230,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     importer = commands.add_parser("import-csv")
     parsers.append(importer)
     importer.add_argument("path", type=Path)
+    pending = commands.add_parser("pending")
+    parsers.append(pending)
+    resolver = commands.add_parser("resolve-pending")
+    parsers.append(resolver)
     for command in parsers:
         command.add_argument("--database", type=Path, default=DATABASE_PATH)
         command.add_argument("--output", choices=("text", "json"), default="text")
@@ -175,6 +253,10 @@ def main(argv: list[str] | None = None) -> int:
         result = validate_mappings(args.source_symbol, args.database)
     elif args.command == "retire":
         result = {"updated": retire_mapping(args.source_symbol, args.currency, args.effective_to, args.database)}
+    elif args.command == "pending":
+        result = list_pending(args.database)
+    elif args.command == "resolve-pending":
+        result = resolve_pending_interactively(args.database)
     else:
         result = import_csv(args.path, args.database)
     print(json.dumps(result, indent=2, default=str) if args.output == "json" else result)

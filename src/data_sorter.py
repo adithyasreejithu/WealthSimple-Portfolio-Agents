@@ -221,7 +221,7 @@ def _ticker_candidates(connection: Any) -> dict[str, list[dict[str, Any]]]:
     ).fetchall()
     candidates: dict[str, list[dict[str, Any]]] = {}
     for ticker_id, symbol, exchange, currency, security_name in rows:
-        candidates.setdefault(symbol.strip().upper(), []).append(
+        candidates.setdefault(base_ticker_symbol(symbol), []).append(
             {
                 "ticker_id": ticker_id,
                 "exchange": exchange,

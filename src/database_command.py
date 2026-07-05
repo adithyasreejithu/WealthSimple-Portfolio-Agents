@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+import hashlib
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
@@ -101,10 +102,13 @@ def _insert_metadata_frame(
     data: pd.DataFrame,
     security_type: str,
     db_path: Path | str,
+    ticker_ids: dict[str, int] | None = None,
 ) -> None:
+    """Persist provider enrichment without mutating an existing ticker identity."""
     connection = get_shared_connection(db_path)
     for row in data.to_dict(orient="records"):
         symbol = _text(row.get("ticker")).upper()
+        provider_symbol = _text(row.get("provider_symbol")).upper() or symbol
         exchange = _text(row.get("exchange")).upper()
         currency = _text(row.get("currency")).upper()
         financial_currency = _text(row.get("financial_currency")).upper() or None
@@ -117,23 +121,63 @@ def _insert_metadata_frame(
                 currency,
             )
             continue
-        ticker_id = int(
-            connection.execute(
+
+        if ticker_ids is not None:
+            ticker_id = ticker_ids.get(provider_symbol)
+            if ticker_id is None:
+                logger.warning(
+                    "Skipping unexpected yfinance metadata | ticker=%s | provider_symbol=%s",
+                    symbol,
+                    provider_symbol,
+                )
+                continue
+        else:
+            existing = connection.execute(
                 """
-                INSERT INTO tickers (
-                    ticker_symbol, exchange, currency, financial_currency,
-                    security_name, security_type
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT (ticker_symbol, exchange) DO UPDATE SET
-                    currency = excluded.currency,
-                    financial_currency = excluded.financial_currency,
-                    security_name = excluded.security_name,
-                    security_type = excluded.security_type
-                RETURNING ticker_id
+                SELECT ticker_id, currency, financial_currency, security_name, security_type
+                FROM tickers
+                WHERE ticker_symbol = ? AND exchange = ?
                 """,
-                [symbol, exchange, currency, financial_currency, name, security_type],
-            ).fetchone()[0]
-        )
+                [symbol, exchange],
+            ).fetchone()
+            if existing:
+                ticker_id = int(existing[0])
+            else:
+                ticker_id = int(connection.execute(
+                    """
+                    INSERT INTO tickers (
+                        ticker_symbol, exchange, currency, financial_currency,
+                        security_name, security_type
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    RETURNING ticker_id
+                    """,
+                    [symbol, exchange, currency, financial_currency, name, security_type],
+                ).fetchone()[0])
+
+        stored = connection.execute(
+            """
+            SELECT ticker_symbol, exchange, currency, financial_currency,
+                   security_name, security_type
+            FROM tickers WHERE ticker_id = ?
+            """,
+            [ticker_id],
+        ).fetchone()
+        if stored is None:
+            logger.warning(
+                "Skipping yfinance metadata for missing ticker identity | ticker_id=%s",
+                ticker_id,
+            )
+            continue
+        provider_identity = (symbol, exchange, currency, financial_currency, name, security_type)
+        if tuple(stored) != provider_identity:
+            logger.info(
+                "Preserving ticker identity despite yfinance metadata difference | "
+                "ticker_id=%s | stored=%s | provider=%s",
+                ticker_id,
+                tuple(stored),
+                provider_identity,
+            )
+
         if security_type == "stock":
             connection.execute(
                 """
@@ -183,34 +227,106 @@ def _insert_metadata_frame(
                     _json(row.get("sector_weights")),
                 ],
             )
-        provider_symbol = _text(row.get("provider_symbol")) or symbol
-        connection.execute(
-            """
-            INSERT INTO ticker_provider_mappings (
-                ticker_id, provider, provider_symbol, verification_status
-            ) VALUES (?, 'yahoo', ?, 'verified')
-            ON CONFLICT (ticker_id, provider) DO UPDATE SET
-                provider_symbol = excluded.provider_symbol,
-                verification_status = excluded.verification_status,
-                verified_at = now()
-            """,
-            [ticker_id, provider_symbol.upper()],
-        )
-        connection.execute(
-            """
-            INSERT INTO ticker_symbol_history (
-                ticker_id, source_symbol, provider_symbol, currency, exchange,
-                reason, mapping_source, created_by
-            ) VALUES (?, ?, ?, ?, ?, 'validated provider resolution', 'automatic', 'pipeline')
-            ON CONFLICT DO NOTHING
-            """,
-            [ticker_id, symbol, provider_symbol.upper(), currency, exchange],
-        )
+        if ticker_ids is None:
+            connection.execute(
+                """
+                INSERT INTO ticker_provider_mappings (
+                    ticker_id, provider, provider_symbol, verification_status
+                ) VALUES (?, 'yahoo', ?, 'verified')
+                ON CONFLICT DO NOTHING
+                """,
+                [ticker_id, provider_symbol],
+            )
+            connection.execute(
+                """
+                INSERT INTO ticker_symbol_history (
+                    ticker_id, source_symbol, provider_symbol, currency, exchange,
+                    reason, mapping_source, created_by
+                ) VALUES (?, ?, ?, ?, ?, 'validated provider resolution', 'automatic', 'pipeline')
+                ON CONFLICT DO NOTHING
+                """,
+                [ticker_id, symbol, provider_symbol, currency, exchange],
+            )
         logger.info(
             "Ticker metadata stored | ticker=%s | provider_symbol=%s | "
             "trading_currency=%s | financial_currency=%s | exchange=%s",
-            symbol, provider_symbol.upper(), currency, financial_currency or "", exchange,
+            symbol, provider_symbol, currency, financial_currency or "", exchange,
         )
+
+
+def upload_security_metadata(
+    stocks: pd.DataFrame,
+    etfs: pd.DataFrame,
+    db_path: Path | str = DATABASE_PATH,
+    *,
+    ticker_ids: dict[str, int] | None = None,
+) -> int:
+    """Store enrichment, inserting ticker identities only during onboarding."""
+    normalized_ids = (
+        {symbol.upper(): ticker_id for symbol, ticker_id in ticker_ids.items()}
+        if ticker_ids is not None else None
+    )
+    _insert_metadata_frame(stocks, "stock", db_path, normalized_ids)
+    _insert_metadata_frame(etfs, "etf", db_path, normalized_ids)
+    return len(stocks) + len(etfs)
+
+
+def upload_security_history(
+    data: pd.DataFrame,
+    ticker_ids: dict[str, int],
+    db_path: Path | str = DATABASE_PATH,
+) -> int:
+    """Upsert normalized yfinance history by provider symbol and market date."""
+    connection = get_shared_connection(db_path)
+    written = 0
+    for row in data.to_dict(orient="records"):
+        provider_symbol = _text(row.get("Ticker")).upper()
+        ticker_id = ticker_ids.get(provider_symbol)
+        record_date = _optional_date(row.get("Date"))
+        close = _optional_decimal(row.get("Close"))
+        adjusted_close = _optional_decimal(row.get("Adj Close")) or close
+        values = [
+            _optional_decimal(row.get(field))
+            for field in ("Open", "High", "Low")
+        ]
+        volume = _optional_decimal(row.get("Volume"))
+        if ticker_id is None:
+            raise ValueError(f"No ticker_id mapping for yfinance symbol {provider_symbol}")
+        if not record_date or close is None or adjusted_close is None or any(
+            value is None for value in values
+        ) or volume is None:
+            raise ValueError(
+                f"Incomplete yfinance history row for {provider_symbol or 'unknown'}"
+            )
+        if volume < 0 or volume != volume.to_integral_value():
+            raise ValueError(f"Invalid yfinance volume for {provider_symbol}")
+        connection.execute(
+            """
+            INSERT INTO historical_records (
+                ticker_id, record_date, open, high, low, close,
+                adjusted_close, volume
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (ticker_id, record_date) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                adjusted_close = excluded.adjusted_close,
+                volume = excluded.volume
+            """,
+            [
+                ticker_id,
+                record_date,
+                values[0],
+                values[1],
+                values[2],
+                close,
+                adjusted_close,
+                int(volume),
+            ],
+        )
+        written += 1
+    return written
 
 
 def ensure_tickers(
@@ -430,7 +546,31 @@ def upload_email_transactions(
     connection = get_shared_connection(db_path)
     written = 0
     for row in data.to_dict(orient="records"):
+        source = "interac" if _text(row.get("ticker")).upper() == "EMAIL" else "wealthsimple"
+        source_message_id = _text(row.get("source_message_id"))
+        if not source_message_id:
+            source_message_id = "legacy:" + hashlib.sha256(
+                json.dumps(row, default=str, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        existing_message = connection.execute(
+            "SELECT email_message_id FROM email_messages WHERE source = ? AND source_message_id = ?",
+            [source, source_message_id],
+        ).fetchone()
+        if existing_message:
+            continue
+        content_hash = hashlib.sha256(
+            json.dumps(row, default=str, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        email_message_id = int(connection.execute(
+            """
+            INSERT INTO email_messages (
+                source, source_message_id, received_at, content_hash
+            ) VALUES (?, ?, ?, ?) RETURNING email_message_id
+            """,
+            [source, source_message_id, row.get("received_at") or None, content_hash],
+        ).fetchone()[0])
         ticker_id = row.get("ticker_id")
+        resolved = ticker_id is not None and not pd.isna(ticker_id)
         values = [
             _text(row.get("account")) or None,
             _text(row.get("transaction")) or "UNKNOWN",
@@ -461,10 +601,18 @@ def upload_email_transactions(
             """
             INSERT OR IGNORE INTO email_transactions (
                 account, transaction_type, ticker_id, quantity, average_price,
-                total_cost, debit, transaction_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                total_cost, debit, transaction_date, email_message_id,
+                source_symbol, price_currency, ticker_resolution_status,
+                reconciliation_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            values,
+            values + [
+                email_message_id,
+                _text(row.get("ticker")) or None,
+                _text(row.get("price_currency")) or None,
+                "resolved" if resolved else "pending",
+                "not_applicable" if source == "interac" else "provisional",
+            ],
         )
         written += 1
     logger.info("Email upload complete | inserted=%d | input=%d", written, len(data))
@@ -472,6 +620,95 @@ def upload_email_transactions(
         "Email FX summary unavailable | transactions=0 | reason=missing applied FX rate and confirmed CAD amount"
     )
     return written
+
+
+def reconcile_email_transactions(db_path: Path | str = DATABASE_PATH) -> int:
+    """Supersede provisional email trades when one statement row matches exactly."""
+    connection = get_shared_connection(db_path)
+    rows = connection.execute(
+        """
+        SELECT email_transaction_id, ticker_id, transaction_type,
+               ABS(quantity), transaction_date
+        FROM email_transactions
+        WHERE ticker_id IS NOT NULL
+          AND ticker_resolution_status = 'resolved'
+          AND reconciliation_status = 'provisional'
+          AND (UPPER(transaction_type) LIKE '%BUY%'
+               OR UPPER(transaction_type) LIKE '%SELL%')
+        ORDER BY email_transaction_id
+        """
+    ).fetchall()
+    reconciled = 0
+    for email_id, ticker_id, transaction_type, quantity, transaction_date in rows:
+        direction = "SELL" if "SELL" in str(transaction_type).upper() else "BUY"
+        candidates = connection.execute(
+            """
+            SELECT transaction_id
+            FROM transactions tr
+            WHERE tr.ticker_id = ?
+              AND UPPER(tr.transaction_type) = ?
+              AND ABS(tr.quantity) = ?
+              AND COALESCE(tr.execution_date, tr.transaction_date) = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM email_transactions et
+                  WHERE et.matched_transaction_id = tr.transaction_id
+              )
+            ORDER BY transaction_id
+            """,
+            [ticker_id, direction, quantity, transaction_date],
+        ).fetchall()
+        if not candidates:
+            nearby = connection.execute(
+                """
+                SELECT transaction_id
+                FROM transactions tr
+                WHERE tr.ticker_id = ?
+                  AND UPPER(tr.transaction_type) = ?
+                  AND ABS(tr.quantity) = ?
+                  AND ABS(date_diff('day', COALESCE(tr.execution_date, tr.transaction_date), ?)) <= 3
+                  AND NOT EXISTS (
+                      SELECT 1 FROM email_transactions et
+                      WHERE et.matched_transaction_id = tr.transaction_id
+                  )
+                ORDER BY transaction_id
+                """,
+                [ticker_id, direction, quantity, transaction_date],
+            ).fetchall()
+            if len(nearby) == 1:
+                candidates = nearby
+            elif len(nearby) > 1:
+                connection.execute(
+                    """
+                    UPDATE email_transactions
+                    SET reconciliation_status = 'review_required'
+                    WHERE email_transaction_id = ?
+                    """,
+                    [email_id],
+                )
+                logger.warning(
+                    "Email reconciliation requires review | email_transaction_id=%d | candidates=%d",
+                    email_id, len(nearby),
+                )
+                continue
+            else:
+                continue
+        if len(candidates) > 1:
+            logger.info(
+                "Email reconciliation pairing repeated trade deterministically | "
+                "email_transaction_id=%d | candidates=%d",
+                email_id, len(candidates),
+            )
+        connection.execute(
+            """
+            UPDATE email_transactions
+            SET reconciliation_status = 'superseded', matched_transaction_id = ?
+            WHERE email_transaction_id = ?
+            """,
+            [candidates[0][0], email_id],
+        )
+        reconciled += 1
+    logger.info("Email reconciliation complete | reconciled=%d | candidates=%d", reconciled, len(rows))
+    return reconciled
 
 
 def get_email_checkpoint(
@@ -486,19 +723,21 @@ def get_email_checkpoint(
 
 
 def update_email_checkpoint(
-    checked_through_date: date,
+    checked_through_date: date | datetime,
     email_count: int,
     db_path: Path | str = DATABASE_PATH,
     source: str = EMAIL_CHECKPOINT_SOURCE,
 ) -> None:
     get_shared_connection(db_path).execute(
         """
-        INSERT INTO email_checkpoints (source, checked_through_date, email_count)
-        VALUES (?, ?, ?)
+        INSERT INTO email_checkpoints (
+            source, checked_through_date, checked_through_at, email_count
+        ) VALUES (?, ?, ?, ?)
         ON CONFLICT (source) DO UPDATE SET
             checked_through_date = excluded.checked_through_date,
+            checked_through_at = excluded.checked_through_at,
             email_count = email_checkpoints.email_count + excluded.email_count,
             updated_at = now()
         """,
-        [source, checked_through_date, email_count],
+        [source, checked_through_date, checked_through_date, email_count],
     )

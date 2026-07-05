@@ -331,6 +331,8 @@ def fetch_security_history(
     tickers: Iterable[str],
     start_date: str | date,
     end_date: str | date | None = None,
+    *,
+    raise_on_error: bool = False,
 ) -> pd.DataFrame:
     normalized_tickers = _normalize_tickers(tickers)
     if not normalized_tickers:
@@ -351,6 +353,8 @@ def fetch_security_history(
         )
     except Exception:
         logger.exception("Failed to fetch yfinance historical data")
+        if raise_on_error:
+            raise
         return _empty_frame(HISTORY_COLUMNS)
 
     normalized = _normalize_history_data(history, normalized_tickers)

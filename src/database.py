@@ -30,6 +30,7 @@ REQUIRED_TABLES = frozenset(
         "cash_transactions",
         "historical_records",
         "email_checkpoints",
+        "email_messages",
         "email_transactions",
         "activity_imports",
         "raw_activity_exports",
@@ -434,12 +435,29 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
                     DEFAULT nextval('email_checkpoint_id_sequence'),
                 source VARCHAR NOT NULL UNIQUE,
                 checked_through_date DATE NOT NULL,
+                checked_through_at TIMESTAMP,
                 email_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
         connection.execute("CREATE SEQUENCE email_transaction_id_sequence START 1")
+        connection.execute("CREATE SEQUENCE email_message_id_sequence START 1")
+        connection.execute(
+            """
+            CREATE TABLE email_messages (
+                email_message_id BIGINT PRIMARY KEY
+                    DEFAULT nextval('email_message_id_sequence'),
+                source VARCHAR NOT NULL,
+                source_message_id VARCHAR NOT NULL,
+                received_at TIMESTAMP,
+                content_hash VARCHAR NOT NULL,
+                processing_status VARCHAR NOT NULL DEFAULT 'stored',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (source, source_message_id)
+            )
+            """
+        )
         connection.execute(
             """
             CREATE TABLE email_transactions (
@@ -453,7 +471,15 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
                 total_cost DECIMAL(20, 4),
                 debit DECIMAL(20, 4),
                 transaction_date DATE NOT NULL,
+                email_message_id BIGINT,
+                source_symbol VARCHAR,
+                price_currency VARCHAR(10),
+                ticker_resolution_status VARCHAR NOT NULL DEFAULT 'resolved',
+                reconciliation_status VARCHAR NOT NULL DEFAULT 'provisional',
+                matched_transaction_id BIGINT,
                 FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id),
+                FOREIGN KEY (email_message_id) REFERENCES email_messages(email_message_id),
+                FOREIGN KEY (matched_transaction_id) REFERENCES transactions(transaction_id),
                 UNIQUE (
                     account,
                     transaction_type,
@@ -609,14 +635,14 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
                     )
                     connection.execute(
                         "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
-                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                        [4, SCHEMA_COMPONENT],
                     )
                     connection.execute("COMMIT")
                 except Exception:
                     connection.execute("ROLLBACK")
                     logger.exception("Database migration from version 3 failed")
                     raise
-                logger.info("Database migrated from schema version 3 to %d", DATABASE_SCHEMA_VERSION)
+                logger.info("Database migrated from schema version 3 to 4")
                 row = (4,)
             if row and row[0] == 4:
                 connection.execute("BEGIN TRANSACTION")
@@ -638,14 +664,14 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
                     )
                     connection.execute(
                         "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
-                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                        [5, SCHEMA_COMPONENT],
                     )
                     connection.execute("COMMIT")
                 except Exception:
                     connection.execute("ROLLBACK")
                     logger.exception("Database migration from version 4 failed")
                     raise
-                logger.info("Database migrated from schema version 4 to %d", DATABASE_SCHEMA_VERSION)
+                logger.info("Database migrated from schema version 4 to 5")
                 row = (5,)
             if row and row[0] == 5:
                 connection.execute("BEGIN TRANSACTION")
@@ -655,14 +681,14 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
                     )
                     connection.execute(
                         "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
-                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                        [6, SCHEMA_COMPONENT],
                     )
                     connection.execute("COMMIT")
                 except Exception:
                     connection.execute("ROLLBACK")
                     logger.exception("Database migration from version 5 failed")
                     raise
-                logger.info("Database migrated from schema version 5 to %d", DATABASE_SCHEMA_VERSION)
+                logger.info("Database migrated from schema version 5 to 6")
                 row = (6,)
             if row and row[0] == 6:
                 connection.execute("BEGIN TRANSACTION")
@@ -672,14 +698,79 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
                     )
                     connection.execute(
                         "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
-                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                        [7, SCHEMA_COMPONENT],
                     )
                     connection.execute("COMMIT")
                 except Exception:
                     connection.execute("ROLLBACK")
                     logger.exception("Database migration from version 6 failed")
                     raise
-                logger.info("Database migrated from schema version 6 to %d", DATABASE_SCHEMA_VERSION)
+                logger.info("Database migrated from schema version 6 to 7")
+                row = (7,)
+            if row and row[0] == 7:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    connection.execute("CREATE SEQUENCE IF NOT EXISTS email_message_id_sequence START 1")
+                    connection.execute(
+                        "ALTER TABLE email_checkpoints ADD COLUMN IF NOT EXISTS checked_through_at TIMESTAMP"
+                    )
+                    connection.execute(
+                        "UPDATE email_checkpoints SET checked_through_at = CAST(checked_through_date AS TIMESTAMP) "
+                        "WHERE checked_through_at IS NULL"
+                    )
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS email_messages (
+                            email_message_id BIGINT PRIMARY KEY
+                                DEFAULT nextval('email_message_id_sequence'),
+                            source VARCHAR NOT NULL,
+                            source_message_id VARCHAR NOT NULL,
+                            received_at TIMESTAMP,
+                            content_hash VARCHAR NOT NULL,
+                            processing_status VARCHAR NOT NULL DEFAULT 'stored',
+                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            UNIQUE (source, source_message_id)
+                        )
+                        """
+                    )
+                    for definition in (
+                        "email_message_id BIGINT",
+                        "source_symbol VARCHAR",
+                        "price_currency VARCHAR(10)",
+                        "ticker_resolution_status VARCHAR DEFAULT 'resolved'",
+                        "reconciliation_status VARCHAR DEFAULT 'provisional'",
+                        "matched_transaction_id BIGINT",
+                    ):
+                        connection.execute(
+                            f"ALTER TABLE email_transactions ADD COLUMN IF NOT EXISTS {definition}"
+                        )
+                    connection.execute(
+                        "UPDATE email_transactions SET ticker_resolution_status = "
+                        "CASE WHEN ticker_id IS NULL THEN 'pending' ELSE 'resolved' END "
+                        "WHERE ticker_resolution_status IS NULL"
+                    )
+                    connection.execute(
+                        """
+                        UPDATE email_transactions SET reconciliation_status =
+                            CASE
+                                WHEN UPPER(transaction_type) LIKE '%BUY%'
+                                  OR UPPER(transaction_type) LIKE '%SELL%'
+                                THEN 'provisional'
+                                ELSE 'not_applicable'
+                            END
+                        WHERE reconciliation_status IS NULL
+                        """
+                    )
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 7 failed")
+                    raise
+                logger.info("Database migrated from schema version 7 to %d", DATABASE_SCHEMA_VERSION)
                 return False
         if existing_tables:
             raise RuntimeError(
