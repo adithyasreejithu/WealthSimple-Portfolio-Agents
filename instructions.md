@@ -23,10 +23,16 @@ This file is the first thing to read before implementing or changing code in thi
 - Prefer small, focused changes.
 - Preserve existing behavior unless the task explicitly asks for a change.
 - Keep names clear and consistent with the surrounding code.
-- Add comments only where the logic would otherwise be hard to follow.
+- Every new feature must include docstrings or comments that explain its purpose,
+  important constraints, non-obvious decisions, and significant data flow.
+- Comments should explain why the code exists or why an approach was chosen; do
+  not restate straightforward code line by line.
 - Reuse shared helpers and avoid duplicating logic when a common utility already exists.
 - Do not rename files or create extra copies unless the task explicitly asks for that behavior.
 - Keep non-secret static values in `src/config.py` so modules share one source of truth.
+- Treat reusable hard-coded business values as configuration. Rates, thresholds,
+  tolerances, annualization periods, source defaults, and similar financial
+  assumptions belong in `src/config.py`, not inline in runtime calculations.
 - Keep secrets, tokens, passwords, and environment-specific values out of `src/config.py`; load those from the environment at runtime instead.
 - Treat `instructions.md` as the repo-wide default context for all implementation work unless a task overrides it.
 - Prefer adding or updating tests in `tests/` when behavior changes.
@@ -61,6 +67,12 @@ Use these sources according to their role and priority:
 
 When sources conflict, use the entire Wealthsimple data export for verification while preserving additional details, such as FX information, that are available only in monthly reports.
 
+Analytics must select one source explicitly when sources can overlap. Dividend
+analytics defaults to email for near-real-time coverage, cash-flow and commission
+analytics default to activity exports for broad history, and FX analytics defaults
+to statements because only statements currently retain both the applied FX rate
+and CAD cash amount. Do not silently combine these sources and double-count events.
+
 ## Database Normalization
 
 - Use `ticker_id` as the canonical database key for securities in every domain, including statements, email transactions, yfinance metadata, and historical prices.
@@ -83,6 +95,8 @@ When sources conflict, use the entire Wealthsimple data export for verification 
 - Always implement regression testing for behavior changes, bug fixes, and refactors that could affect existing flows.
 - Always add or update test cases for new features before considering the work complete.
 - For CLI and pipeline changes, confirm both exit code and printed status output.
+- Keep every user-facing CLI feature accessible through `src/app.py` and update
+  `docs/reference/cli.md` whenever a command or option changes.
 - For database changes, verify initialization and any migration path touched by the change.
 
 ## Git and Repo Hygiene
@@ -94,12 +108,17 @@ When sources conflict, use the entire Wealthsimple data export for verification 
 
 ## Comments Format
 
-- Please follow this format:
-  ```text
-  """
-  Comment
-  """
-  ```
+- Use Python docstrings for modules, classes, and public functions.
+- Use `#` comments for local implementation rationale and non-obvious behavior.
+- Keep comments accurate when changing the code they describe.
+
+## Documentation and Context
+
+- Treat `docs/project/handover.md` as the current repository context file.
+- After every completed task that changes the repository, update the handover
+  with the current state, completed work, remaining limitations, and verification.
+- Keep `docs/README.md` and the relevant reference documents synchronized when
+  files, commands, or supported workflows change.
 
 ## Future Work
 

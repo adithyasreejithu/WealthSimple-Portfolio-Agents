@@ -8,7 +8,7 @@ Call `initialize_database()` when the future end-to-end process starts.
 
 - A database with the complete current schema and matching schema version is active, so initialization returns without changing data.
 - An empty database is initialized with every table in one transaction.
-- A partial, legacy, or version-mismatched database raises an error. Migration is deferred and tracked in `docs/TODO.md`.
+- A partial, legacy, or version-mismatched database raises an error. Migration is deferred and tracked in the [project TODO](../project/todo.md).
 
 The `schema_metadata` table records the active schema version. Startup also verifies that every required table exists, so metadata alone cannot mark a partial schema as active.
 
@@ -30,6 +30,11 @@ This is a temporary rule and should be replaced later by a security master or ex
 `activity_imports` tracks each source file, its hash, status, row counts, duplicate counts, and unresolved ticker count.
 
 `raw_activity_exports` preserves every original Wealthsimple export field for audit and reconciliation. `activities` is the typed analytics table and stores `ticker_id` instead of symbol or security name.
+
+Estimated Wealthsimple FX fees are intentionally not stored as schema fields.
+Analytics derives them from statement `transactions.transaction_type`, `debit`,
+`credit`, and `fx_rate` using the configured fee rate. This avoids stale derived
+values and does not duplicate unavailable fields into activity or email tables.
 
 Ticker-bearing rows must resolve unambiguously before an import is published. Rejected imports retain their raw rows and source file. Successful imports append new activity, update lineage for repeated history, and archive the source CSV.
 

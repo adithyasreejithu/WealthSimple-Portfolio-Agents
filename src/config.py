@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -19,6 +20,14 @@ DATABASE_PATH = Path(
     os.getenv("DB_PATH", str(DATA_FOLDER / "PRD_WealthSimple.duckdb"))
 ).expanduser()
 DATABASE_SCHEMA_VERSION = 7
+
+"""
+Financial analytics assumptions. Keep business constants here so calculations
+remain reviewable and do not diverge between CLI and library callers.
+"""
+WEALTHSIMPLE_FX_FEE_RATE = Decimal("0.015")
+ANNUALIZATION_PERIODS = 252
+DEFAULT_RISK_FREE_RATE = 0.0
 
 """
 Logging config used by `system_logger.py`.

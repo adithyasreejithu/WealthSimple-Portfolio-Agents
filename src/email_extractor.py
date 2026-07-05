@@ -347,20 +347,22 @@ def export_run_csv(data: pd.DataFrame, export_folder: Path | str = DEFAULT_EXPOR
 Accept an optional explicit start date while the permanent database-backed
 checkpoint remains future work.
 """
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse email CLI arguments from a caller or the process command line."""
     parser = argparse.ArgumentParser(description="Extract Wealthsimple and Interac email transactions.")
     parser.add_argument("--date-from", type=str, default=DEFAULT_START_DATE)
     parser.add_argument("--export", action="store_true", help="Write this run's email data to exports/*.csv.")
     parser.add_argument("--export-folder", type=Path, default=DEFAULT_EXPORT_FOLDER)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 """
 Print the full combined dataset at the end of each run for visibility.
 """
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    """Run email extraction as a standalone or delegated CLI command."""
     try:
-        args = parse_args()
+        args = parse_args(argv)
         logger.info(
             "Running email extractor CLI | date_from=%s | export=%s",
             args.date_from,
@@ -372,17 +374,18 @@ def main() -> None:
 
         if data.empty:
             print("No matching emails found.")
-            return
+            return 0
 
         print("Email transactions:")
         print(data.to_string(index=False))
         if args.export:
             export_path = export_run_csv(data, args.export_folder)
             print(f"\nExported email transactions to {export_path}")
+        return 0
     except Exception:
         logger.exception("Email extractor failed")
         raise
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

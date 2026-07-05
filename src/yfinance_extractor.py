@@ -408,7 +408,8 @@ def _print_frame(title: str, data: pd.DataFrame) -> None:
     print(data.to_string(index=False))
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
+    """Run yfinance extraction as a standalone or delegated CLI command."""
     args = parse_args(argv)
     if args.ignore_proxy:
         clear_proxy_environment()
@@ -422,7 +423,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.include_history:
         history = fetch_security_history(args.tickers, args.start_date, args.end_date)
         _print_frame("HISTORY", history)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

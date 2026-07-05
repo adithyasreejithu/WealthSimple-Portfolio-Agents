@@ -1,6 +1,6 @@
 # Email Extraction Success Criteria
 
-Use this checklist to decide whether the email extraction consolidation is ready to move forward. The detailed implementation plan lives in `docs/email_extraction_plan.md`.
+Use this checklist to decide whether the email extraction consolidation is ready to move forward. The detailed implementation plan is [Email Extraction Plan](../plans/email_extraction.md).
 
 ## Scope
 
