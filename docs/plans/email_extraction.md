@@ -13,7 +13,8 @@ Create one flat runtime file under `src/` that combines the existing Wealthsimpl
 5. Normalize both sources into one dataframe with the columns `account`, `transaction`, `ticker_id`, `ticker`, `quantity`, `avg_price`, `total_cost`, `debit`, and `date`.
 6. Leave non-applicable fields blank for now, except for the existing Interac defaults `ticker_id=0` and `ticker=EMAIL`.
 7. Read credentials from environment variables and use `START_DATE` as the temporary start-date source.
-8. If `START_DATE` is not configured, run without a date filter and log that the database-backed checkpoint is still future work.
+8. For direct extractor runs, use `START_DATE` when supplied. The canonical database
+   pipeline instead reads and transactionally advances `email_checkpoints`.
 9. Resolve `date` from the email body first and fall back to the IMAP received date when the body does not provide one.
 10. Warn when neither the in-email date nor the received date is available.
 11. Print the full combined dataframe at the end of the run.
@@ -33,6 +34,8 @@ Create one flat runtime file under `src/` that combines the existing Wealthsimpl
 
 ## Deferred Work
 
-- Database-backed email start-date checkpoint retrieval.
-- Email upload or checkpoint update flows.
+- Database-backed checkpoint retrieval and transactional email publication were added
+  in schema v8 through `pipeline --source email`.
+- Message identity, pending ticker resolution, provisional holdings, and statement
+  reconciliation are documented in the database schema and CLI references.
 - Replacing environment-based credentials with a later permanent mechanism.

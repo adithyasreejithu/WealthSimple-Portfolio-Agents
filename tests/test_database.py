@@ -72,6 +72,24 @@ class DatabaseTest(unittest.TestCase):
         self.assertFalse(created)
         self.assertEqual(ticker_count, 1)
 
+    def test_version_seven_schema_is_upgraded_to_version_eight(self):
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "UPDATE schema_metadata SET schema_version = 7 WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        )
+
+        created = database.initialize_database(self.db_path)
+
+        version = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        ).fetchone()[0]
+        self.assertFalse(created)
+        self.assertEqual(version, 8)
+        self.assertTrue(database.is_database_active(connection))
+
     def test_tickers_owns_shared_listing_identity(self):
         database.initialize_database(self.db_path)
         connection = database.get_shared_connection(self.db_path)

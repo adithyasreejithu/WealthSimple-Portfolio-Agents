@@ -19,7 +19,7 @@ LOG_FOLDER = BASE_DIR / "logs"
 DATABASE_PATH = Path(
     os.getenv("DB_PATH", str(DATA_FOLDER / "PRD_WealthSimple.duckdb"))
 ).expanduser()
-DATABASE_SCHEMA_VERSION = 7
+DATABASE_SCHEMA_VERSION = 8
 
 """
 Financial analytics assumptions. Keep business constants here so calculations
@@ -53,6 +53,8 @@ EMAIL_OUTPUT_COLUMNS = [
     "debit",
     "date",
     "price_currency",
+    "source_message_id",
+    "received_at",
 ]
 
 WEALTHSIMPLE_SENDERS = (

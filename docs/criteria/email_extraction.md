@@ -7,7 +7,8 @@ Use this checklist to decide whether the email extraction consolidation is ready
 - Runtime email extraction code lives under `src/`.
 - Runtime extraction is consolidated in `src/email_extractor.py`.
 - `src/email_extractor.py` can be run directly.
-- Database-backed start-date retrieval is deferred.
+- Direct extraction remains read-only; the canonical pipeline owns database checkpoints
+  and publication.
 
 ## Required Outcomes
 
@@ -34,6 +35,6 @@ Use this checklist to decide whether the email extraction consolidation is ready
 
 ## Out of Scope For This Plan
 
-- Reading the start date from the database.
-- Updating database checkpoints after a run.
-- Uploading email transactions into the database.
+- These items were intentionally outside the original extractor consolidation and are
+  now implemented by the schema v8 pipeline without coupling database writes into the
+  extractor.

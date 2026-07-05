@@ -72,6 +72,17 @@ python src/app.py email --date-from 2025-01-01 --export --export-folder exports
 Email access still requires the credentials and mailbox configuration expected by
 `src/email_extractor.py`.
 
+`python src/app.py email` is extractor-only. To persist new messages, update live
+positions, reconcile statement trades, and refresh prices, run:
+
+```powershell
+python src/app.py pipeline --source email
+```
+
+The database pipeline is incremental and deduplicates messages by message ID. Known
+tickers publish immediately. Unknown tickers are retained as pending while unrelated
+trades continue to publish; a pending run exits nonzero and prints the required action.
+
 ## YFinance
 
 ```powershell
@@ -87,16 +98,44 @@ python src/app.py yfinance --tickers AAPL --include-history --start-date 2025-01
 - `--cache-dir PATH` selects the yfinance cache.
 - `--ignore-proxy` clears proxy environment variables for the run.
 
+### Database synchronization
+
+The default full pipeline automatically synchronizes owned ticker metadata and
+history after all ingestion sources succeed. Retry or target that operation with:
+
+```powershell
+python src/app.py yfinance-sync
+python src/app.py yfinance-sync --database Data/PRD_WealthSimple.duckdb --tickers AAPL VFV.TO
+python src/app.py yfinance-sync --full
+```
+
+- `--database PATH` selects the DuckDB database.
+- `--tickers SYMBOL [SYMBOL ...]` optionally limits the run by canonical or
+  Yahoo provider symbol.
+- `--full` backfills again from each selected ticker's first portfolio activity.
+- History starts at the earliest owned date on the first run and continues
+  incrementally after the latest stored date on later runs.
+- Synchronization refreshes stock/ETF detail records and historical prices only.
+  It does not alter existing ticker identity fields, Yahoo mappings, or symbol history.
+- Missing ticker identities must first be created through ingestion or the
+  `ticker-map` workflow; unexpected metadata returned by Yahoo is skipped.
+- The command exits nonzero when fetching or database publication fails.
+
 ## Ticker Mappings
 
 ```powershell
 python src/app.py ticker-map list
+python src/app.py ticker-map pending
+python src/app.py ticker-map resolve-pending
 python src/app.py ticker-map validate --source-symbol AAPL
 python src/app.py ticker-map import-csv mappings.csv
 ```
 
-Available actions are `add`, `update`, `list`, `validate`, `retire`, and
-`import-csv`. All actions accept `--database PATH` and `--output {text,json}`.
+Available actions are `add`, `update`, `list`, `pending`, `resolve-pending`,
+`validate`, `retire`, and `import-csv`. `pending` lists unresolved email symbols.
+`resolve-pending` asks for the mapping interactively; scheduled pipelines never prompt.
+Saving a mapping activates matching pending rows without refetching email.
+All actions accept `--database PATH` and `--output {text,json}`.
 Use action-level `--help` for mapping fields and effective-date options.
 
 ## Activity Import

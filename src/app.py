@@ -19,12 +19,14 @@ from data_sorter import move_to_processed_folder, sort_data
 from database import get_shared_connection, initialize_database
 from database_command import (
     get_email_checkpoint,
+    reconcile_email_transactions,
     update_email_checkpoint,
     upload_email_transactions,
     upload_statement_transactions,
 )
 from analytics import portfolio_report
 from email_extractor import fetch_email_transactions
+from market_data import sync_market_data
 from statement_extractor import extract_statement_pdf
 from staging import (
     complete_batch, create_batch, mark_file, resolve_batch,
@@ -132,6 +134,7 @@ def _publish_statement_file(
     connection.execute("BEGIN TRANSACTION")
     try:
         rows = upload_statement_transactions(prepared, db_path)
+        reconcile_email_transactions(db_path)
         connection.execute("COMMIT")
     except Exception:
         connection.execute("ROLLBACK")
@@ -152,13 +155,54 @@ def _publish_email_batch(
     connection.execute("BEGIN TRANSACTION")
     try:
         rows = upload_email_transactions(prepared, db_path)
-        update_email_checkpoint(date.today(), rows, db_path)
+        reconcile_email_transactions(db_path)
+        received = (
+            pd.to_datetime(prepared["received_at"], errors="coerce")
+            if "received_at" in prepared.columns and not prepared.empty
+            else pd.Series(dtype="datetime64[ns]")
+        )
+        latest_received = received.max() if not received.empty else pd.NaT
+        checkpoint = (
+            latest_received.to_pydatetime()
+            if not pd.isna(latest_received)
+            else max(prepared["date"], default=date.today())
+        )
+        update_email_checkpoint(checkpoint, rows, db_path)
         connection.execute("COMMIT")
     except Exception:
         connection.execute("ROLLBACK")
         raise
     mark_file(staged_file_id, "published", db_path=db_path)
     return rows
+
+
+def _pending_email_symbols(staged_file_id: int, db_path: Path | str) -> list[str]:
+    rows = get_shared_connection(db_path).execute(
+        """
+        SELECT DISTINCT source_symbol
+        FROM staged_records
+        WHERE staged_file_id = ? AND source_symbol IS NOT NULL
+          AND resolution_status <> 'resolved'
+        ORDER BY source_symbol
+        """,
+        [staged_file_id],
+    ).fetchall()
+    return [str(symbol) for (symbol,) in rows]
+
+
+def _pending_email_error(symbols: list[str]) -> str:
+    joined = ", ".join(symbols)
+    return (
+        f"published with pending ticker(s): {joined}; "
+        "run `python src/app.py ticker-map pending`"
+    )
+
+
+def _sync_email_history(db_path: Path | str) -> str | None:
+    result = sync_market_data(db_path)
+    if result.succeeded:
+        return None
+    return result.error or "historical price synchronization failed"
 
 
 def _stage_statement_files(
@@ -352,24 +396,22 @@ def run_email(
 
     staged_id = stage_dataframe(batch_id, "email", None, 1, data, db_path)
     resolve_batch(batch_id, db_path, [staged_id])
-    unresolved_rows = get_shared_connection(db_path).execute(
-        """
-        SELECT DISTINCT source_symbol
-        FROM staged_records
-        WHERE staged_file_id = ? AND source_symbol IS NOT NULL
-          AND resolution_status <> 'resolved'
-        ORDER BY source_symbol
-        """,
-        [staged_id],
-    ).fetchall()
-    if unresolved_rows:
-        error = f"not published; unresolved ticker(s): {', '.join(symbol for (symbol,) in unresolved_rows)}"
-        mark_file(staged_id, "quarantined", error, db_path)
-        complete_batch(batch_id, db_path)
-        return SourceResult("email", None, "failed", error=error)
+    pending_symbols = _pending_email_symbols(staged_id, db_path)
 
     try:
         rows = _publish_email_batch(staged_id, data, db_path)
+        history_error = _sync_email_history(db_path)
+        partial_errors = []
+        if pending_symbols:
+            partial_errors.append(_pending_email_error(pending_symbols))
+        if history_error:
+            partial_errors.append(history_error)
+        if partial_errors:
+            error = "; ".join(partial_errors)
+            mark_file(staged_id, "partial", error, db_path)
+            logger.warning("Email pipeline %s", error)
+            complete_batch(batch_id, db_path)
+            return SourceResult("email", None, "partial", rows, error)
         complete_batch(batch_id, db_path)
         return SourceResult("email", None, "succeeded", rows)
     except Exception as exc:
@@ -424,24 +466,22 @@ def run_pipeline(
         results.extend(stage_results)
         for staged_file_id, data in email_staged:
             resolve_batch(batch_id, db_path, [staged_file_id])
-            unresolved_rows = get_shared_connection(db_path).execute(
-                """
-                SELECT DISTINCT source_symbol
-                FROM staged_records
-                WHERE staged_file_id = ? AND source_symbol IS NOT NULL
-                  AND resolution_status <> 'resolved'
-                ORDER BY source_symbol
-                """,
-                [staged_file_id],
-            ).fetchall()
-            if unresolved_rows:
-                error = f"not published; unresolved ticker(s): {', '.join(symbol for (symbol,) in unresolved_rows)}"
-                mark_file(staged_file_id, "quarantined", error, db_path)
-                results.append(SourceResult("email", None, "failed", error=error))
-                continue
+            pending_symbols = _pending_email_symbols(staged_file_id, db_path)
             try:
                 rows = _publish_email_batch(staged_file_id, data, db_path)
-                results.append(SourceResult("email", None, "succeeded", rows))
+                history_error = _sync_email_history(db_path)
+                partial_errors = []
+                if pending_symbols:
+                    partial_errors.append(_pending_email_error(pending_symbols))
+                if history_error:
+                    partial_errors.append(history_error)
+                if partial_errors:
+                    error = "; ".join(partial_errors)
+                    mark_file(staged_file_id, "partial", error, db_path)
+                    logger.warning("Email pipeline %s", error)
+                    results.append(SourceResult("email", None, "partial", rows, error))
+                else:
+                    results.append(SourceResult("email", None, "succeeded", rows))
             except Exception as exc:
                 logger.exception("Email publication failed")
                 mark_file(staged_file_id, "quarantined", str(exc), db_path)
@@ -494,6 +534,7 @@ def run_pipeline(
     complete_batch(batch_id, db_path)
     if not results:
         results.append(SourceResult(source, None, "skipped"))
+
     return PipelineResult(tuple(results))
 
 
@@ -525,6 +566,9 @@ def _print_root_help() -> None:
     commands.add_parser("statements", help="Extract PDF statement activity.")
     commands.add_parser("email", help="Extract email transactions.")
     commands.add_parser("yfinance", help="Fetch market metadata and history.")
+    commands.add_parser(
+        "yfinance-sync", help="Synchronize owned ticker market data to DuckDB."
+    )
     commands.add_parser("ticker-map", help="Manage ticker mappings.")
     commands.add_parser("import-activities", help="Import one activity export.")
     parser.print_help()
@@ -577,8 +621,8 @@ def _print_portfolio_report(report: dict[str, object]) -> None:
         return
 
     _section_title("Positions")
-    headers = ("Ticker", "Exchange", "Quantity", "Market Value")
-    rows: list[tuple[str, str, str, str]] = []
+    headers = ("Ticker", "Exchange", "Quantity", "Market Value", "Status")
+    rows: list[tuple[str, str, str, str, str]] = []
     for holding in holdings:
         if isinstance(holding, dict):
             rows.append(
@@ -587,6 +631,7 @@ def _print_portfolio_report(report: dict[str, object]) -> None:
                     str(holding.get("exchange", "")),
                     _format_value(holding.get("quantity", 0)),
                     _format_value(holding.get("market_value", 0)),
+                    "provisional" if holding.get("has_provisional_activity") else "confirmed",
                 )
             )
 
@@ -599,23 +644,27 @@ def _print_portfolio_report(report: dict[str, object]) -> None:
         max(len(headers[1]), *(len(row[1]) for row in rows)),
         max(len(headers[2]), *(len(row[2]) for row in rows)),
         max(len(headers[3]), *(len(row[3]) for row in rows)),
+        max(len(headers[4]), *(len(row[4]) for row in rows)),
     ]
     header_line = (
         f"{headers[0]:<{widths[0]}}  "
         f"{headers[1]:<{widths[1]}}  "
         f"{headers[2]:>{widths[2]}}  "
-        f"{headers[3]:>{widths[3]}}"
+        f"{headers[3]:>{widths[3]}}  "
+        f"{headers[4]:<{widths[4]}}"
     )
     print(header_line)
     print(
-        f"{'-' * widths[0]}  {'-' * widths[1]}  {'-' * widths[2]}  {'-' * widths[3]}"
+        f"{'-' * widths[0]}  {'-' * widths[1]}  {'-' * widths[2]}  "
+        f"{'-' * widths[3]}  {'-' * widths[4]}"
     )
-    for ticker, exchange, quantity, market_value in rows:
+    for ticker, exchange, quantity, market_value, status in rows:
         print(
             f"{ticker:<{widths[0]}}  "
             f"{exchange:<{widths[1]}}  "
             f"{quantity:>{widths[2]}}  "
-            f"{market_value:>{widths[3]}}"
+            f"{market_value:>{widths[3]}}  "
+            f"{status:<{widths[4]}}"
         )
 
 
@@ -725,6 +774,33 @@ def _run_delegated_command(command: str, argv: list[str]) -> int:
         return 1
 
 
+def _run_yfinance_sync_command(argv: list[str]) -> int:
+    """Synchronize owned ticker metadata and history into DuckDB."""
+    parser = argparse.ArgumentParser(
+        description="Synchronize owned ticker market data into DuckDB."
+    )
+    parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    parser.add_argument(
+        "--tickers",
+        nargs="+",
+        help="Optionally limit synchronization to canonical or Yahoo symbols.",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Backfill again from each ticker's first portfolio activity.",
+    )
+    args = parser.parse_args(argv)
+    result = sync_market_data(args.database, args.tickers, full=args.full)
+    error_text = f" - {result.error}" if result.error else ""
+    print(
+        f"yfinance: {'succeeded' if result.succeeded else 'failed'} "
+        f"({result.rows} row(s), {result.tickers} ticker(s), "
+        f"{result.skipped} skipped){error_text}"
+    )
+    return 0 if result.succeeded else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Dispatch every user-facing command from the canonical application entry point."""
     raw_args = list(sys.argv[1:] if argv is None else argv)
@@ -735,6 +811,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_pipeline_command(raw_args[1:])
     if raw_args and raw_args[0] == "analytics":
         return _run_analytics_command(raw_args[1:])
+    if raw_args and raw_args[0] == "yfinance-sync":
+        return _run_yfinance_sync_command(raw_args[1:])
 
     # Delegate to module entry points so each command keeps one argument contract.
     delegated_commands = {

@@ -5,9 +5,10 @@ Use this checklist to decide whether the yfinance integration is ready to replac
 ## Scope
 
 - Runtime yfinance code lives in `src/yfinance_extractor.py`.
-- The future pipeline trigger is deferred.
-- The future pipeline will pass a list of tickers and the required date range into the yfinance functions.
-- Database lookup and upload behavior are out of scope for this integration.
+- Extraction remains database-independent. `src/market_data.py` now supplies the
+  separate database synchronization layer and `yfinance-sync` CLI.
+- The synchronizer derives ticker/date targets from portfolio activity and verified
+  provider mappings.
 - CSV export is out of scope unless a future caller explicitly requests it.
 
 ## Required Outcomes
@@ -25,6 +26,10 @@ Use this checklist to decide whether the yfinance integration is ready to replac
 - [x] The extractor does not write `yFinance_Data.csv`.
 - [x] The extractor can be run directly from the terminal for manual live testing.
 - [x] The legacy `extracted_yfinance_method/` folder is removed after migration.
+- [x] Routine synchronization never updates existing `tickers` rows.
+- [x] Routine synchronization preserves automatic and manual Yahoo mappings.
+- [x] Returned metadata is bound to the requested ticker IDs; unexpected rows are skipped.
+- [x] Stock and ETF detail metadata can refresh without changing ticker identity.
 
 ## Output Contracts
 
@@ -42,6 +47,8 @@ Use this checklist to decide whether the yfinance integration is ready to replac
 - [x] Focused tests cover multi-ticker historical dataframe normalization.
 - [x] Focused tests cover empty ticker input.
 - [x] Focused tests cover CLI argument validation and CLI dispatch behavior.
+- [x] Database tests cover enrichment of a ticker referenced by email transactions.
+- [x] Database tests verify ticker identity and provider mappings remain unchanged.
 
 ## Improvements Applied
 

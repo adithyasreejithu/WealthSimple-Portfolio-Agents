@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 from datetime import date, datetime
@@ -157,6 +158,8 @@ def parse_wealthsimple_email(email: str, subject: str, received_date: date | Non
             "debit": extract_first(r"Amount:\s*(?:CA\$|US\$|\$)?(\d+(?:\.\d{1,2})?)", text) or "",
             "date": resolve_email_date(parsed_date, received_date, "Wealthsimple"),
             "price_currency": price_currency,
+            "source_message_id": "",
+            "received_at": received_date,
         }
         logger.debug(
             "Parsed Wealthsimple email | transaction=%s | ticker=%s | quantity=%s | date=%s",
@@ -230,6 +233,8 @@ def parse_interac_email(email: str, subject: str = "", received_date: date | Non
             "debit": extract_interac_money(text),
             "date": resolve_email_date(extract_interac_date(text), received_date, "Interac"),
             "price_currency": "",
+            "source_message_id": "",
+            "received_at": received_date,
         }
         logger.debug("Parsed Interac email | debit=%s | date=%s", row["debit"], row["date"])
         return pd.DataFrame([row], columns=OUTPUT_COLUMNS)
@@ -265,6 +270,21 @@ def fetch_email_transactions(
     interac_messages_seen = 0
     interac_rows_added = 0
 
+    def identify_message(msg: object, source: str) -> str:
+        explicit = str(getattr(msg, "message_id", "") or "").strip()
+        if explicit:
+            return explicit
+        payload = "\n".join(
+            (
+                source,
+                str(getattr(msg, "from_", "") or ""),
+                str(getattr(msg, "subject", "") or ""),
+                str(getattr(msg, "date", "") or ""),
+                str(getattr(msg, "text", "") or ""),
+            )
+        )
+        return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     try:
         wealthsimple_query_parts: list[object] = [OR(*(AND(from_=sender) for sender in WEALTHSIMPLE_SENDERS))]
         interac_query_parts: list[object] = [AND(from_=INTERAC_SENDER)]
@@ -282,6 +302,8 @@ def fetch_email_transactions(
             received_date = msg.date.date() if getattr(msg, "date", None) else None
             parsed = parse_wealthsimple_email(getattr(msg, "text", "") or "", subject, received_date)
             if parsed is not None:
+                parsed["source_message_id"] = identify_message(msg, "wealthsimple")
+                parsed["received_at"] = getattr(msg, "date", None) or received_date
                 rows.append(parsed)
                 wealthsimple_rows_added += len(parsed)
 
@@ -294,6 +316,8 @@ def fetch_email_transactions(
             received_date = msg.date.date() if getattr(msg, "date", None) else None
             parsed = parse_interac_email(getattr(msg, "text", "") or "", getattr(msg, "subject", "") or "", received_date)
             if parsed is not None:
+                parsed["source_message_id"] = identify_message(msg, "interac")
+                parsed["received_at"] = getattr(msg, "date", None) or received_date
                 rows.append(parsed)
                 interac_rows_added += len(parsed)
     finally:
