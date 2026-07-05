@@ -5,12 +5,23 @@ Use this document when signing off, clearing context, or resuming work after a b
 ## Current Focus
 
 - WealthSimple portfolio tooling.
+- Planning a constrained portfolio-classification agent with one supported prompt:
+  `Classify my portfolio`.
 - Main active modules: `src/data_sorter.py`, `src/statement_extractor.py`, `src/email_extractor.py`, and `src/yfinance_extractor.py`.
 - Supporting runtime helper: `src/system_logger.py`.
 - Repo-wide working rules: `instructions.md`.
 
 ## What We Were Doing
 
+- Added the decision-complete design in
+  `docs/plans/constrained_portfolio_classification_agent.md` for a script-driven,
+  read-only classification agent and reusable skills.
+- Defined a database-first enrichment workflow: retain populated database values,
+  use yfinance only for missing allowlisted classification fields, keep enrichment
+  ephemeral, apply the approved YAML rules, and emit JSON.
+- Limited the initial agent surface to one prebuilt workflow. The agent must not
+  receive arbitrary SQL, database paths, ticker lists, Python execution, yfinance
+  fields, or yfinance modes.
 - Added schema v8 live email ingestion with message-level idempotency, pending ticker
   retention, provisional holdings, deterministic statement reconciliation, and
   consolidated market synchronization through `src/market_data.py`.
@@ -32,6 +43,15 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## Current State
 
+- The constrained classification-agent design is documented but its `.codex/agents`
+  and `.agents/skills` structure has not yet been implemented.
+- `agents/openai.yaml` is optional skill presentation metadata for display name,
+  description, and the prebuilt prompt. It is not a permissions boundary; scripts
+  and agent configuration must enforce all access restrictions.
+- The worktree currently contains an uncommitted classifier prototype in
+  `src/portfolio_classifier.py` and focused tests in
+  `tests/test_portfolio_classifier.py`. Review and align that prototype with the
+  approved constrained workflow before including it in an implementation commit.
 - `src/app.py` is the canonical CLI and exposes `pipeline`, `analytics`,
   `statements`, `email`, `yfinance`, `yfinance-sync`, `ticker-map`, and
   `import-activities`.
@@ -75,6 +95,34 @@ Use this document when signing off, clearing context, or resuming work after a b
 - `src/` is intended to stay flat; there should be no Camelot subfolder or separate extractor runner file.
 - `instructions.md` is the repo-wide implementation guide.
 
+## Next Session: Constrained Portfolio Classification Agent
+
+- Use `docs/plans/constrained_portfolio_classification_agent.md` as the source of
+  truth for the first implementation.
+- Create `.codex/agents/portfolio-classifier.toml` with one fixed job and one
+  prebuilt prompt: `Classify my portfolio`.
+- Create script-backed skills under `.agents/skills` for orchestration, read-only
+  portfolio data access, and restricted yfinance classification enrichment.
+- The public agent workflow may invoke only the classification orchestrator. The
+  database and yfinance scripts are constrained implementation dependencies, not
+  open-ended tools exposed to the agent.
+- Open the configured DuckDB database with `read_only=True`. Do not accept SQL or a
+  production database path from the prompt or command line.
+- Use hard-coded, parameterized database queries and return only approved holdings,
+  security metadata, transaction-derived context, and verified provider symbols.
+- Select yfinance modes internally by security type. Allow only `identity`,
+  `equity-classification`, and `etf-classification`; do not expose mode or field
+  selection to the agent.
+- Yfinance may fill only empty allowlisted fields. It must never replace populated
+  database values or write enrichment results to DuckDB or a cache.
+- Apply manual overrides and the YAML classification rules deterministically. Send
+  incomplete or conflicting records to `Needs Review`.
+- Emit schema-validated JSON with field-level provenance and per-ticker enrichment
+  errors. One ticker failure must not abort the remaining portfolio.
+- Before implementation is complete, test that the database is unchanged, arguments
+  cannot escape the allowlists, yfinance is mocked in unit tests, and malformed
+  policy or output data fails safely.
+
 ## Next Session: Activity Export Pipeline
 
 - `activities` is an analytics-ready table inside the main DuckDB database, not a separate database.
@@ -86,6 +134,10 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## Important Files
 
+- `docs/plans/constrained_portfolio_classification_agent.md`
+- `Knowledge-Base/ref/required_fields_v1_1.yaml`
+- `Knowledge-Base/ref/classification_rules_v1_1.yaml`
+- `Knowledge-Base/ref/manual_overrides_v1_1.yaml`
 - `src/app.py`
 - `src/data_sorter.py`
 - `src/statement_extractor.py`
@@ -107,6 +159,14 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## Known Constraints
 
+- The initial classification agent supports only `Classify my portfolio` and JSON
+  output.
+- Classification database access must be view-only and must not expose arbitrary
+  SQL, paths, or mutation methods.
+- Classification yfinance access must be ephemeral, classification-only, and
+  restricted to fixed script modes and field allowlists.
+- Enforce access limits in executable wrappers and agent configuration, not only in
+  prompt wording or `openai.yaml` metadata.
 - Do not create extra tracked files unless the task explicitly requires them.
 - Do not rename the source file during the processed-file move.
 - Keep future changes aligned with `instructions.md`.
@@ -123,6 +183,10 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## Last Completed Work
 
+- Added and pushed the constrained portfolio-classification agent plan on branch
+  `Agent-Development` in commit `9e72293`.
+- Recorded the fixed prompt, script and skill boundaries, DB-first source priority,
+  restricted yfinance modes, JSON contract, and acceptance criteria.
 - Verification: `python -m unittest discover -s tests` passes 109 tests.
 - Consolidated yfinance persistence around `src/market_data.py` and `yfinance-sync`;
   removed the duplicate history-sync command design.
