@@ -4,9 +4,14 @@ Repository documentation is grouped by purpose so plans, acceptance criteria, te
 
 ## Architecture and Technical References
 
-- [Codex agent and skill structure](architecture/codex_agent_skill_structure.md)
+- [Claude agent and skill structure](architecture/claude_agent_skill_structure.md)
 - [Database foundation and schema](architecture/database_schema.md)
 - [Logger notes](architecture/logger_notes.md)
+
+## Agents
+
+- [Portfolio classifier agent](agents/portfolio-classifier/architecture.md)
+- [Portfolio classifier design plan](agents/portfolio-classifier/plan.md)
 
 ## Implementation Plans
 

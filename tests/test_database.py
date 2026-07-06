@@ -72,7 +72,7 @@ class DatabaseTest(unittest.TestCase):
         self.assertFalse(created)
         self.assertEqual(ticker_count, 1)
 
-    def test_version_seven_schema_is_upgraded_to_version_eight(self):
+    def test_version_seven_schema_is_upgraded_to_current_version(self):
         database.initialize_database(self.db_path)
         connection = database.get_shared_connection(self.db_path)
         connection.execute(
@@ -87,7 +87,30 @@ class DatabaseTest(unittest.TestCase):
             [database.SCHEMA_COMPONENT],
         ).fetchone()[0]
         self.assertFalse(created)
-        self.assertEqual(version, 8)
+        self.assertEqual(version, database.DATABASE_SCHEMA_VERSION)
+        self.assertTrue(database.is_database_active(connection))
+
+    def test_version_eight_schema_is_upgraded_and_adds_classifications_table(self):
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute("DROP TABLE portfolio_classifications")
+        connection.execute(
+            "UPDATE schema_metadata SET schema_version = 8 WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        )
+
+        created = database.initialize_database(self.db_path)
+
+        version = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        ).fetchone()[0]
+        table_exists = connection.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'portfolio_classifications'"
+        ).fetchone()[0]
+        self.assertFalse(created)
+        self.assertEqual(version, database.DATABASE_SCHEMA_VERSION)
+        self.assertEqual(table_exists, 1)
         self.assertTrue(database.is_database_active(connection))
 
     def test_tickers_owns_shared_listing_identity(self):

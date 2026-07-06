@@ -21,6 +21,7 @@ REQUIRED_TABLES = frozenset(
         "tickers",
         "stock_details",
         "etf_details",
+        "portfolio_classifications",
         "ticker_provider_mappings",
         "ticker_symbol_history",
         "ingestion_batches",
@@ -178,6 +179,25 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
                 nav DECIMAL(20, 6),
                 top_holdings JSON,
                 sector_weights JSON,
+                FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE portfolio_classifications (
+                ticker_id BIGINT PRIMARY KEY,
+                primary_group VARCHAR NOT NULL,
+                secondary_tags JSON,
+                confidence VARCHAR,
+                reasoning VARCHAR,
+                evidence_used JSON,
+                missing_data JSON,
+                review_needed BOOLEAN NOT NULL,
+                fields JSON,
+                field_provenance JSON,
+                enrichment JSON,
+                generated_at TIMESTAMP NOT NULL,
                 FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
             )
             """
@@ -763,14 +783,47 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
                     )
                     connection.execute(
                         "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
-                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                        [8, SCHEMA_COMPONENT],
                     )
                     connection.execute("COMMIT")
                 except Exception:
                     connection.execute("ROLLBACK")
                     logger.exception("Database migration from version 7 failed")
                     raise
-                logger.info("Database migrated from schema version 7 to %d", DATABASE_SCHEMA_VERSION)
+                logger.info("Database migrated from schema version 7 to 8")
+                row = (8,)
+            if row and row[0] == 8:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS portfolio_classifications (
+                            ticker_id BIGINT PRIMARY KEY,
+                            primary_group VARCHAR NOT NULL,
+                            secondary_tags JSON,
+                            confidence VARCHAR,
+                            reasoning VARCHAR,
+                            evidence_used JSON,
+                            missing_data JSON,
+                            review_needed BOOLEAN NOT NULL,
+                            fields JSON,
+                            field_provenance JSON,
+                            enrichment JSON,
+                            generated_at TIMESTAMP NOT NULL,
+                            FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
+                        )
+                        """
+                    )
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 8 failed")
+                    raise
+                logger.info("Database migrated from schema version 8 to %d", DATABASE_SCHEMA_VERSION)
                 return False
         if existing_tables:
             raise RuntimeError(

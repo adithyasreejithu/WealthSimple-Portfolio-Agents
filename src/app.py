@@ -22,6 +22,7 @@ from database_command import (
     reconcile_email_transactions,
     update_email_checkpoint,
     upload_email_transactions,
+    upload_portfolio_classifications,
     upload_statement_transactions,
 )
 from analytics import portfolio_report
@@ -37,6 +38,9 @@ from system_logger import get_logger
 
 logger = get_logger(__name__)
 SUPPORTED_DATA_SUFFIXES = frozenset({".csv", ".pdf", ".xlsx", ".xls"})
+CLASSIFY_SKILL_SCRIPTS = (
+    Path(__file__).resolve().parents[1] / ".claude" / "skills" / "classify-portfolio" / "scripts"
+)
 
 
 @dataclass(frozen=True)
@@ -571,6 +575,14 @@ def _print_root_help() -> None:
     )
     commands.add_parser("ticker-map", help="Manage ticker mappings.")
     commands.add_parser("import-activities", help="Import one activity export.")
+    commands.add_parser(
+        "portfolio-classify",
+        help="Run the read-only portfolio classification workflow over the live database.",
+    )
+    commands.add_parser(
+        "classification-sync",
+        help="Sync the classify-portfolio JSON output into DuckDB.",
+    )
     parser.print_help()
 
 
@@ -763,8 +775,13 @@ def _run_delegated_command(command: str, argv: list[str]) -> int:
         "yfinance": ("yfinance_extractor", "main"),
         "ticker-map": ("ticker_mapping", "main"),
         "import-activities": ("data_sorter", "main"),
+        "portfolio-classify": ("classify_portfolio", "main"),
     }
     module_name, function_name = delegated_commands[command]
+    if command == "portfolio-classify":
+        # The classification workflow and its helper modules live beside the
+        # classify-portfolio skill, not in src/, so expose them for import.
+        sys.path.insert(0, str(CLASSIFY_SKILL_SCRIPTS))
     module = __import__(module_name, fromlist=[function_name])
     command_main = getattr(module, function_name)
     try:
@@ -801,6 +818,23 @@ def _run_yfinance_sync_command(argv: list[str]) -> int:
     return 0 if result.succeeded else 1
 
 
+def _run_classification_sync_command(argv: list[str]) -> int:
+    """Persist the latest classify-portfolio JSON output into DuckDB."""
+    parser = argparse.ArgumentParser(
+        description="Sync the classification JSON output into DuckDB."
+    )
+    parser.add_argument("--input", type=Path, help="Path to the classification JSON file.")
+    parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    args = parser.parse_args(argv)
+    try:
+        count = upload_portfolio_classifications(args.input, args.database)
+    except Exception as exc:
+        print(f"classification-sync failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"classification-sync: succeeded ({count} row(s))")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Dispatch every user-facing command from the canonical application entry point."""
     raw_args = list(sys.argv[1:] if argv is None else argv)
@@ -813,10 +847,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run_analytics_command(raw_args[1:])
     if raw_args and raw_args[0] == "yfinance-sync":
         return _run_yfinance_sync_command(raw_args[1:])
+    if raw_args and raw_args[0] == "classification-sync":
+        return _run_classification_sync_command(raw_args[1:])
 
     # Delegate to module entry points so each command keeps one argument contract.
     delegated_commands = {
-        "statements", "email", "yfinance", "ticker-map", "import-activities"
+        "statements", "email", "yfinance", "ticker-map", "import-activities", "portfolio-classify"
     }
     if raw_args and raw_args[0] in delegated_commands:
         return _run_delegated_command(raw_args[0], raw_args[1:])

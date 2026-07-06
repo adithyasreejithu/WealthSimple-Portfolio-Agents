@@ -13,7 +13,7 @@ from market_data import MarketSyncResult
 class AppPipelineTest(unittest.TestCase):
     def setUp(self):
         database.close_connection()
-        self.temp_dir = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.addCleanup(database.close_connection)
         self.data_dir = Path(self.temp_dir.name)
@@ -233,6 +233,8 @@ class AppPipelineTest(unittest.TestCase):
             "yfinance-sync",
             "ticker-map",
             "import-activities",
+            "portfolio-classify",
+            "classification-sync",
         ):
             self.assertIn(command, printed)
 
@@ -260,6 +262,27 @@ class AppPipelineTest(unittest.TestCase):
 
         self.assertEqual(output, 0)
         sync.assert_called_once_with(app.DATABASE_PATH, None, full=True)
+
+    def test_classification_sync_command_forwards_input_and_database(self):
+        with patch.object(app, "upload_portfolio_classifications", return_value=3) as upload:
+            output = app.main([
+                "classification-sync",
+                "--input",
+                str(self.data_dir / "classification.json"),
+                "--database",
+                str(self.data_dir / "db.duckdb"),
+            ])
+
+        self.assertEqual(output, 0)
+        upload.assert_called_once_with(
+            self.data_dir / "classification.json", self.data_dir / "db.duckdb"
+        )
+
+    def test_classification_sync_failure_returns_nonzero(self):
+        with patch.object(app, "upload_portfolio_classifications", side_effect=RuntimeError("bad json")):
+            output = app.main(["classification-sync"])
+
+        self.assertEqual(output, 1)
 
 
 if __name__ == "__main__":

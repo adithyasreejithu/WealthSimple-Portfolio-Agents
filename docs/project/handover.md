@@ -16,6 +16,13 @@ Use this document when signing off, clearing context, or resuming work after a b
 - Added the decision-complete design in
   `docs/plans/constrained_portfolio_classification_agent.md` for a script-driven,
   read-only classification agent and reusable skills.
+- Implemented the `portfolio-classifier` agent as a Claude Code subagent at
+  `.claude/agents/portfolio-classifier.md` (model `haiku`, `tools: ["Bash"]`), and
+  made its skill dependencies explicit in the system prompt.
+- Added a human-readable companion doc at
+  `docs/agents/portfolio-classifier/architecture.md` that explains how the
+  classifier agent relates to its supporting skills, alongside the design
+  rationale in `docs/agents/portfolio-classifier/plan.md`.
 - Defined a database-first enrichment workflow: retain populated database values,
   use yfinance only for missing allowlisted classification fields, keep enrichment
   ephemeral, apply the approved YAML rules, and emit JSON.
@@ -43,15 +50,24 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 ## Current State
 
-- The constrained classification-agent design is documented but its `.codex/agents`
-  and `.agents/skills` structure has not yet been implemented.
-- `agents/openai.yaml` is optional skill presentation metadata for display name,
-  description, and the prebuilt prompt. It is not a permissions boundary; scripts
-  and agent configuration must enforce all access restrictions.
+- The constrained classification-agent design is implemented as a Claude Code
+  subagent (`.claude/agents/portfolio-classifier.md`) plus three skills under
+  `.claude/skills/`.
+- Access restrictions are enforced in the skill scripts and in the agent's tool
+  restrictions (`tools: ["Bash"]`), not in prose or presentation metadata.
+- The classification workflow modules (`classification_workflow.py`,
+  `portfolio_classifier.py`) were moved out of `src/` into
+  `.claude/skills/classify-portfolio/scripts/` because they are used only by the
+  classifier agent. `src/app.py`'s `portfolio-classify` subcommand now runs the
+  live, database-backed workflow (it previously ran a hardcoded sample-data demo).
 - The worktree currently contains an uncommitted classifier prototype in
   `src/portfolio_classifier.py` and focused tests in
   `tests/test_portfolio_classifier.py`. Review and align that prototype with the
   approved constrained workflow before including it in an implementation commit.
+- The classifier agent uses model `haiku` and documents its dependency on
+  the `classify-portfolio`, `read-portfolio-classification-data`, and
+  `fetch-yfinance-classification-data` skills.
+- The human-readable docs for the agent live in `docs/agents/portfolio-classifier/`.
 - `src/app.py` is the canonical CLI and exposes `pipeline`, `analytics`,
   `statements`, `email`, `yfinance`, `yfinance-sync`, `ticker-map`, and
   `import-activities`.
@@ -99,9 +115,9 @@ Use this document when signing off, clearing context, or resuming work after a b
 
 - Use `docs/plans/constrained_portfolio_classification_agent.md` as the source of
   truth for the first implementation.
-- Create `.codex/agents/portfolio-classifier.toml` with one fixed job and one
-  prebuilt prompt: `Classify my portfolio`.
-- Create script-backed skills under `.agents/skills` for orchestration, read-only
+- The `portfolio-classifier` subagent (`.claude/agents/portfolio-classifier.md`)
+  has one fixed job and one supported prompt: `Classify my portfolio`.
+- Script-backed skills under `.claude/skills/` provide orchestration, read-only
   portfolio data access, and restricted yfinance classification enrichment.
 - The public agent workflow may invoke only the classification orchestrator. The
   database and yfinance scripts are constrained implementation dependencies, not
@@ -165,8 +181,8 @@ Use this document when signing off, clearing context, or resuming work after a b
   SQL, paths, or mutation methods.
 - Classification yfinance access must be ephemeral, classification-only, and
   restricted to fixed script modes and field allowlists.
-- Enforce access limits in executable wrappers and agent configuration, not only in
-  prompt wording or `openai.yaml` metadata.
+- Enforce access limits in executable wrappers and the agent's tool restrictions,
+  not only in prompt wording.
 - Do not create extra tracked files unless the task explicitly requires them.
 - Do not rename the source file during the processed-file move.
 - Keep future changes aligned with `instructions.md`.

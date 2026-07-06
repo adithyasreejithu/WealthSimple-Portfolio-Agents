@@ -13,13 +13,15 @@ Shared folder paths used by multiple source files.
 """
 DATA_FOLDER = BASE_DIR / "Data"
 EXPORT_FOLDER = BASE_DIR / "exports"
+KNOWLEDGE_BASE_FOLDER = BASE_DIR / "Knowledge-Base"
+PORTFOLIO_GROUPING_FOLDER = KNOWLEDGE_BASE_FOLDER / "ref"
 DEFAULT_DATA_FOLDER = DATA_FOLDER
 DEFAULT_EXPORT_FOLDER = EXPORT_FOLDER
 LOG_FOLDER = BASE_DIR / "logs"
 DATABASE_PATH = Path(
     os.getenv("DB_PATH", str(DATA_FOLDER / "PRD_WealthSimple.duckdb"))
 ).expanduser()
-DATABASE_SCHEMA_VERSION = 8
+DATABASE_SCHEMA_VERSION = 9
 
 """
 Financial analytics assumptions. Keep business constants here so calculations

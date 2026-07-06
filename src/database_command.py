@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from config import DATABASE_PATH
+from config import BASE_DIR, DATABASE_PATH
 from database import get_shared_connection
 from portfolio_metrics import estimate_wealthsimple_fx_fee_cad
 from system_logger import get_logger
@@ -21,6 +21,9 @@ from yfinance_extractor import TickerHint, configure_yfinance_cache, fetch_secur
 logger = get_logger(__name__)
 SecurityFetcher = Callable[[list[Any]], tuple[pd.DataFrame, pd.DataFrame]]
 EMAIL_CHECKPOINT_SOURCE = "wealthsimple_email"
+DEFAULT_CLASSIFICATION_JSON_PATH = (
+    BASE_DIR / "exports" / "portfolio-classification" / "portfolio-classification.json"
+)
 
 
 def _text(value: Any) -> str:
@@ -326,6 +329,63 @@ def upload_security_history(
             ],
         )
         written += 1
+    return written
+
+
+def upload_portfolio_classifications(
+    json_path: Path | str | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> int:
+    """Fully replace portfolio_classifications from the classify-portfolio JSON output."""
+    path = Path(json_path) if json_path is not None else DEFAULT_CLASSIFICATION_JSON_PATH
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    generated_at = payload["generated_at"]
+    holdings = payload["holdings"]
+    connection = get_shared_connection(db_path)
+    written = 0
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        connection.execute("DELETE FROM portfolio_classifications")
+        for holding in holdings:
+            fields = holding.get("fields") or {}
+            row = connection.execute(
+                "SELECT ticker_id FROM tickers WHERE ticker_symbol = ? AND exchange = ?",
+                [holding["ticker"], fields.get("exchange")],
+            ).fetchone()
+            if row is None:
+                logger.warning(
+                    "Skipping classification upload for unresolved ticker | ticker=%s",
+                    holding["ticker"],
+                )
+                continue
+            connection.execute(
+                """
+                INSERT INTO portfolio_classifications (
+                    ticker_id, primary_group, secondary_tags, confidence, reasoning,
+                    evidence_used, missing_data, review_needed, fields, field_provenance,
+                    enrichment, generated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    row[0],
+                    holding["primary_group"],
+                    _json(holding.get("secondary_tags")),
+                    holding.get("confidence"),
+                    holding.get("reasoning"),
+                    _json(holding.get("evidence_used")),
+                    _json(holding.get("missing_data")),
+                    bool(holding.get("review_needed")),
+                    _json(fields),
+                    _json(holding.get("field_provenance")),
+                    _json(holding.get("enrichment")),
+                    generated_at,
+                ],
+            )
+            written += 1
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
     return written
 
 

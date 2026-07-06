@@ -6,6 +6,7 @@ keyring
 pyotp
 python-dotenv
 imap-tools
+PyYAML
 yfinance
 curl_cffi
 duckdb

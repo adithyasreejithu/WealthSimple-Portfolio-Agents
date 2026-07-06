@@ -3,6 +3,7 @@
 
 # Keep the ignore file itself and the source tree.
 !.gitignore
+!CLAUDE.md
 !instructions.md
 !src/
 !src/**
@@ -11,5 +12,7 @@
 !requirements.txt
 !tests/
 !tests/**
+!.claude/
+!.claude/**
 __pycache__/
 *.pyc*

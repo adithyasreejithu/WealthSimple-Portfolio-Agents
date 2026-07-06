@@ -21,7 +21,7 @@ from analytics import (
 class AnalyticsTest(unittest.TestCase):
     def setUp(self):
         database.close_connection()
-        self.temp_dir = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.addCleanup(database.close_connection)
         self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"

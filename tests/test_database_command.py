@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import date, datetime
@@ -12,6 +13,7 @@ from database_command import (
     normalize_ticker_dataframe,
     update_email_checkpoint,
     upload_email_transactions,
+    upload_portfolio_classifications,
     reconcile_email_transactions,
     upload_security_metadata,
 )
@@ -267,6 +269,78 @@ class DatabaseCommandTest(unittest.TestCase):
             "SELECT currency FROM tickers WHERE ticker_symbol = 'ABC' ORDER BY currency"
         ).fetchall()
         self.assertEqual(rows, [("CAD",), ("USD",)])
+
+    def _holding(self, ticker, exchange="NASDAQ"):
+        return {
+            "ticker": ticker, "company_name": f"{ticker} Inc.", "primary_group": "Quality",
+            "secondary_tags": ["Dividend"], "confidence": "high", "reasoning": "Strong fundamentals",
+            "evidence_used": ["sector"], "missing_data": [], "review_needed": False,
+            "fields": {"exchange": exchange, "sector": "Technology"},
+            "field_provenance": {"sector": "database"},
+            "enrichment": {"mode": "identity", "attempted_fields": [], "populated_fields": [], "errors": []},
+        }
+
+    def _write_classification_json(self, holdings):
+        path = Path(self.temp_dir.name) / "portfolio-classification.json"
+        path.write_text(json.dumps({
+            "schema_version": "1.0", "generated_at": "2026-01-01T00:00:00+00:00",
+            "workflow": "classify-my-portfolio", "database_mode": "read_only",
+            "summary": {}, "holdings": holdings,
+        }))
+        return path
+
+    def test_classification_sync_inserts_row_linked_to_ticker_id(self):
+        connection = database.get_shared_connection(self.db_path)
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        path = self._write_classification_json([self._holding("AAPL")])
+
+        written = upload_portfolio_classifications(path, self.db_path)
+
+        row = connection.execute(
+            "SELECT ticker_id, primary_group, review_needed FROM portfolio_classifications"
+        ).fetchone()
+        self.assertEqual(written, 1)
+        self.assertEqual(row, (ticker_id, "Quality", False))
+
+    def test_classification_sync_fully_replaces_prior_rows(self):
+        connection = database.get_shared_connection(self.db_path)
+        ticker_ids = {}
+        for symbol in ("AAPL", "MSFT"):
+            ticker_ids[symbol] = connection.execute(
+                """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+                   VALUES (?, 'NASDAQ', 'USD', ?, 'stock') RETURNING ticker_id""",
+                [symbol, symbol],
+            ).fetchone()[0]
+
+        upload_portfolio_classifications(
+            self._write_classification_json([self._holding("AAPL"), self._holding("MSFT")]),
+            self.db_path,
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM portfolio_classifications").fetchone()[0], 2
+        )
+
+        written = upload_portfolio_classifications(
+            self._write_classification_json([self._holding("AAPL")]), self.db_path
+        )
+
+        remaining = connection.execute("SELECT ticker_id FROM portfolio_classifications").fetchall()
+        self.assertEqual(written, 1)
+        self.assertEqual(remaining, [(ticker_ids["AAPL"],)])
+
+    def test_classification_sync_skips_unresolved_ticker(self):
+        path = self._write_classification_json([self._holding("UNKNOWN")])
+
+        with self.assertLogs("database_command", level="WARNING") as captured:
+            written = upload_portfolio_classifications(path, self.db_path)
+
+        self.assertEqual(written, 0)
+        self.assertTrue(
+            any("Skipping classification upload for unresolved ticker" in line for line in captured.output)
+        )
 
 
 if __name__ == "__main__":

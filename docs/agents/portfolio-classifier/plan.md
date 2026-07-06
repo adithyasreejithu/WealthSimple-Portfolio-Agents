@@ -11,21 +11,19 @@ The agent will run a deterministic, read-only workflow. It will read portfolio d
 ## Agent and Skill Structure
 
 ```text
-.codex/
+.claude/
 +-- agents/
-    +-- portfolio-classifier.toml
-
-.agents/
+|   +-- portfolio-classifier.md
 +-- skills/
     +-- classify-portfolio/
     |   +-- SKILL.md
-    |   +-- agents/
-    |   |   +-- openai.yaml
     |   +-- references/
     |   |   +-- workflow-contract.md
     |   |   +-- output-contract.md
     |   +-- scripts/
     |       +-- classify_portfolio.py
+    |       +-- classification_workflow.py
+    |       +-- portfolio_classifier.py
     +-- read-portfolio-classification-data/
     |   +-- SKILL.md
     |   +-- references/
@@ -40,9 +38,9 @@ The agent will run a deterministic, read-only workflow. It will read portfolio d
             +-- fetch_classification_data.py
 ```
 
-The `portfolio-classifier` agent receives a prebuilt prompt that requires it to invoke only `classify_portfolio.py`. Supporting scripts are implementation details of that workflow and are not exposed as general-purpose agent tools.
+The `portfolio-classifier` agent (`.claude/agents/portfolio-classifier.md`) is restricted so it invokes only `classify_portfolio.py`. Supporting scripts are implementation details of that workflow and are not exposed as general-purpose agent tools.
 
-The optional `agents/openai.yaml` file contains only skill presentation metadata, such as its display name, short description, and prebuilt default prompt. It does not grant permissions or enforce read-only behavior. Those controls belong in the scripts and agent configuration.
+The workflow's Python modules (`classification_workflow.py`, `portfolio_classifier.py`) live beside the skill that owns them rather than in `src/`, because they are used exclusively by the classification workflow. Access controls are enforced in the scripts and in the agent's tool restrictions, not in prose alone.
 
 The agent definition will explicitly prohibit:
 
@@ -137,7 +135,7 @@ Controls include:
 The public command will be equivalent to:
 
 ```powershell
-python .agents/skills/classify-portfolio/scripts/classify_portfolio.py
+python .claude/skills/classify-portfolio/scripts/classify_portfolio.py
 ```
 
 Optional public arguments will be limited to:
