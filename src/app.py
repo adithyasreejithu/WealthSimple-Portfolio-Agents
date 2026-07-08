@@ -14,7 +14,15 @@ from typing import Callable
 
 import pandas as pd
 
-from config import DATABASE_PATH, DATA_FOLDER, PROCESSED_FOLDER_NAME, SOURCE_PREFIX
+from config import (
+    ANALYTICS_EXPORT_FILENAME,
+    ANALYTICS_EXPORT_FOLDER,
+    DATABASE_PATH,
+    DATA_FOLDER,
+    DEFAULT_BENCHMARK_SYMBOL,
+    PROCESSED_FOLDER_NAME,
+    SOURCE_PREFIX,
+)
 from data_sorter import move_to_processed_folder, sort_data
 from database import get_shared_connection, initialize_database
 from database_command import (
@@ -34,6 +42,7 @@ from staging import (
     stage_dataframe,
 )
 from system_logger import get_logger
+import ticker_mapping
 
 
 logger = get_logger(__name__)
@@ -198,7 +207,7 @@ def _pending_email_error(symbols: list[str]) -> str:
     joined = ", ".join(symbols)
     return (
         f"published with pending ticker(s): {joined}; "
-        "run `python src/app.py ticker-map pending`"
+        "run `python src/app.py resolve-tickers` to map them and retry"
     )
 
 
@@ -207,6 +216,31 @@ def _sync_email_history(db_path: Path | str) -> str | None:
     if result.succeeded:
         return None
     return result.error or "historical price synchronization failed"
+
+
+def _run_portfolio_classification(db_path: Path | str) -> SourceResult:
+    """Classify current holdings and persist the result, as the final step of
+    a full pipeline run. The classification workflow itself stays read-only
+    (a separate read-only DuckDB connection, per
+    docs/agents/portfolio-classifier/architecture.md); this wraps it with the
+    same explicit classification-sync write the CLI command performs, so a
+    routine full pipeline run always reflects current classifications without
+    a separate manual step. Failure here never rolls back ingestion that
+    already completed, matching the yfinance-sync failure-handling pattern.
+    """
+    # The classification workflow and its helper modules live beside the
+    # classify-portfolio skill, not in src/, so expose them for import.
+    sys.path.insert(0, str(CLASSIFY_SKILL_SCRIPTS))
+    from classification_workflow import classify_portfolio, write_output
+
+    try:
+        payload = classify_portfolio(db_path)
+        output_path = write_output(payload)
+        rows = upload_portfolio_classifications(output_path, db_path)
+        return SourceResult("classification", output_path, "succeeded", rows)
+    except Exception as exc:
+        logger.exception("Portfolio classification failed")
+        return SourceResult("classification", None, "failed", error=str(exc))
 
 
 def _stage_statement_files(
@@ -306,7 +340,11 @@ def run_full_exports(
             [staged_file_id],
         ).fetchall()
         if unresolved_rows:
-            error = f"not published; unresolved ticker(s): {', '.join(symbol for (symbol,) in unresolved_rows)}"
+            error = (
+                f"not published; unresolved ticker(s): "
+                f"{', '.join(symbol for (symbol,) in unresolved_rows)}; "
+                "run `python src/app.py resolve-tickers` to map them and retry"
+            )
             mark_file(staged_file_id, "quarantined", error, db_path)
             results.append(SourceResult("export", file, "failed", error=error))
             continue
@@ -363,7 +401,11 @@ def run_statements(
             [staged_file_id],
         ).fetchall()
         if unresolved_rows:
-            error = f"not published; unresolved ticker(s): {', '.join(symbol for (symbol,) in unresolved_rows)}"
+            error = (
+                f"not published; unresolved ticker(s): "
+                f"{', '.join(symbol for (symbol,) in unresolved_rows)}; "
+                "run `python src/app.py resolve-tickers` to map them and retry"
+            )
             mark_file(staged_file_id, "quarantined", error, db_path)
             logger.error(
                 "Source quarantined and not published | source=%s | file=%s | tickers=%s",
@@ -453,7 +495,11 @@ def run_pipeline(
                     [staged_file_id],
                 ).fetchall()
                 if unresolved_rows:
-                    error = f"not published; unresolved ticker(s): {', '.join(symbol for (symbol,) in unresolved_rows)}"
+                    error = (
+                        f"not published; unresolved ticker(s): "
+                        f"{', '.join(symbol for (symbol,) in unresolved_rows)}; "
+                        "run `python src/app.py resolve-tickers` to map them and retry"
+                    )
                     mark_file(staged_file_id, "quarantined", error, db_path)
                     results.append(SourceResult("statement", file, "failed", error=error))
                     continue
@@ -508,7 +554,11 @@ def run_pipeline(
                     [staged_file_id],
                 ).fetchall()
                 if unresolved_rows:
-                    error = f"not published; unresolved ticker(s): {', '.join(symbol for (symbol,) in unresolved_rows)}"
+                    error = (
+                        f"not published; unresolved ticker(s): "
+                        f"{', '.join(symbol for (symbol,) in unresolved_rows)}; "
+                        "run `python src/app.py resolve-tickers` to map them and retry"
+                    )
                     mark_file(staged_file_id, "quarantined", error, db_path)
                     results.append(SourceResult("export", file, "failed", error=error))
                     continue
@@ -538,6 +588,9 @@ def run_pipeline(
     complete_batch(batch_id, db_path)
     if not results:
         results.append(SourceResult(source, None, "skipped"))
+
+    if source == "all":
+        results.append(_run_portfolio_classification(db_path))
 
     return PipelineResult(tuple(results))
 
@@ -574,6 +627,10 @@ def _print_root_help() -> None:
         "yfinance-sync", help="Synchronize owned ticker market data to DuckDB."
     )
     commands.add_parser("ticker-map", help="Manage ticker mappings.")
+    commands.add_parser(
+        "resolve-tickers",
+        help="Resolve pending ticker mappings interactively, then retry quarantined ingestion.",
+    )
     commands.add_parser("import-activities", help="Import one activity export.")
     commands.add_parser(
         "portfolio-classify",
@@ -597,24 +654,36 @@ def _print_portfolio_report(report: dict[str, object]) -> None:
         print(title)
         print("-" * len(title))
 
+    summary = report.get("summary", {})
+    allocation = report.get("allocation", {})
+    targets = report.get("targets", {})
+    income = report.get("income", {})
+    fees = report.get("fees", {})
+    data_quality = report.get("data_quality", {})
+    unavailable_metrics = report.get("unavailable_metrics", [])
+    holdings = report.get("holdings", [])
+
     print("Portfolio Analytics")
     print("=" * len("Portfolio Analytics"))
-    print(f"Portfolio value : {_format_value(report['portfolio_value'])}")
+    print(f"Portfolio value : {_format_value(summary.get('portfolio_value', 0))}")
 
-    cash = report["cash"]
+    cash = summary.get("cash", {})
     if isinstance(cash, dict):
         print(f"Cash balance    : {_format_value(cash.get('balance', 0))}")
         print(f"Cash source     : {cash.get('source', 'unknown')}")
 
-    holdings = report.get("holdings", [])
+    print(f"Book cost       : {_format_value(summary.get('book_cost', 0))}")
+    unrealized = summary.get("unrealized_gain", {})
+    if isinstance(unrealized, dict):
+        percent = unrealized.get("percent")
+        percent_text = f"{percent:.2%}" if percent is not None else "n/a"
+        print(f"Unrealized gain : {_format_value(unrealized.get('amount', 0))} ({percent_text})")
+    print(f"Realized gain   : {_format_value(summary.get('realized_gain_total', 0))}")
     print(f"Holdings        : {len(holdings)}")
 
-    dividends = report.get("dividends", {})
-    fees = report.get("fees", {})
-    cash_flow = report.get("cash_flow", {})
-    if isinstance(dividends, dict):
-        print(f"Dividend source : {dividends.get('source', 'unknown')}")
-        totals = dividends.get("totals_by_currency", {})
+    if isinstance(income, dict):
+        print(f"Dividend source : {income.get('source', 'unknown')}")
+        totals = income.get("totals_by_currency", {})
         if isinstance(totals, dict):
             for currency, amount in sorted(totals.items()):
                 print(f"Dividends {currency:<4} : {_format_value(amount)}")
@@ -624,8 +693,31 @@ def _print_portfolio_report(report: dict[str, object]) -> None:
             print(f"Estimated FX fee: {_format_value(fx.get('estimated_fx_fee_cad', 0))} CAD")
         else:
             print(f"Estimated FX fee: unavailable for {fx.get('source', 'source')}")
-    if isinstance(cash_flow, dict):
-        print(f"Net contributions: {_format_value(cash_flow.get('net_contributions', 0))}")
+
+    by_group = allocation.get("by_group", {}) if isinstance(allocation, dict) else {}
+    if by_group:
+        _section_title("Allocation by Group")
+        drift_by_group = {
+            row["group"]: row for row in (targets.get("groups", []) if isinstance(targets, dict) else [])
+        }
+        for group, info in sorted(by_group.items(), key=lambda item: -item[1]["weight"]):
+            drift_row = drift_by_group.get(group)
+            drift_text = ""
+            if drift_row and drift_row.get("drift_pp") is not None:
+                flag = " (rebalance)" if drift_row.get("rebalance_needed") else ""
+                drift_text = f"  target {drift_row['target_percent']:.0f}%  drift {drift_row['drift_pp']:+.1f}pp{flag}"
+            print(f"{group:<15} {info['weight']:>6.1%}{drift_text}")
+
+    if isinstance(data_quality, dict):
+        counts = data_quality.get("counts_by_code", {})
+        if counts:
+            _section_title("Data Quality")
+            for code, count in sorted(counts.items()):
+                print(f"{code:<22} {count}")
+
+    if unavailable_metrics:
+        _section_title("Unavailable Metrics")
+        print(f"{len(unavailable_metrics)} metric(s) unavailable; see --export JSON for reasons.")
 
     if not holdings:
         _section_title("Positions")
@@ -688,8 +780,24 @@ def _json_default(value: object) -> object:
     return str(value)
 
 
-def _print_portfolio_report_json(report: dict[str, object]) -> None:
-    print(json.dumps(report, default=_json_default, indent=2, sort_keys=True))
+def _write_analytics_export(
+    report: dict[str, object], export_folder: Path | str = ANALYTICS_EXPORT_FOLDER
+) -> Path:
+    """Write the analytics report as a stable-named JSON export and return its path."""
+    export_folder = Path(export_folder)
+    export_folder.mkdir(parents=True, exist_ok=True)
+    export_path = export_folder / ANALYTICS_EXPORT_FILENAME
+    envelope = {
+        "schema_version": "1.0",
+        "generated_at": report.get("generated_at"),
+        "workflow": "portfolio-analytics",
+        "parameters": report.get("parameters", {}),
+        "report": report,
+    }
+    export_path.write_text(
+        json.dumps(envelope, default=_json_default, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return export_path
 
 
 def run_analytics(
@@ -700,6 +808,8 @@ def run_analytics(
     dividend_source: str = "email",
     cash_flow_source: str = "activities",
     fx_source: str = "statements",
+    benchmark_symbol: str | None = DEFAULT_BENCHMARK_SYMBOL,
+    benchmark_fetcher: Callable[[list[str], date, date], object] | None = None,
 ) -> dict[str, object]:
     """Return the current read-only analytics report."""
     initialize_database(db_path)
@@ -710,6 +820,8 @@ def run_analytics(
         dividend_source=dividend_source,
         cash_flow_source=cash_flow_source,
         fx_source=fx_source,
+        benchmark_symbol=benchmark_symbol,
+        benchmark_fetcher=benchmark_fetcher,
     )
 
 
@@ -728,7 +840,21 @@ def _run_analytics_command(argv: list[str]) -> int:
     parser.add_argument(
         "--fx-source", choices=("statements", "exports", "email"), default="statements"
     )
-    parser.add_argument("--export", action="store_true", help="Export the report as JSON.")
+    parser.add_argument(
+        "--benchmark", default=DEFAULT_BENCHMARK_SYMBOL,
+        help="Benchmark ticker symbol fetched live from yfinance for comparison stats.",
+    )
+    parser.add_argument(
+        "--no-benchmark", action="store_true", help="Skip the live benchmark comparison fetch."
+    )
+    parser.add_argument(
+        "--export", action="store_true",
+        help=f"Write the report to {ANALYTICS_EXPORT_FOLDER / ANALYTICS_EXPORT_FILENAME} instead of printing it.",
+    )
+    parser.add_argument(
+        "--export-folder", type=Path, default=ANALYTICS_EXPORT_FOLDER,
+        help="Destination folder for --export.",
+    )
     args = parser.parse_args(argv)
     try:
         report = run_analytics(
@@ -738,15 +864,27 @@ def _run_analytics_command(argv: list[str]) -> int:
             dividend_source=args.dividend_source,
             cash_flow_source=args.cash_flow_source,
             fx_source=args.fx_source,
+            benchmark_symbol=None if args.no_benchmark else args.benchmark,
         )
     except Exception:
         logger.exception("Analytics report failed")
         return 1
     if args.export:
-        _print_portfolio_report_json(report)
+        export_path = _write_analytics_export(report, args.export_folder)
+        print(f"Exported analytics report: {export_path}")
     else:
         _print_portfolio_report(report)
     return 0
+
+
+def _print_pipeline_results(result: PipelineResult) -> None:
+    for source_result in result.results:
+        file_text = f" [{source_result.source_file}]" if source_result.source_file else ""
+        error_text = f" - {source_result.error}" if source_result.error else ""
+        print(
+            f"{source_result.source}{file_text}: {source_result.status} "
+            f"({source_result.rows} row(s)){error_text}"
+        )
 
 
 def _run_pipeline_command(argv: list[str]) -> int:
@@ -757,13 +895,52 @@ def _run_pipeline_command(argv: list[str]) -> int:
     except Exception:
         logger.exception("Pipeline startup failed")
         return 1
-    for source_result in result.results:
-        file_text = f" [{source_result.source_file}]" if source_result.source_file else ""
-        error_text = f" - {source_result.error}" if source_result.error else ""
-        print(
-            f"{source_result.source}{file_text}: {source_result.status} "
-            f"({source_result.rows} row(s)){error_text}"
-        )
+    _print_pipeline_results(result)
+    return 0 if result.succeeded else 1
+
+
+def _run_resolve_tickers_command(argv: list[str]) -> int:
+    """Resolve every pending ticker interactively, then retry ingestion that was quarantined because of it."""
+    parser = argparse.ArgumentParser(
+        description="Resolve pending ticker mappings and retry any quarantined ingestion."
+    )
+    parser.add_argument("--data-folder", type=Path, default=DATA_FOLDER)
+    parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    args = parser.parse_args(argv)
+
+    try:
+        pending = ticker_mapping.list_pending(args.database)
+        if not pending:
+            print("No pending ticker mappings.")
+            return 0
+        resolutions = ticker_mapping.resolve_pending_interactively(args.database)
+    except Exception:
+        logger.exception("Ticker resolution failed")
+        return 1
+
+    verified = [item for item in resolutions if item.get("status") == "verified"]
+    print()
+    for item in resolutions:
+        symbol = item.get("source_symbol", "?")
+        if item.get("status") == "verified":
+            print(
+                f"{symbol}: mapped to {item.get('provider_symbol')} ({item.get('currency')}) "
+                f"- {item.get('resolved_email_rows', 0)} email row(s) updated"
+            )
+        else:
+            print(f"{symbol}: skipped")
+
+    if not verified:
+        print("\nNo mappings were saved; nothing to retry.")
+        return 0
+
+    print("\nRetrying ingestion for previously quarantined source(s)...")
+    try:
+        result = run_pipeline("all", args.data_folder, args.database)
+    except Exception:
+        logger.exception("Pipeline retry failed after ticker resolution")
+        return 1
+    _print_pipeline_results(result)
     return 0 if result.succeeded else 1
 
 
@@ -849,6 +1026,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_yfinance_sync_command(raw_args[1:])
     if raw_args and raw_args[0] == "classification-sync":
         return _run_classification_sync_command(raw_args[1:])
+    if raw_args and raw_args[0] == "resolve-tickers":
+        return _run_resolve_tickers_command(raw_args[1:])
 
     # Delegate to module entry points so each command keeps one argument contract.
     delegated_commands = {

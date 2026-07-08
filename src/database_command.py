@@ -629,8 +629,14 @@ def upload_email_transactions(
             """,
             [source, source_message_id, row.get("received_at") or None, content_hash],
         ).fetchone()[0])
-        ticker_id = row.get("ticker_id")
+        # Interac deposits carry a placeholder ticker_id (0) and the "EMAIL"
+        # source symbol; neither is a real security, so they must never be
+        # inserted with a ticker_id or sit as 'pending' ticker resolution.
+        ticker_id = None if source == "interac" else row.get("ticker_id")
         resolved = ticker_id is not None and not pd.isna(ticker_id)
+        ticker_resolution_status = (
+            "not_applicable" if source == "interac" else ("resolved" if resolved else "pending")
+        )
         values = [
             _text(row.get("account")) or None,
             _text(row.get("transaction")) or "UNKNOWN",
@@ -670,7 +676,7 @@ def upload_email_transactions(
                 email_message_id,
                 _text(row.get("ticker")) or None,
                 _text(row.get("price_currency")) or None,
-                "resolved" if resolved else "pending",
+                ticker_resolution_status,
                 "not_applicable" if source == "interac" else "provisional",
             ],
         )

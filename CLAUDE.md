@@ -37,6 +37,18 @@ Follow standard Python 3 style with 4-space indentation and snake_case for funct
 
 The project uses the built-in `unittest` framework. Add tests alongside the module behavior they cover, and prefer deterministic fixtures over live service calls. When testing pipeline behavior, mock external dependencies such as network, email, and database operations.
 
+## Documentation
+
+`docs/reference/cli.md` is the canonical, complete guide to every user-facing
+`python src/app.py <command>` — every command registered in `app.py`'s
+`_print_root_help`/`main()` dispatch must have a section there, kept in sync
+with its actual arguments and behavior. When a change adds, renames, or alters
+the behavior of a CLI command (new flags, new subcommand, changed defaults,
+changed output format), update `docs/reference/cli.md` in the same change,
+not as a follow-up — a command missing from this file is a bug. Related
+architecture docs (`docs/architecture/*.md`, `docs/agents/<agent>/*.md`) should
+also be updated when the change affects the behavior they describe.
+
 ## Commit & Pull Request Guidelines
 
 Recent commits are short, imperative, and task-focused, for example: `Add normalized activity export storage` and `Consolidate statement extraction`. Keep commit messages in that style.

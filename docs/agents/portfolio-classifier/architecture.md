@@ -110,4 +110,8 @@ is handled by a separate, decoupled pipeline stage, not by the agent:
 
 This keeps the "read-only agent" guarantee intact — `classification-sync` is
 a distinct, explicitly-invoked pipeline command, never run implicitly as
-part of "Classify my portfolio."
+part of "Classify my portfolio." (`python src/app.py pipeline`, a separate,
+human-invoked ingestion command unrelated to the agent, does run classify +
+sync automatically as its final step for a full run — see `docs/reference/cli.md`
+— but that is orthogonal to this guarantee: the agent itself still never
+triggers a database write.)

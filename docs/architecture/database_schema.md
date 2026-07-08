@@ -22,6 +22,12 @@ Ticker identity is immutable during routine market synchronization. Yfinance may
 refresh `stock_details` and `etf_details` for an existing `ticker_id`, but it does
 not update the parent ticker row, its Yahoo provider mapping, or its symbol history.
 Only explicit ticker onboarding may insert a missing identity and its initial mapping.
+Resolution is keyed purely on exact `ticker_symbol` text match; it never consults
+`ticker_symbol_history`, so a provider renaming a symbol creates a second, separate
+identity rather than being recognized as a continuation. `ticker-map merge`
+(`src/ticker_mapping.py::merge_tickers`) is the one sanctioned, explicit exception to
+the immutability rule above: it consolidates two already-populated ticker identities
+into one after such a rename, distinct from anything routine sync ever does on its own.
 
 `staged_records.contains_fx_rate` records whether the source row included an FX rate during parsing or staging. The current ingestion assumption is:
 

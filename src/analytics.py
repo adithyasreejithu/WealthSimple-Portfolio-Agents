@@ -2,14 +2,42 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
-from config import DATABASE_PATH, WEALTHSIMPLE_FX_FEE_RATE
+import pandas as pd
+import yaml
+
+from config import (
+    DATABASE_PATH,
+    DEFAULT_BENCHMARK_SYMBOL,
+    POLICY_FILE,
+    SINGLE_NAME_MAX_WEIGHT,
+    STALE_PRICE_MAX_AGE_DAYS,
+    SUSPICIOUS_UNREALIZED_GAIN_THRESHOLD,
+    WEALTHSIMPLE_FX_FEE_RATE,
+)
 from database import get_shared_connection
-from portfolio_metrics import estimate_wealthsimple_fx_fee_cad, financial_metrics_summary
+from portfolio_metrics import (
+    calculate_adjusted_daily_returns,
+    calculate_adjusted_sharpe_ratio,
+    calculate_adjusted_volatility,
+    calculate_benchmark_stats,
+    calculate_concentration,
+    calculate_drawdown_details,
+    calculate_position_weights,
+    calculate_rebalance_drift,
+    calculate_sortino_ratio,
+    calculate_twr_total_return,
+    calculate_unrealized_gain_percent,
+    calculate_weighted_mer,
+    build_wealth_index,
+    estimate_wealthsimple_fx_fee_cad,
+)
 from system_logger import get_logger
 
 
@@ -42,6 +70,7 @@ class Holding:
     quantity: Decimal
     cost_basis: Decimal
     market_value: Decimal
+    currency: str = ""
     last_price: Decimal | None = None
     last_price_date: date | None = None
     provisional_quantity: Decimal = Decimal("0")
@@ -61,9 +90,13 @@ class PortfolioSummary:
     portfolio_value: Decimal
 
 
-def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
+def _get_net_positions(db_path: str = DATABASE_PATH) -> list[Holding]:
+    """Reconstruct every nonzero net position, positive or negative.
+
+    A negative net position means recorded sells exceed recorded buys (a data
+    or reconciliation issue), so callers must not treat it as a live holding.
+    """
     connection = get_shared_connection(db_path)
-    # Reconstruct the current position state from cumulative transaction history.
     rows = connection.execute(
         """
         WITH statement_positions AS (
@@ -111,6 +144,7 @@ def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
             t.exchange,
             t.security_name,
             t.security_type,
+            t.currency,
             nt.total_amount,
             nt.total_debit,
             nt.total_credit,
@@ -126,7 +160,10 @@ def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
     ).fetchall()
     holdings: list[Holding] = []
     for row in rows:
-        ticker_id, symbol, exchange, name, security_type, total_amount, debit, credit, price_date, close, provisional = row
+        (
+            ticker_id, symbol, exchange, name, security_type, currency,
+            total_amount, debit, credit, price_date, close, provisional,
+        ) = row
         quantity_value = _decimal(total_amount)
         cost_basis = _decimal(debit) - _decimal(credit)
         last_price = _decimal(close) if close is not None else None
@@ -139,6 +176,7 @@ def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
                 exchange=exchange,
                 security_name=name,
                 security_type=security_type,
+                currency=currency,
                 quantity=quantity_value,
                 cost_basis=cost_basis,
                 market_value=market_value,
@@ -149,6 +187,21 @@ def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
             )
         )
     return holdings
+
+
+def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
+    """Return only currently-held positions (positive net quantity)."""
+    return [holding for holding in _get_net_positions(db_path) if holding.quantity > 0]
+
+
+def get_excluded_positions(db_path: str = DATABASE_PATH) -> list[Holding]:
+    """Return net-negative positions excluded from current-holdings analytics.
+
+    A negative quantity means recorded sells exceed recorded buys for that
+    ticker, which points at a reconciliation or data-entry issue rather than a
+    real short position, so these are surfaced only in data-quality reporting.
+    """
+    return [holding for holding in _get_net_positions(db_path) if holding.quantity < 0]
 
 
 def get_cash_summary(db_path: str = DATABASE_PATH) -> CashSummary:
@@ -204,57 +257,130 @@ def get_position(ticker_id: int, db_path: str = DATABASE_PATH) -> Holding:
 
 
 def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[str, Any]]:
+    """Build a chronological valuation series (securities + cash) as one set-based query.
+
+    Quantities are signed BUY/SELL deltas (statement and provisional email
+    activity) cumulatively summed per ticker and clamped at zero so a
+    data-error negative position never subtracts from the series, matching
+    ``get_holdings`` excluding negative net positions from current value.
+    Prices are carried forward from the latest known close on or before each
+    date. Cash uses the latest explicit balance on or before each date,
+    falling back to cumulative net cash flow, mirroring ``get_cash_summary``.
+    """
     connection = get_shared_connection(db_path)
-    # Build a chronological valuation series from every relevant date in the stored tables.
-    dates = [
-        _date(row[0])
-        for row in connection.execute(
-            """
+    rows = connection.execute(
+        """
+        WITH statement_deltas AS (
+            SELECT ticker_id, transaction_date AS d,
+                   SUM(CASE WHEN UPPER(transaction_type) = 'SELL'
+                            THEN -ABS(quantity) ELSE ABS(quantity) END) AS dq
+            FROM transactions
+            WHERE UPPER(transaction_type) IN ('BUY', 'SELL')
+            GROUP BY ticker_id, transaction_date
+        ),
+        email_deltas AS (
+            SELECT ticker_id, transaction_date AS d,
+                   SUM(CASE WHEN UPPER(transaction_type) LIKE '%SELL%'
+                            THEN -ABS(quantity) ELSE ABS(quantity) END) AS dq
+            FROM email_transactions
+            WHERE ticker_id IS NOT NULL
+              AND ticker_resolution_status = 'resolved'
+              AND reconciliation_status = 'provisional'
+              AND (UPPER(transaction_type) LIKE '%BUY%' OR UPPER(transaction_type) LIKE '%SELL%')
+            GROUP BY ticker_id, transaction_date
+        ),
+        deltas AS (
+            SELECT ticker_id, d, SUM(dq) AS dq
+            FROM (
+                SELECT ticker_id, d, dq FROM statement_deltas
+                UNION ALL
+                SELECT ticker_id, d, dq FROM email_deltas
+            )
+            GROUP BY ticker_id, d
+        ),
+        traded_tickers AS (SELECT DISTINCT ticker_id FROM deltas),
+        value_dates AS (
             SELECT DISTINCT value_date
             FROM (
-                SELECT transaction_date AS value_date FROM transactions
-                UNION
-                SELECT transaction_date AS value_date FROM cash_transactions
+                SELECT d AS value_date FROM deltas
                 UNION
                 SELECT record_date AS value_date FROM historical_records
+                UNION
+                SELECT transaction_date AS value_date FROM cash_transactions
             )
             WHERE value_date IS NOT NULL
-            ORDER BY value_date
-            """
-        ).fetchall()
-    ]
-    ticker_ids = [
-        int(row[0]) for row in connection.execute("SELECT ticker_id FROM tickers ORDER BY ticker_id").fetchall()
-    ]
+        ),
+        grid AS (
+            SELECT vd.value_date, tt.ticker_id
+            FROM value_dates vd CROSS JOIN traded_tickers tt
+        ),
+        qty_series AS (
+            SELECT g.value_date, g.ticker_id,
+                   GREATEST(
+                       SUM(COALESCE(d.dq, 0)) OVER (
+                           PARTITION BY g.ticker_id ORDER BY g.value_date
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ),
+                       0
+                   ) AS qty
+            FROM grid g
+            LEFT JOIN deltas d ON d.ticker_id = g.ticker_id AND d.d = g.value_date
+        ),
+        price_series AS (
+            SELECT g.value_date, g.ticker_id,
+                   LAST_VALUE(hr.close IGNORE NULLS) OVER (
+                       PARTITION BY g.ticker_id ORDER BY g.value_date
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                   ) AS close
+            FROM grid g
+            LEFT JOIN historical_records hr ON hr.ticker_id = g.ticker_id AND hr.record_date = g.value_date
+        ),
+        securities_series AS (
+            SELECT q.value_date, SUM(q.qty * COALESCE(p.close, 0)) AS securities_value
+            FROM qty_series q
+            JOIN price_series p ON p.ticker_id = q.ticker_id AND p.value_date = q.value_date
+            GROUP BY q.value_date
+        ),
+        cash_by_date AS (
+            SELECT transaction_date AS d, MAX(balance) AS balance_on_date,
+                   SUM(COALESCE(credit, 0) - COALESCE(debit, 0)) AS net_flow_on_date
+            FROM cash_transactions
+            GROUP BY transaction_date
+        ),
+        cash_series AS (
+            SELECT vd.value_date,
+                   LAST_VALUE(cb.balance_on_date IGNORE NULLS) OVER (
+                       ORDER BY vd.value_date
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                   ) AS explicit_balance,
+                   SUM(COALESCE(cb.net_flow_on_date, 0)) OVER (
+                       ORDER BY vd.value_date
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                   ) AS cumulative_flow
+            FROM value_dates vd
+            LEFT JOIN cash_by_date cb ON cb.d = vd.value_date
+        )
+        SELECT vd.value_date,
+               COALESCE(sv.securities_value, 0) AS securities_value,
+               COALESCE(cs.explicit_balance, cs.cumulative_flow, 0) AS cash_balance
+        FROM value_dates vd
+        LEFT JOIN securities_series sv ON sv.value_date = vd.value_date
+        LEFT JOIN cash_series cs ON cs.value_date = vd.value_date
+        ORDER BY vd.value_date
+        """
+    ).fetchall()
     results: list[dict[str, Any]] = []
-    for value_date in dates:
-        total = Decimal("0")
-        for ticker_id in ticker_ids:
-            # Use the latest known close on or before each valuation date.
-            quantity_row = connection.execute(
-                """
-                SELECT SUM(quantity) AS total_amount
-                FROM transactions
-                WHERE ticker_id = ?
-                  AND transaction_type = 'BUY'
-                  AND transaction_date <= ?
-                """,
-                [ticker_id, value_date],
-            ).fetchone()
-            price_row = connection.execute(
-                """
-                SELECT close
-                FROM historical_records
-                WHERE ticker_id = ?
-                  AND record_date <= ?
-                ORDER BY record_date DESC
-                LIMIT 1
-                """,
-                [ticker_id, value_date],
-            ).fetchone()
-            if quantity_row and price_row and price_row[0] is not None:
-                total += _decimal(quantity_row[0]) * _decimal(price_row[0])
-        results.append({"date": value_date, "portfolio_value": total})
+    for value_date, securities_value, cash_balance in rows:
+        securities = _decimal(securities_value)
+        cash = _decimal(cash_balance)
+        results.append(
+            {
+                "date": _date(value_date),
+                "securities_value": securities,
+                "cash_balance": cash,
+                "portfolio_value": securities + cash,
+            }
+        )
     return results
 
 
@@ -463,6 +589,26 @@ def _cash_flow_rows(
     return [(_date(row[0]), _decimal(row[1])) for row in rows]
 
 
+def get_external_flow_series(
+    db_path: str = DATABASE_PATH,
+    *,
+    source: str = "activities",
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[dict[str, Any]]:
+    """Return external cash flows (contributions positive, withdrawals negative) per date.
+
+    Used to strip contribution/withdrawal noise out of daily returns; the
+    money-weighted (XIRR) calculation in ``get_cash_flow_summary`` is
+    unaffected by this helper.
+    """
+    rows = _cash_flow_rows(db_path, source, date_from, date_to)
+    totals: dict[date, Decimal] = {}
+    for flow_date, amount in rows:
+        totals[flow_date] = totals.get(flow_date, Decimal("0")) + amount
+    return [{"date": flow_date, "amount": amount} for flow_date, amount in sorted(totals.items())]
+
+
 def _xirr(flows: list[tuple[date, Decimal]]) -> float | None:
     """Solve annualized irregular cash-flow return by bounded bisection."""
     if len(flows) < 2 or not any(v < 0 for _, v in flows) or not any(v > 0 for _, v in flows):
@@ -564,6 +710,609 @@ def get_cash_flow_summary(
     }
 
 
+GEOGRAPHY_TAGS = ("Canada", "US", "Global", "India")
+
+
+def _weights_from_totals(totals: dict[str, Decimal]) -> dict[str, dict[str, Any]]:
+    total_value = sum(totals.values(), Decimal("0"))
+    if total_value <= 0:
+        return {}
+    return {
+        label: {"market_value": value, "weight": float(value / total_value)}
+        for label, value in totals.items()
+    }
+
+
+def _get_classifications(db_path: str, ticker_ids: list[int]) -> dict[int, dict[str, Any]]:
+    if not ticker_ids:
+        return {}
+    connection = get_shared_connection(db_path)
+    placeholders = ",".join("?" for _ in ticker_ids)
+    rows = connection.execute(
+        f"""
+        SELECT ticker_id, primary_group, secondary_tags, review_needed
+        FROM portfolio_classifications
+        WHERE ticker_id IN ({placeholders})
+        """,
+        ticker_ids,
+    ).fetchall()
+    classifications: dict[int, dict[str, Any]] = {}
+    for ticker_id, primary_group, secondary_tags, review_needed in rows:
+        tags = json.loads(secondary_tags) if secondary_tags else []
+        classifications[int(ticker_id)] = {
+            "primary_group": primary_group,
+            "secondary_tags": tags if isinstance(tags, list) else [],
+            "review_needed": bool(review_needed),
+        }
+    return classifications
+
+
+def get_group_allocation(db_path: str, holdings: list[Holding]) -> dict[str, Any]:
+    """Allocate current holdings by classifier group, and by geography tag when tagged.
+
+    Holdings without a ``portfolio_classifications`` row are bucketed as
+    ``Unclassified`` rather than dropped, so allocation weights still sum to
+    the full current-holdings market value.
+    """
+    classifications = _get_classifications(db_path, [h.ticker_id for h in holdings])
+    group_totals: dict[str, Decimal] = {}
+    geography_totals: dict[str, Decimal] = {}
+    tagged_value = Decimal("0")
+    for holding in holdings:
+        info = classifications.get(holding.ticker_id)
+        group = info["primary_group"] if info else "Unclassified"
+        group_totals[group] = group_totals.get(group, Decimal("0")) + holding.market_value
+        if info:
+            geography = next((tag for tag in info["secondary_tags"] if tag in GEOGRAPHY_TAGS), None)
+            if geography:
+                geography_totals[geography] = geography_totals.get(geography, Decimal("0")) + holding.market_value
+                tagged_value += holding.market_value
+    result: dict[str, Any] = {"by_group": _weights_from_totals(group_totals), "classifications": classifications}
+    if not classifications:
+        result["group_unavailable_reason"] = (
+            "No rows in portfolio_classifications; run the classify-portfolio workflow."
+        )
+    if tagged_value > 0:
+        result["by_geography"] = _weights_from_totals(geography_totals)
+        result["geography_unavailable_reason"] = None
+    else:
+        result["by_geography"] = None
+        result["geography_unavailable_reason"] = "No current holdings carry a geography tag."
+    return result
+
+
+def _get_sectors(db_path: str, ticker_ids: list[int]) -> dict[int, str]:
+    if not ticker_ids:
+        return {}
+    connection = get_shared_connection(db_path)
+    placeholders = ",".join("?" for _ in ticker_ids)
+    rows = connection.execute(
+        f"SELECT ticker_id, sector FROM stock_details WHERE ticker_id IN ({placeholders})",
+        ticker_ids,
+    ).fetchall()
+    return {int(ticker_id): sector for ticker_id, sector in rows if sector}
+
+
+def get_sector_allocation(db_path: str, holdings: list[Holding]) -> dict[str, Any]:
+    """Allocate current holdings by sector; ETFs bucket as ``ETF`` (no per-ticker sector)."""
+    sectors = _get_sectors(db_path, [h.ticker_id for h in holdings])
+    totals: dict[str, Decimal] = {}
+    missing_sector_tickers: list[str] = []
+    for holding in holdings:
+        if holding.security_type == "etf":
+            label = "ETF"
+        else:
+            label = sectors.get(holding.ticker_id) or "Unknown"
+            if holding.ticker_id not in sectors:
+                missing_sector_tickers.append(holding.ticker_symbol)
+        totals[label] = totals.get(label, Decimal("0")) + holding.market_value
+    return {"by_sector": _weights_from_totals(totals), "missing_sector_tickers": missing_sector_tickers}
+
+
+def _get_etf_sector_weights(db_path: str, ticker_ids: list[int]) -> dict[int, dict[str, float]]:
+    if not ticker_ids:
+        return {}
+    connection = get_shared_connection(db_path)
+    placeholders = ",".join("?" for _ in ticker_ids)
+    rows = connection.execute(
+        f"SELECT ticker_id, sector_weights FROM etf_details WHERE ticker_id IN ({placeholders})",
+        ticker_ids,
+    ).fetchall()
+    result: dict[int, dict[str, float]] = {}
+    for ticker_id, sector_weights in rows:
+        if not sector_weights:
+            continue
+        try:
+            parsed = json.loads(sector_weights)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict) and parsed:
+            result[int(ticker_id)] = {str(key): float(value) for key, value in parsed.items()}
+    return result
+
+
+def get_look_through_sector_exposure(db_path: str, holdings: list[Holding]) -> dict[str, Any]:
+    """Blend ETF ``sector_weights`` with stock sectors into one look-through view.
+
+    ``coverage_percent`` is the share of current-holdings market value backed
+    by known sector data (a stock's own sector, or an ETF's stored
+    sector_weights); the rest is simply excluded from the sector split rather
+    than guessed.
+    """
+    total_value = sum((h.market_value for h in holdings), Decimal("0"))
+    if total_value <= 0:
+        return {
+            "available": False,
+            "reason": "No current holdings to assess.",
+            "weights": {},
+            "coverage_percent": 0.0,
+        }
+    ticker_ids = [h.ticker_id for h in holdings]
+    sectors = _get_sectors(db_path, ticker_ids)
+    etf_weights = _get_etf_sector_weights(db_path, ticker_ids)
+    exposure: dict[str, float] = {}
+    covered_value = Decimal("0")
+    for holding in holdings:
+        if holding.security_type == "etf":
+            weights = etf_weights.get(holding.ticker_id)
+            if not weights:
+                continue
+            covered_value += holding.market_value
+            for sector, weight in weights.items():
+                exposure[sector] = exposure.get(sector, 0.0) + float(holding.market_value) * weight
+        else:
+            sector = sectors.get(holding.ticker_id)
+            if not sector:
+                continue
+            covered_value += holding.market_value
+            exposure[sector] = exposure.get(sector, 0.0) + float(holding.market_value)
+    coverage_percent = float(covered_value / total_value)
+    if coverage_percent <= 0:
+        return {
+            "available": False,
+            "reason": "No holdings have sector or ETF sector-weight data.",
+            "weights": {},
+            "coverage_percent": 0.0,
+        }
+    total_exposure = sum(exposure.values())
+    weights = {sector: value / total_exposure for sector, value in exposure.items()} if total_exposure else {}
+    return {"available": True, "weights": weights, "coverage_percent": coverage_percent}
+
+
+def get_currency_exposure(holdings: list[Holding]) -> dict[str, dict[str, Any]]:
+    """Allocate current holdings by listing currency (values are not FX-converted)."""
+    totals: dict[str, Decimal] = {}
+    for holding in holdings:
+        label = holding.currency or "UNKNOWN"
+        totals[label] = totals.get(label, Decimal("0")) + holding.market_value
+    return _weights_from_totals(totals)
+
+
+def get_expense_ratios(db_path: str, ticker_ids: list[int]) -> dict[int, Decimal]:
+    """Return known ETF expense ratios (MER) for the given tickers."""
+    if not ticker_ids:
+        return {}
+    connection = get_shared_connection(db_path)
+    placeholders = ",".join("?" for _ in ticker_ids)
+    rows = connection.execute(
+        f"""
+        SELECT ticker_id, expense_ratio FROM etf_details
+        WHERE ticker_id IN ({placeholders}) AND expense_ratio IS NOT NULL
+        """,
+        ticker_ids,
+    ).fetchall()
+    return {int(ticker_id): _decimal(expense_ratio) for ticker_id, expense_ratio in rows}
+
+
+def load_allocation_targets(policy_path: str | Path = POLICY_FILE) -> dict[str, dict[str, Any]] | None:
+    """Load group allocation targets from the classifier policy YAML, if configured."""
+    path = Path(policy_path)
+    if not path.exists():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError:
+        logger.exception("Failed to parse allocation targets policy file | path=%s", path)
+        return None
+    if not isinstance(data, dict):
+        return None
+    targets = data.get("allocation_targets")
+    return targets if isinstance(targets, dict) else None
+
+
+def get_turnover_and_holding_period(
+    db_path: str = DATABASE_PATH,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    historical_values: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Estimate portfolio turnover and quantity-weighted average holding period.
+
+    Turnover is ``min(buy dollars, sell dollars) / average portfolio value``
+    over the period, from statement transactions. Holding period is computed
+    from a chronological per-ticker weighted-average-acquisition-date ledger
+    walk (the same technique ``get_realized_gain_summary`` uses for cost);
+    open positions measure to today, closed lots measure to their sale date,
+    and a ticker whose net quantity ends negative contributes nothing to the
+    open-holding-period figure.
+    """
+    connection = get_shared_connection(db_path)
+    clause, params = _date_filters(date_from, date_to, "transaction_date")
+    turnover_row = connection.execute(
+        f"""
+        SELECT
+            SUM(CASE WHEN UPPER(transaction_type) = 'BUY' THEN COALESCE(debit, 0) ELSE 0 END),
+            SUM(CASE WHEN UPPER(transaction_type) = 'SELL' THEN COALESCE(credit, 0) ELSE 0 END)
+        FROM transactions
+        WHERE UPPER(transaction_type) IN ('BUY', 'SELL') {clause}
+        """,
+        params,
+    ).fetchone()
+    total_buys = _decimal(turnover_row[0])
+    total_sells = _decimal(turnover_row[1])
+
+    values = historical_values if historical_values is not None else get_historical_portfolio_values(db_path)
+    period_values = [
+        row["portfolio_value"]
+        for row in values
+        if (date_from is None or row["date"] >= date_from) and (date_to is None or row["date"] <= date_to)
+    ]
+    positive_values = [value for value in period_values if value > 0]
+    average_value = (
+        sum(positive_values, Decimal("0")) / len(positive_values) if positive_values else Decimal("0")
+    )
+    if average_value > 0:
+        turnover = {
+            "available": True,
+            "turnover_ratio": float(min(total_buys, total_sells) / average_value),
+            "method": "min(buy_dollars, sell_dollars) / average portfolio value over the period",
+        }
+    else:
+        turnover = {
+            "available": False,
+            "reason": "No positive portfolio valuation available over the period.",
+            "turnover_ratio": None,
+        }
+
+    ledger_rows = connection.execute(
+        """
+        SELECT transaction_date, transaction_type, ticker_id, quantity
+        FROM transactions
+        WHERE UPPER(transaction_type) IN ('BUY', 'SELL')
+        ORDER BY transaction_date, transaction_id
+        """
+    ).fetchall()
+    epoch = date(1970, 1, 1)
+    state: dict[int, tuple[Decimal, Decimal]] = {}
+    closed_days_total = Decimal("0")
+    closed_qty_total = Decimal("0")
+    for transaction_date, kind, ticker_id, quantity in ledger_rows:
+        held_qty, held_weighted = state.get(int(ticker_id), (Decimal("0"), Decimal("0")))
+        qty = abs(_decimal(quantity))
+        current_epoch_day = Decimal((_date(transaction_date) - epoch).days)
+        if str(kind).upper() == "BUY":
+            new_qty = held_qty + qty
+            held_weighted = (
+                (held_weighted * held_qty + current_epoch_day * qty) / new_qty if new_qty > 0 else Decimal("0")
+            )
+            state[int(ticker_id)] = (new_qty, held_weighted)
+            continue
+        sold_qty = min(qty, held_qty)
+        if sold_qty > 0:
+            closed_days_total += sold_qty * (current_epoch_day - held_weighted)
+            closed_qty_total += sold_qty
+        state[int(ticker_id)] = (held_qty - sold_qty, held_weighted)
+
+    today_epoch_day = Decimal((date.today() - epoch).days)
+    open_days_total = Decimal("0")
+    open_qty_total = Decimal("0")
+    for held_qty, held_weighted in state.values():
+        if held_qty > 0:
+            open_days_total += held_qty * (today_epoch_day - held_weighted)
+            open_qty_total += held_qty
+
+    average_holding_period = {
+        "open": (
+            {"available": True, "days": float(open_days_total / open_qty_total)}
+            if open_qty_total > 0
+            else {"available": False, "reason": "No open positions.", "days": None}
+        ),
+        "closed": (
+            {"available": True, "days": float(closed_days_total / closed_qty_total)}
+            if closed_qty_total > 0
+            else {"available": False, "reason": "No closed lots (no sell transactions).", "days": None}
+        ),
+    }
+    return {"turnover": turnover, "average_holding_period": average_holding_period}
+
+
+def _is_full_calendar_year(year: int) -> bool:
+    return year < date.today().year
+
+
+def get_dividend_history(
+    db_path: str = DATABASE_PATH,
+    *,
+    source: str = "email",
+    date_from: date | None = None,
+    date_to: date | None = None,
+    portfolio_value: Decimal = Decimal("0"),
+    book_cost: Decimal = Decimal("0"),
+) -> dict[str, Any]:
+    """Return dividend income by month/currency plus trailing yield and growth figures."""
+    connection = get_shared_connection(db_path)
+    if source == "email":
+        clause, params = _date_filters(date_from, date_to, "et.transaction_date")
+        query = f"""
+            SELECT et.transaction_date, COALESCE(t.currency, 'UNKNOWN'), et.debit
+            FROM email_transactions et LEFT JOIN tickers t ON t.ticker_id = et.ticker_id
+            WHERE LOWER(et.transaction_type) = 'dividend' {clause}
+        """
+    elif source == "activities":
+        clause, params = _date_filters(date_from, date_to, "transaction_date")
+        query = f"""
+            SELECT transaction_date, COALESCE(transaction_currency, 'UNKNOWN'), net_cash_amount
+            FROM activities WHERE activity_code = 'DIV' AND COALESCE(net_cash_amount, 0) > 0 {clause}
+        """
+    elif source == "statements":
+        clause, params = _date_filters(date_from, date_to, "transaction_date")
+        query = f"""
+            SELECT transaction_date, 'CAD', credit
+            FROM transactions WHERE UPPER(transaction_type) = 'DIV' {clause}
+        """
+    else:
+        raise ValueError("dividend source must be email, activities, or statements")
+    rows = connection.execute(query, params).fetchall()
+
+    by_month: dict[str, Decimal] = {}
+    by_currency: dict[str, Decimal] = {}
+    by_year: dict[int, Decimal] = {}
+    t12m_by_currency: dict[str, Decimal] = {}
+    twelve_months_ago = date.today() - timedelta(days=365)
+    for transaction_date, currency, amount in rows:
+        day = _date(transaction_date)
+        value = _decimal(amount)
+        month_key = f"{day.year:04d}-{day.month:02d}"
+        by_month[month_key] = by_month.get(month_key, Decimal("0")) + value
+        by_currency[currency] = by_currency.get(currency, Decimal("0")) + value
+        by_year[day.year] = by_year.get(day.year, Decimal("0")) + value
+        if day >= twelve_months_ago:
+            t12m_by_currency[currency] = t12m_by_currency.get(currency, Decimal("0")) + value
+
+    cad_t12m = t12m_by_currency.get("CAD", Decimal("0"))
+    yield_on_cost = (
+        {"available": True, "value": float(cad_t12m / book_cost)}
+        if book_cost > 0
+        else {"available": False, "reason": "No CAD book cost to compute yield on cost.", "value": None}
+    )
+    trailing_yield = (
+        {"available": True, "value": float(cad_t12m / portfolio_value)}
+        if portfolio_value > 0
+        else {"available": False, "reason": "No portfolio value to compute trailing yield.", "value": None}
+    )
+
+    full_years = sorted(year for year in by_year if _is_full_calendar_year(year))
+    if len(full_years) >= 2:
+        previous_year, latest_year = full_years[-2], full_years[-1]
+        previous_total = by_year[previous_year]
+        growth = (
+            {
+                "available": True,
+                "value": float((by_year[latest_year] - previous_total) / previous_total),
+                "from_year": previous_year,
+                "to_year": latest_year,
+            }
+            if previous_total > 0
+            else {"available": False, "reason": "Prior full year had zero dividends.", "value": None}
+        )
+    else:
+        growth = {
+            "available": False,
+            "reason": "Fewer than two full calendar years of dividend history.",
+            "value": None,
+        }
+
+    return {
+        "source": source,
+        "transaction_count": len(rows),
+        "by_month": {month: by_month[month] for month in sorted(by_month)},
+        "totals_by_currency": by_currency,
+        "trailing_12_month": {
+            "totals_by_currency": t12m_by_currency,
+            "yield_on_portfolio_value": trailing_yield,
+        },
+        "yield_on_cost": yield_on_cost,
+        "dividend_growth": growth,
+    }
+
+
+def build_data_quality(
+    holdings: list[Holding],
+    excluded_positions: list[Holding],
+    classifications: dict[int, dict[str, Any]],
+    *,
+    missing_sector_tickers: list[str] | None = None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Flag positions that need attention instead of silently including or excluding them."""
+    today = today or date.today()
+    missing_sector = set(missing_sector_tickers or [])
+    flags: list[dict[str, Any]] = []
+
+    for holding in excluded_positions:
+        flags.append(
+            {
+                "code": "negative_quantity",
+                "ticker_symbol": holding.ticker_symbol,
+                "detail": f"Net quantity is {holding.quantity}; recorded sells exceed recorded buys.",
+                "severity": "warning",
+            }
+        )
+
+    for holding in holdings:
+        if holding.has_provisional_activity:
+            flags.append(
+                {
+                    "code": "provisional_activity",
+                    "ticker_symbol": holding.ticker_symbol,
+                    "detail": "Includes unreconciled provisional email activity.",
+                    "severity": "info",
+                }
+            )
+        if holding.last_price_date is None:
+            flags.append(
+                {
+                    "code": "stale_price",
+                    "ticker_symbol": holding.ticker_symbol,
+                    "detail": "No stored price history for this ticker.",
+                    "severity": "warning",
+                }
+            )
+        elif (today - holding.last_price_date).days > STALE_PRICE_MAX_AGE_DAYS:
+            flags.append(
+                {
+                    "code": "stale_price",
+                    "ticker_symbol": holding.ticker_symbol,
+                    "detail": (
+                        f"Last price is from {holding.last_price_date}, "
+                        f"older than {STALE_PRICE_MAX_AGE_DAYS} days."
+                    ),
+                    "severity": "warning",
+                }
+            )
+        if holding.cost_basis <= 0:
+            flags.append(
+                {
+                    "code": "missing_cost_basis",
+                    "ticker_symbol": holding.ticker_symbol,
+                    "detail": "Cost basis is zero or negative for a currently held position.",
+                    "severity": "warning",
+                }
+            )
+        elif holding.market_value > 0:
+            gain_percent = (holding.market_value - holding.cost_basis) / holding.cost_basis
+            if abs(gain_percent) > Decimal(str(SUSPICIOUS_UNREALIZED_GAIN_THRESHOLD)):
+                flags.append(
+                    {
+                        "code": "suspicious_gain",
+                        "ticker_symbol": holding.ticker_symbol,
+                        "detail": (
+                            f"Unrealized gain is {gain_percent:.1%}, beyond the "
+                            f"{SUSPICIOUS_UNREALIZED_GAIN_THRESHOLD:.0%} sanity threshold."
+                        ),
+                        "severity": "warning",
+                    }
+                )
+        if holding.ticker_symbol in missing_sector:
+            flags.append(
+                {
+                    "code": "missing_sector",
+                    "ticker_symbol": holding.ticker_symbol,
+                    "detail": "No stock_details.sector recorded for this ticker.",
+                    "severity": "info",
+                }
+            )
+        info = classifications.get(holding.ticker_id)
+        if info is None:
+            flags.append(
+                {
+                    "code": "missing_classification",
+                    "ticker_symbol": holding.ticker_symbol,
+                    "detail": "No portfolio_classifications row for this ticker.",
+                    "severity": "info",
+                }
+            )
+        elif info.get("review_needed"):
+            flags.append(
+                {
+                    "code": "missing_classification",
+                    "ticker_symbol": holding.ticker_symbol,
+                    "detail": "Classifier flagged this ticker for manual review.",
+                    "severity": "info",
+                }
+            )
+
+    counts_by_code: dict[str, int] = {}
+    for flag in flags:
+        counts_by_code[flag["code"]] = counts_by_code.get(flag["code"], 0) + 1
+
+    return {
+        "flags": flags,
+        "excluded_negative_positions": [
+            {"ticker_symbol": h.ticker_symbol, "quantity": h.quantity, "cost_basis": h.cost_basis}
+            for h in excluded_positions
+        ],
+        "counts_by_code": counts_by_code,
+    }
+
+
+def _normalize_benchmark_history(history: Any) -> list[dict[str, Any]]:
+    """Normalize a yfinance-shaped history frame or list into sorted {date, close} rows."""
+    if isinstance(history, pd.DataFrame):
+        if history.empty:
+            return []
+        records: list[dict[str, Any]] = []
+        for _, row in history.iterrows():
+            close = row.get("Close")
+            if close is None or pd.isna(close):
+                continue
+            raw_date = row.get("Date")
+            normalized_date = raw_date.date() if hasattr(raw_date, "date") else raw_date
+            records.append({"date": normalized_date, "close": float(close)})
+        records.sort(key=lambda record: record["date"])
+        return records
+    # Test fixtures: a plain iterable of {"date", "close"} dicts.
+    records = [
+        {"date": row["date"], "close": float(row["close"])}
+        for row in history
+        if row.get("close") is not None
+    ]
+    records.sort(key=lambda record: record["date"])
+    return records
+
+
+def get_benchmark_returns(
+    symbol: str,
+    start: date,
+    end: date,
+    *,
+    fetch_history: Callable[[list[str], date, date], Any] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Fetch a benchmark's daily returns from yfinance, or ``None`` on any failure.
+
+    Never persisted to the database; used only to compute in-memory benchmark
+    comparison statistics for a single report run. ``fetch_history`` is
+    injectable so tests never need a live network call.
+    """
+    if fetch_history is None:
+        try:
+            from yfinance_extractor import fetch_security_history as fetch_history
+        except ImportError:
+            return None
+    try:
+        history = fetch_history([symbol], start, end)
+    except Exception:
+        logger.exception("Benchmark history fetch failed | symbol=%s", symbol)
+        return None
+    try:
+        records = _normalize_benchmark_history(history)
+    except Exception:
+        logger.exception("Benchmark history normalization failed | symbol=%s", symbol)
+        return None
+    if len(records) < 2:
+        return None
+    returns: list[dict[str, Any]] = []
+    previous_close: float | None = None
+    for record in records:
+        if previous_close is not None and previous_close > 0:
+            returns.append(
+                {"date": record["date"], "return": (record["close"] - previous_close) / previous_close}
+            )
+        previous_close = record["close"]
+    return returns or None
+
+
 def portfolio_report(
     db_path: str = DATABASE_PATH,
     *,
@@ -572,43 +1321,260 @@ def portfolio_report(
     dividend_source: str = "email",
     cash_flow_source: str = "activities",
     fx_source: str = "statements",
+    benchmark_symbol: str | None = DEFAULT_BENCHMARK_SYMBOL,
+    benchmark_fetcher: Callable[[list[str], date, date], Any] | None = None,
 ) -> dict[str, Any]:
-    # Keep the dashboard-facing payload plain and easy to serialize.
-    summary = get_portfolio_summary(db_path)
-    holdings = [asdict(holding) for holding in summary.holdings]
+    """Compose the full read-only portfolio analytics report.
+
+    Only currently-held positive-quantity positions drive holdings, allocation,
+    and concentration figures; excluded negative net positions are reported
+    only through ``data_quality``. Every metric that cannot be computed
+    reliably from available data is recorded in ``unavailable_metrics`` with a
+    reason instead of being guessed or omitted silently.
+    """
+    unavailable: list[dict[str, str]] = []
+
+    def _mark_unavailable(metric: str, reason: str) -> None:
+        unavailable.append({"metric": metric, "reason": reason})
+
+    summary_obj = get_portfolio_summary(db_path)
+    holding_objs = summary_obj.holdings
+    excluded_objs = get_excluded_positions(db_path)
+    holdings = [asdict(holding) for holding in holding_objs]
+
     historical_values = get_historical_portfolio_values(db_path)
-    filtered_historical_values = [
-        row for row in historical_values
-        if (date_from is None or row["date"] >= date_from)
-        and (date_to is None or row["date"] <= date_to)
-    ]
-    dividends = get_dividend_summary(
-        db_path, source=dividend_source, date_from=date_from, date_to=date_to
+
+    # --- Allocation ---
+    group_allocation = get_group_allocation(db_path, holding_objs)
+    sector_allocation = get_sector_allocation(db_path, holding_objs)
+    look_through = get_look_through_sector_exposure(db_path, holding_objs)
+    currency_exposure = get_currency_exposure(holding_objs)
+    weights_by_ticker = calculate_position_weights(holdings)
+    concentration = calculate_concentration(weights_by_ticker)
+
+    if group_allocation.get("group_unavailable_reason"):
+        _mark_unavailable("allocation.by_group", group_allocation["group_unavailable_reason"])
+    if group_allocation.get("geography_unavailable_reason"):
+        _mark_unavailable("allocation.by_geography", group_allocation["geography_unavailable_reason"])
+    if sector_allocation["missing_sector_tickers"]:
+        _mark_unavailable(
+            "allocation.by_sector",
+            "Missing sector metadata for: " + ", ".join(sector_allocation["missing_sector_tickers"]),
+        )
+    if not look_through["available"]:
+        _mark_unavailable("allocation.look_through_sector", look_through["reason"])
+    if not concentration["available"]:
+        _mark_unavailable("allocation.concentration", concentration["reason"])
+
+    single_name_breach = (
+        concentration["max_single_name_weight"] > float(SINGLE_NAME_MAX_WEIGHT)
+        if concentration["available"]
+        else None
     )
-    commissions = get_commission_summary(db_path, date_from=date_from, date_to=date_to)
-    fx_fees = get_fx_fee_summary(
-        db_path, source=fx_source, date_from=date_from, date_to=date_to
+    concentration_with_limit = {
+        **concentration,
+        "single_name_limit": float(SINGLE_NAME_MAX_WEIGHT),
+        "single_name_limit_breached": single_name_breach,
+    }
+    allocation = {
+        "by_ticker": weights_by_ticker,
+        "by_group": group_allocation["by_group"],
+        "by_sector": sector_allocation["by_sector"],
+        "by_currency": currency_exposure,
+        "by_geography": group_allocation["by_geography"],
+        "look_through_sector": look_through,
+        "concentration": concentration_with_limit,
+    }
+
+    # --- Targets / rebalance drift ---
+    allocation_targets = load_allocation_targets()
+    actual_group_weights = {group: info["weight"] for group, info in group_allocation["by_group"].items()}
+    drift = calculate_rebalance_drift(actual_group_weights, allocation_targets)
+    if not drift["available"]:
+        _mark_unavailable("targets", drift["reason"])
+    targets = {"available": drift["available"], "source_file": str(POLICY_FILE), "groups": drift["groups"]}
+
+    # --- Performance ---
+    external_flows = get_external_flow_series(
+        db_path,
+        source=cash_flow_source if cash_flow_source in ("activities", "statements") else "activities",
+        date_from=date_from,
+        date_to=date_to,
     )
+    adjusted_returns = calculate_adjusted_daily_returns(historical_values, external_flows)
+    wealth_index = build_wealth_index(adjusted_returns)
+    total_return = calculate_twr_total_return(adjusted_returns)
+    volatility = calculate_adjusted_volatility(adjusted_returns)
+    sharpe_ratio = calculate_adjusted_sharpe_ratio(adjusted_returns)
+    sortino_ratio = calculate_sortino_ratio(adjusted_returns)
+    drawdown_details = calculate_drawdown_details(wealth_index)
+    for metric_name, block in (
+        ("performance.total_return", total_return),
+        ("performance.volatility", volatility),
+        ("performance.sharpe_ratio", sharpe_ratio),
+        ("performance.sortino_ratio", sortino_ratio),
+        ("performance.drawdown", drawdown_details),
+    ):
+        if not block.get("available"):
+            _mark_unavailable(metric_name, block.get("reason", "Not enough adjusted return history."))
+
     cash_flow = get_cash_flow_summary(
         db_path,
         source=cash_flow_source,
         date_from=date_from,
         date_to=date_to,
-        terminal_value=summary.portfolio_value,
+        terminal_value=summary_obj.portfolio_value,
     )
-    cost_basis = sum((holding.cost_basis for holding in summary.holdings), Decimal("0"))
-    cad_dividends = dividends["totals_by_currency"].get("CAD", Decimal("0"))
-    return {
-        "holdings": holdings,
-        "cash": asdict(summary.cash),
-        "portfolio_value": summary.portfolio_value,
+    if not cash_flow["money_weighted_return"]["available"]:
+        _mark_unavailable("performance.money_weighted_return", cash_flow["money_weighted_return"]["reason"])
+
+    benchmark_stats: dict[str, Any] | None = None
+    if benchmark_symbol and historical_values:
+        start = historical_values[0]["date"]
+        end = historical_values[-1]["date"]
+        benchmark_returns = get_benchmark_returns(benchmark_symbol, start, end, fetch_history=benchmark_fetcher)
+        if benchmark_returns:
+            benchmark_stats = calculate_benchmark_stats(adjusted_returns, benchmark_returns)
+        if not benchmark_stats:
+            _mark_unavailable(
+                "performance.benchmark",
+                f"Could not fetch or align benchmark data for {benchmark_symbol}.",
+            )
+    else:
+        _mark_unavailable(
+            "performance.benchmark",
+            "Benchmark comparison disabled." if not benchmark_symbol else "No historical valuation series to compare.",
+        )
+
+    performance = {
         "historical_values": historical_values,
-        "financial_metrics": financial_metrics_summary(holdings, filtered_historical_values),
-        "cash_flow": cash_flow,
-        "realized_gains": get_realized_gain_summary(db_path, date_from=date_from, date_to=date_to),
-        "dividends": {
-            **dividends,
-            "yield_on_current_cost_basis": cad_dividends / cost_basis if cost_basis > 0 else Decimal("0"),
+        "adjusted_returns": {
+            "total_return": total_return,
+            "volatility": volatility,
+            "sharpe_ratio": sharpe_ratio,
+            "sortino_ratio": sortino_ratio,
+            "drawdown": drawdown_details,
         },
-        "fees": {"commissions": commissions, "fx": fx_fees},
+        "money_weighted": cash_flow,
+        "benchmark": {
+            "available": benchmark_stats is not None,
+            "symbol": benchmark_symbol,
+            **(benchmark_stats or {}),
+        },
+    }
+
+    # --- Income ---
+    cost_basis = sum((holding.cost_basis for holding in holding_objs), Decimal("0"))
+    income = get_dividend_history(
+        db_path,
+        source=dividend_source,
+        date_from=date_from,
+        date_to=date_to,
+        portfolio_value=summary_obj.portfolio_value,
+        book_cost=cost_basis,
+    )
+    if not income["yield_on_cost"]["available"]:
+        _mark_unavailable("income.yield_on_cost", income["yield_on_cost"]["reason"])
+    if not income["dividend_growth"]["available"]:
+        _mark_unavailable("income.dividend_growth", income["dividend_growth"]["reason"])
+
+    # --- Fees ---
+    commissions = get_commission_summary(db_path, date_from=date_from, date_to=date_to)
+    fx_fees = get_fx_fee_summary(db_path, source=fx_source, date_from=date_from, date_to=date_to)
+    expense_ratios = get_expense_ratios(db_path, [h.ticker_id for h in holding_objs])
+    weighted_mer = calculate_weighted_mer(
+        [
+            {"market_value": h.market_value, "expense_ratio": expense_ratios.get(h.ticker_id)}
+            for h in holding_objs
+        ]
+    )
+    if not weighted_mer["available"]:
+        _mark_unavailable("fees.weighted_mer", weighted_mer["reason"])
+    fx_fee_percent_of_value = (
+        {"available": True, "value": float(fx_fees["estimated_fx_fee_cad"] / summary_obj.portfolio_value)}
+        if fx_fees["available"] and summary_obj.portfolio_value > 0
+        else {"available": False, "reason": "No positive portfolio value to compare fees against.", "value": None}
+    )
+    unrealized_total = sum((h.market_value - h.cost_basis for h in holding_objs), Decimal("0"))
+    fx_fee_percent_of_gains = (
+        {"available": True, "value": float(fx_fees["estimated_fx_fee_cad"] / unrealized_total)}
+        if fx_fees["available"] and unrealized_total > 0
+        else {"available": False, "reason": "No positive unrealized gain to compare fees against.", "value": None}
+    )
+    if not fx_fee_percent_of_value["available"]:
+        _mark_unavailable("fees.fx_fee_percent_of_value", fx_fee_percent_of_value["reason"])
+    if not fx_fee_percent_of_gains["available"]:
+        _mark_unavailable("fees.fx_fee_percent_of_gains", fx_fee_percent_of_gains["reason"])
+    fees = {
+        "commissions": commissions,
+        "fx": fx_fees,
+        "fee_drag": {
+            "fx_fee_percent_of_value": fx_fee_percent_of_value,
+            "fx_fee_percent_of_gains": fx_fee_percent_of_gains,
+            "weighted_mer": weighted_mer,
+        },
+    }
+
+    # --- Activity ---
+    activity = get_turnover_and_holding_period(
+        db_path, date_from=date_from, date_to=date_to, historical_values=historical_values
+    )
+    if not activity["turnover"]["available"]:
+        _mark_unavailable("activity.turnover", activity["turnover"]["reason"])
+    for horizon in ("open", "closed"):
+        block = activity["average_holding_period"][horizon]
+        if not block["available"]:
+            _mark_unavailable(f"activity.average_holding_period.{horizon}", block["reason"])
+
+    # --- Data quality ---
+    data_quality = build_data_quality(
+        holding_objs,
+        excluded_objs,
+        group_allocation["classifications"],
+        missing_sector_tickers=sector_allocation["missing_sector_tickers"],
+    )
+
+    # --- Summary ---
+    realized_gains = get_realized_gain_summary(db_path, date_from=date_from, date_to=date_to)
+    securities_value = sum((h.market_value for h in holding_objs), Decimal("0"))
+    summary = {
+        "portfolio_value": summary_obj.portfolio_value,
+        "cash": asdict(summary_obj.cash),
+        "securities_value": securities_value,
+        "book_cost": cost_basis,
+        "holdings_count": len(holding_objs),
+        "unrealized_gain": {
+            "amount": unrealized_total,
+            "percent": float(unrealized_total / cost_basis) if cost_basis > 0 else None,
+        },
+        "unrealized_gains_by_ticker": {
+            row["ticker_symbol"]: calculate_unrealized_gain_percent(row) for row in holdings
+        },
+        "realized_gain_total": realized_gains["total_realized_gain"],
+    }
+    if cost_basis <= 0 and holdings:
+        _mark_unavailable("summary.unrealized_gain.percent", "No positive book cost to compute a percentage.")
+
+    return {
+        "schema_version": "1.0",
+        "generated_at": datetime.now().isoformat(),
+        "parameters": {
+            "date_from": date_from,
+            "date_to": date_to,
+            "dividend_source": dividend_source,
+            "cash_flow_source": cash_flow_source,
+            "fx_source": fx_source,
+            "benchmark_symbol": benchmark_symbol,
+        },
+        "summary": summary,
+        "holdings": holdings,
+        "allocation": allocation,
+        "targets": targets,
+        "performance": performance,
+        "income": income,
+        "fees": fees,
+        "activity": activity,
+        "realized_gains": realized_gains,
+        "data_quality": data_quality,
+        "unavailable_metrics": unavailable,
     }

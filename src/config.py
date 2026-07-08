@@ -30,6 +30,13 @@ remain reviewable and do not diverge between CLI and library callers.
 WEALTHSIMPLE_FX_FEE_RATE = Decimal("0.015")
 ANNUALIZATION_PERIODS = 252
 DEFAULT_RISK_FREE_RATE = 0.0
+STALE_PRICE_MAX_AGE_DAYS = 7
+SUSPICIOUS_UNREALIZED_GAIN_THRESHOLD = 0.95
+DEFAULT_BENCHMARK_SYMBOL = "XEQT.TO"
+SINGLE_NAME_MAX_WEIGHT = Decimal("0.10")
+ANALYTICS_EXPORT_FOLDER = EXPORT_FOLDER / "analytics"
+ANALYTICS_EXPORT_FILENAME = "portfolio-analytics.json"
+POLICY_FILE = PORTFOLIO_GROUPING_FOLDER / "policy_v1_1.yaml"
 
 """
 Logging config used by `system_logger.py`.

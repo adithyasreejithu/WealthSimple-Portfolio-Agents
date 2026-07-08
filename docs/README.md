@@ -2,6 +2,8 @@
 
 Repository documentation is grouped by purpose so plans, acceptance criteria, technical references, and project status are easy to find.
 
+New here? Start with the [project overview](project/overview.md) for a plain-English tour of what the system does and how the pieces fit together.
+
 ## Architecture and Technical References
 
 - [Claude agent and skill structure](architecture/claude_agent_skill_structure.md)
@@ -26,6 +28,7 @@ Repository documentation is grouped by purpose so plans, acceptance criteria, te
 
 ## Project Status
 
+- [Project overview](project/overview.md)
 - [Handover](project/handover.md)
 - [Issues, risks, and security](project/issues.md)
 - [TODO](project/todo.md)

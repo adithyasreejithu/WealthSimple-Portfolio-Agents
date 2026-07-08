@@ -1,5 +1,9 @@
+import io
+import json
 import tempfile
+import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -7,6 +11,7 @@ import pandas as pd
 
 import app
 import database
+import ticker_mapping
 from market_data import MarketSyncResult
 
 
@@ -59,8 +64,13 @@ class AppPipelineTest(unittest.TestCase):
             "account", "transaction", "ticker_id", "ticker", "quantity", "avg_price",
             "total_cost", "debit", "date", "price_currency",
         ])
-        with patch.object(app, "extract_statement_pdf", return_value=empty_statement), patch.object(
-            app, "fetch_email_transactions", return_value=empty_email
+        with (
+            patch.object(app, "extract_statement_pdf", return_value=empty_statement),
+            patch.object(app, "fetch_email_transactions", return_value=empty_email),
+            patch.object(
+                app, "_run_portfolio_classification",
+                return_value=app.SourceResult("classification", None, "succeeded", 0),
+            ),
         ):
             result = app.run_pipeline("all", self.data_dir, self.data_dir / "db.duckdb")
 
@@ -92,12 +102,17 @@ class AppPipelineTest(unittest.TestCase):
                 "sync_market_data",
                 side_effect=lambda *_: events.append("market") or MarketSyncResult(1, 2),
             ) as sync,
+            patch.object(
+                app, "_run_portfolio_classification",
+                return_value=app.SourceResult("classification", None, "succeeded", 0),
+            ),
         ):
             result = app.run_pipeline("all", self.data_dir, self.data_dir / "db.duckdb")
 
         self.assertEqual(events, ["email", "market", "batch"])
         sync.assert_called_once_with(self.data_dir / "db.duckdb")
-        self.assertEqual(result.results[-1], app.SourceResult("email", None, "succeeded", 0))
+        self.assertEqual(result.results[-2], app.SourceResult("email", None, "succeeded", 0))
+        self.assertEqual(result.results[-1], app.SourceResult("classification", None, "succeeded", 0))
 
     def test_source_specific_pipeline_does_not_sync_market_data(self):
         with (
@@ -121,16 +136,68 @@ class AppPipelineTest(unittest.TestCase):
             patch.object(app, "_stage_export_files", return_value=([], 3, [])),
             patch.object(app, "complete_batch"),
             patch.object(app, "sync_market_data") as sync,
+            patch.object(
+                app, "_run_portfolio_classification",
+                return_value=app.SourceResult("classification", None, "succeeded", 0),
+            ),
         ):
             result = app.run_pipeline("all", self.data_dir, self.data_dir / "db.duckdb")
 
         sync.assert_not_called()
         self.assertFalse(result.succeeded)
 
+    def test_full_pipeline_skips_classification_for_partial_source(self):
+        with (
+            patch.object(app, "initialize_database"),
+            patch.object(app, "create_batch", return_value=7),
+            patch.object(app, "_stage_statement_files", return_value=([], 1, [])),
+            patch.object(app, "complete_batch"),
+            patch.object(app, "_run_portfolio_classification") as classify,
+        ):
+            app.run_pipeline("statements", self.data_dir, self.data_dir / "db.duckdb")
+
+        classify.assert_not_called()
+
+    def test_run_portfolio_classification_persists_and_reports_rows(self):
+        fake_module = types.ModuleType("classification_workflow")
+        fake_module.classify_portfolio = lambda db_path: {"holdings": []}
+        fake_module.write_output = lambda payload: Path("fake-output.json")
+        db_path = self.data_dir / "db.duckdb"
+        with (
+            patch.dict("sys.modules", {"classification_workflow": fake_module}),
+            patch.object(app, "upload_portfolio_classifications", return_value=5) as upload,
+        ):
+            result = app._run_portfolio_classification(db_path)
+
+        self.assertEqual(result, app.SourceResult("classification", Path("fake-output.json"), "succeeded", 5))
+        upload.assert_called_once_with(Path("fake-output.json"), db_path)
+
+    def test_run_portfolio_classification_failure_is_non_fatal(self):
+        fake_module = types.ModuleType("classification_workflow")
+
+        def _boom(db_path):
+            raise RuntimeError("yfinance unavailable")
+
+        fake_module.classify_portfolio = _boom
+        fake_module.write_output = lambda payload: Path("unused.json")
+        with patch.dict("sys.modules", {"classification_workflow": fake_module}):
+            result = app._run_portfolio_classification(self.data_dir / "db.duckdb")
+
+        self.assertEqual(result.source, "classification")
+        self.assertEqual(result.status, "failed")
+        self.assertIn("yfinance unavailable", result.error)
+
     def test_analytics_command_prints_report(self):
         report = {
-            "portfolio_value": 1234,
-            "cash": {"balance": 250, "source": "explicit_balance"},
+            "generated_at": "2025-01-01T00:00:00",
+            "parameters": {},
+            "summary": {
+                "portfolio_value": 1234,
+                "cash": {"balance": 250, "source": "explicit_balance"},
+                "book_cost": 900,
+                "unrealized_gain": {"amount": 84, "percent": 0.0933},
+                "realized_gain_total": 0,
+            },
             "holdings": [
                 {
                     "ticker_symbol": "AAPL",
@@ -139,6 +206,12 @@ class AppPipelineTest(unittest.TestCase):
                     "market_value": 984,
                 }
             ],
+            "allocation": {"by_group": {}},
+            "targets": {"groups": []},
+            "income": {"source": "email", "totals_by_currency": {}},
+            "fees": {"fx": {"available": False, "source": "statements"}},
+            "data_quality": {"counts_by_code": {}},
+            "unavailable_metrics": [],
         }
 
         with patch.object(app, "run_analytics", return_value=report), patch(
@@ -156,26 +229,30 @@ class AppPipelineTest(unittest.TestCase):
         self.assertIn("3.00", printed)
         self.assertIn("984.00", printed)
 
-    def test_analytics_command_exports_json(self):
+    def test_analytics_command_exports_json_to_file(self):
         report = {
-            "portfolio_value": 1234,
-            "cash": {"balance": 250, "source": "explicit_balance"},
+            "generated_at": "2025-01-01T00:00:00",
+            "parameters": {},
+            "summary": {"portfolio_value": 1234, "cash": {"balance": 250, "source": "explicit_balance"}},
             "holdings": [],
         }
+        export_folder = self.data_dir / "exports" / "analytics"
 
-        with patch.object(app, "run_analytics", return_value=report), patch(
-            "sys.stdout.write"
-        ) as write:
+        with patch.object(app, "run_analytics", return_value=report):
             output = app.main([
                 "analytics",
                 "--export",
+                "--export-folder",
+                str(export_folder),
                 "--database",
                 str(self.data_dir / "db.duckdb"),
             ])
 
         self.assertEqual(output, 0)
-        printed = "".join(call.args[0] for call in write.call_args_list)
-        self.assertIn('"portfolio_value": 1234', printed)
+        export_path = export_folder / "portfolio-analytics.json"
+        self.assertTrue(export_path.exists())
+        written = json.loads(export_path.read_text(encoding="utf-8"))
+        self.assertEqual(written["report"]["summary"]["portfolio_value"], 1234)
 
     def test_pipeline_subcommand_forwards_pipeline_options(self):
         result = app.PipelineResult((app.SourceResult("email", None, "skipped"),))
@@ -195,6 +272,71 @@ class AppPipelineTest(unittest.TestCase):
         run_pipeline.assert_called_once_with(
             "email", self.data_dir, self.data_dir / "db.duckdb"
         )
+
+    def test_resolve_tickers_with_no_pending_skips_retry(self):
+        db_path = self.data_dir / "db.duckdb"
+        with (
+            patch.object(ticker_mapping, "list_pending", return_value=[]) as list_pending,
+            patch.object(app, "run_pipeline") as run_pipeline,
+        ):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                output = app.main(["resolve-tickers", "--database", str(db_path)])
+
+        self.assertEqual(output, 0)
+        list_pending.assert_called_once_with(db_path)
+        run_pipeline.assert_not_called()
+        self.assertIn("No pending ticker mappings.", buffer.getvalue())
+
+    def test_resolve_tickers_retries_pipeline_when_mapping_verified(self):
+        db_path = self.data_dir / "db.duckdb"
+        pending = [{
+            "source_symbol": "MDA", "detected_currency": "CAD", "trade_count": 1,
+            "first_seen": None, "last_seen": None, "sources": ["export"],
+        }]
+        resolutions = [{
+            "source_symbol": "MDA", "provider_symbol": "MDA.TO", "currency": "CAD",
+            "status": "verified", "resolved_email_rows": 1,
+        }]
+        pipeline_result = app.PipelineResult(
+            (app.SourceResult("export", None, "succeeded", 569),)
+        )
+        with (
+            patch.object(ticker_mapping, "list_pending", return_value=pending),
+            patch.object(ticker_mapping, "resolve_pending_interactively", return_value=resolutions),
+            patch.object(app, "run_pipeline", return_value=pipeline_result) as run_pipeline,
+        ):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                output = app.main([
+                    "resolve-tickers",
+                    "--data-folder", str(self.data_dir),
+                    "--database", str(db_path),
+                ])
+
+        self.assertEqual(output, 0)
+        run_pipeline.assert_called_once_with("all", self.data_dir, db_path)
+        printed = buffer.getvalue()
+        self.assertIn("MDA: mapped to MDA.TO (CAD)", printed)
+        self.assertIn("export: succeeded (569 row(s))", printed)
+        self.assertNotIn("{", printed)
+
+    def test_resolve_tickers_skips_retry_when_all_skipped(self):
+        db_path = self.data_dir / "db.duckdb"
+        pending = [{
+            "source_symbol": "XNDU", "detected_currency": "CAD", "trade_count": 1,
+            "first_seen": None, "last_seen": None, "sources": ["email"],
+        }]
+        resolutions = [{"source_symbol": "XNDU", "status": "skipped"}]
+        with (
+            patch.object(ticker_mapping, "list_pending", return_value=pending),
+            patch.object(ticker_mapping, "resolve_pending_interactively", return_value=resolutions),
+            patch.object(app, "run_pipeline") as run_pipeline,
+        ):
+            output = app.main(["resolve-tickers", "--database", str(db_path)])
+
+        self.assertEqual(output, 0)
+        run_pipeline.assert_not_called()
 
     def test_app_delegates_feature_subcommands(self):
         commands = {
@@ -232,6 +374,7 @@ class AppPipelineTest(unittest.TestCase):
             "yfinance",
             "yfinance-sync",
             "ticker-map",
+            "resolve-tickers",
             "import-activities",
             "portfolio-classify",
             "classification-sync",

@@ -171,6 +171,22 @@ class DatabaseCommandTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row, ("NEW", "CAD", "pending"))
 
+    def test_interac_deposit_is_not_applicable_not_pending(self):
+        data = pd.DataFrame([{
+            "account": "TFSA", "transaction": "Deposit", "ticker_id": 0,
+            "ticker": "EMAIL", "quantity": "", "avg_price": "",
+            "total_cost": "", "debit": "225.00", "date": date(2024, 10, 23),
+            "price_currency": "", "source_message_id": "",
+            "received_at": date(2024, 10, 23),
+        }])
+
+        self.assertEqual(upload_email_transactions(data, self.db_path), 1)
+        row = database.get_shared_connection(self.db_path).execute(
+            "SELECT source_symbol, ticker_resolution_status, reconciliation_status "
+            "FROM email_transactions"
+        ).fetchone()
+        self.assertEqual(row, ("EMAIL", "not_applicable", "not_applicable"))
+
     def test_statement_match_supersedes_email_trade_once(self):
         connection = database.get_shared_connection(self.db_path)
         ticker_id = connection.execute(

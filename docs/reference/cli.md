@@ -29,13 +29,34 @@ Options:
 
 The legacy form `python src/app.py --source all` remains supported.
 
+A full (`--source all`, the default) run also classifies current holdings and
+persists the result as its final step — the same work `portfolio-classify` +
+`classification-sync` do (see "Portfolio Classification" below), run
+automatically so a routine pipeline run always reflects current
+classifications without a separate manual step. It prints as one more
+`classification: succeeded/failed (N row(s))` line in the results. A
+classification failure (e.g. a transient yfinance error) never rolls back
+ingestion that already completed, matching how a market-data sync failure is
+handled — it only affects the reported exit code, the same way a `partial`
+email result already does. Partial-source runs (`--source
+export/statements/email`) never trigger it.
+
 ## Analytics
 
 ```powershell
 python src/app.py analytics
 python src/app.py analytics --database Data/PRD_WealthSimple.duckdb --export
 python src/app.py analytics --date-from 2025-01-01 --date-to 2025-12-31 --dividend-source email
+python src/app.py analytics --benchmark VFV.TO
+python src/app.py analytics --no-benchmark --export --export-folder exports/analytics
 ```
+
+Only current, positive-quantity holdings drive holdings, allocation, and
+concentration figures; a ticker whose recorded sells exceed recorded buys is
+excluded and instead surfaced in `data_quality`. See
+[`docs/reference/analytics.md`](analytics.md) for the full calculation
+reference, the exported JSON structure, and how unavailable metrics are
+reported.
 
 - `--database PATH` selects the database.
 - `--date-from YYYY-MM-DD` and `--date-to YYYY-MM-DD` apply inclusive filters
@@ -44,7 +65,18 @@ python src/app.py analytics --date-from 2025-01-01 --date-to 2025-12-31 --divide
 - `--cash-flow-source {activities,statements}` defaults to `activities`.
 - `--fx-source {statements,exports,email}` defaults to `statements`; exports and
   email currently report unavailable because they lack complete FX inputs.
-- `--export` prints JSON instead of the formatted report.
+- `--benchmark SYMBOL` fetches that symbol's price history live from yfinance
+  at report time (default `XEQT.TO`) to compute active return, tracking
+  error, information ratio, beta, and alpha. Requires network access; any
+  fetch failure degrades to an unavailable benchmark section rather than an
+  error.
+- `--no-benchmark` skips the benchmark fetch entirely (no network call).
+- `--export` writes the full report as JSON to
+  `exports/analytics/portfolio-analytics.json` (default) and prints the
+  export path, instead of printing the formatted report. The file is
+  overwritten on each run.
+- `--export-folder PATH` selects the export destination folder; default:
+  `exports/analytics`.
 
 ## Statement Extraction
 
@@ -129,14 +161,129 @@ python src/app.py ticker-map pending
 python src/app.py ticker-map resolve-pending
 python src/app.py ticker-map validate --source-symbol AAPL
 python src/app.py ticker-map import-csv mappings.csv
+python src/app.py ticker-map merge --old-symbol SPLG --new-symbol SPYM --currency USD --dry-run
 ```
 
 Available actions are `add`, `update`, `list`, `pending`, `resolve-pending`,
-`validate`, `retire`, and `import-csv`. `pending` lists unresolved email symbols.
-`resolve-pending` asks for the mapping interactively; scheduled pipelines never prompt.
-Saving a mapping activates matching pending rows without refetching email.
-All actions accept `--database PATH` and `--output {text,json}`.
+`validate`, `retire`, `import-csv`, and `merge`. `pending` lists every source symbol still
+blocking ingestion: symbols left `pending` on published email transactions, and
+symbols that quarantined an activity export entirely (`staged_records.resolution_status
+= 'unresolved'` on a `status = 'quarantined'` export file). Each row's `sources`
+column shows whether it came from `email`, `export`, or both.
+`resolve-pending` asks for the mapping interactively for every symbol `pending`
+reports; scheduled pipelines never prompt.
+Saving a mapping activates matching pending rows without refetching email, but
+does not by itself re-publish a quarantined export — see `resolve-tickers` below
+for the one-command version that also retries ingestion.
+All actions accept `--database PATH` and `--output {text,json}`. With `--output
+text` (the default), list-shaped results print as an aligned table and
+single-record results print as `key : value` lines — not a raw Python dict dump.
 Use action-level `--help` for mapping fields and effective-date options.
+
+### Merging a renamed ticker
+
+Use `merge` when a broker or data provider renames a symbol (e.g. `SPLG` became
+`SPYM`) and the pipeline already created a **second, separate** `tickers` row
+for the new symbol text, because ticker resolution is keyed purely on exact
+symbol match and has no notion of renames. `merge` consolidates the two
+identities into one:
+
+```powershell
+python src/app.py ticker-map merge --old-symbol SPLG --new-symbol SPYM --currency USD --dry-run
+python src/app.py ticker-map merge --old-symbol SPLG --new-symbol SPYM --currency USD --yes
+```
+
+- The **older** (lower/first-created) `ticker_id` always survives, permanently —
+  there is no heuristic or override flag. This keeps one stable anchor identity
+  across any number of future renames of the same security, rather than the
+  canonical id changing every time.
+- The surviving ticker's `ticker_symbol` is always updated to `--new-symbol`,
+  regardless of which side survived — so the visible symbol always ends up
+  correct, only the internal id is chosen by age.
+- Every referencing table (`transactions`, `email_transactions`, `activities`,
+  `staged_records`, `historical_records`, `ticker_provider_mappings`,
+  `stock_details`, `etf_details`, `portfolio_classifications`) is repointed onto
+  the survivor in one transaction; a coincidental duplicate row in
+  `transactions`/`email_transactions` aborts the whole merge rather than
+  silently dropping data. Overlapping `historical_records` dates keep the
+  survivor's own values.
+- The losing ticker's row is **renamed and retained** (e.g. `SPYM_MERGED_26`),
+  never deleted — `ticker_symbol_history` keeps its original rows pointing at
+  it, so the merge is always backtrackable, plus a new open-ended history row
+  records that the old symbol is now an alias of the survivor.
+- Without `--yes`, a real run only previews (full per-table report) and exits
+  nonzero; `--dry-run` does the same without requiring `--yes`. Nothing is
+  written until you pass `--yes`.
+- `--exchange` disambiguates if a symbol matches more than one exchange listing.
+  `--effective-to` (default: today), `--reason`, and `--created-by` match
+  `add`'s conventions.
+
+## Resolve Pending Tickers
+
+When a source is quarantined or published with pending tickers, the log names
+the blocking symbol(s) and points here:
+
+```powershell
+python src/app.py resolve-tickers
+```
+
+This is the one-shot recovery command: it lists every pending symbol (email and
+export), prompts for each mapping interactively (same prompts as `ticker-map
+resolve-pending`), and — if at least one mapping was saved — automatically
+re-runs `python src/app.py pipeline --source all` so any file quarantined only
+because of that symbol is retried and published in the same run. Example
+output:
+
+```
+MDA: mapped to MDA.TO (CAD) - 1 email row(s) updated
+XNDU: mapped to XNDU.TO (CAD) - 1 email row(s) updated
+
+Retrying ingestion for previously quarantined source(s)...
+export [Data/activities-export-2026-07-07.csv]: succeeded (569 row(s))
+```
+
+If nothing is pending, it prints `No pending ticker mappings.` and exits `0`
+without touching the pipeline. If every symbol is skipped interactively, it
+prints the skip summary and exits `0` without retrying ingestion. It exits
+nonzero if resolution or the retry fails.
+
+- `--data-folder PATH` selects the input folder scanned during retry; default:
+  repository `Data/`.
+- `--database PATH` selects the DuckDB database.
+
+## Portfolio Classification
+
+```powershell
+python src/app.py portfolio-classify
+python src/app.py portfolio-classify --output exports/portfolio-classification/latest.json --pretty
+python src/app.py classification-sync
+python src/app.py classification-sync --input exports/portfolio-classification/latest.json
+```
+
+`portfolio-classify` runs the read-only, deterministic classification workflow
+(read-only DuckDB connection, approved YAML rules, ephemeral allowlisted
+yfinance enrichment) and writes the result as JSON.
+
+- `--output PATH` selects the JSON destination inside
+  `exports/portfolio-classification/`; a default path is used if omitted.
+- `--pretty` indents and sorts the JSON output.
+
+`classification-sync` is a separate, explicitly-invoked step that persists the
+latest classification JSON into the `portfolio_classifications` table
+(delete-then-reinsert, one transaction) — running `portfolio-classify` alone
+never syncs to the database, keeping that workflow itself read-only. (A full
+`pipeline` run does both automatically as its final step — see "Pipeline"
+above — but the standalone `portfolio-classify`/`classification-sync`
+commands remain independent for ad hoc use, e.g. reviewing the JSON before
+deciding whether to persist it.)
+
+- `--input PATH` selects the JSON file to sync; defaults to
+  `exports/portfolio-classification/portfolio-classification.json`, the same
+  path `portfolio-classify` writes to when `--output` is omitted.
+- `--database PATH` selects the DuckDB database.
+
+See `docs/agents/portfolio-classifier/architecture.md` for the full workflow
+design and the `classify-portfolio` skill for the underlying scripts.
 
 ## Activity Import
 
