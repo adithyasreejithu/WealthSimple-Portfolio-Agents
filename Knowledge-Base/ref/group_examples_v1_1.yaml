@@ -1,0 +1,57 @@
+version: v1.1
+name: group_examples
+status: approved_reference
+purpose: >
+  Few-shot examples for validating the deterministic classification output.
+
+examples:
+  - ticker: XEQT
+    expected_primary_group: Core
+    expected_secondary_tags: [ETF, Global, Broad Market, CAD]
+    explanation: >
+      XEQT is broad global equity exposure and functions as a foundation
+      holding, so it belongs in Core.
+
+  - ticker: VFV
+    expected_primary_group: Core
+    expected_secondary_tags: [ETF, United States, Broad Market, CAD]
+    explanation: >
+      VFV is broad S&P 500 exposure, so it belongs in Core.
+
+  - ticker: INDA
+    expected_primary_group: Growth
+    expected_secondary_tags: [ETF, India, Emerging Markets, Thematic Growth, Satellite, Bought On Whim]
+    explanation: >
+      INDA is a thematic India position and should be treated as Growth rather
+      than Core.
+
+  - ticker: AAPL
+    expected_primary_group: Quality
+    expected_secondary_tags: [Equity, Technology, Quality, USD]
+    explanation: >
+      AAPL is a mature, profitable compounder, so the portfolio role is Quality.
+
+  - ticker: NVDA
+    expected_primary_group: Growth
+    expected_secondary_tags: [Equity, Technology, Semiconductors, AI, High Volatility, USD]
+    explanation: >
+      NVDA is AI/semiconductor growth exposure with higher volatility.
+
+  - ticker: RY
+    expected_primary_group: Quality
+    expected_secondary_tags: [Equity, Financials, Canadian Bank, Dividend, CAD]
+    explanation: >
+      RY is a blue-chip Canadian bank and should default to Quality, not Income.
+
+  - ticker: BN
+    expected_primary_group: Quality
+    expected_secondary_tags: [Equity, Asset Management, Quality, CAD]
+    explanation: >
+      BN is Quality but should still be flagged for review because the final role
+      remains under consideration.
+
+  - ticker: ZGLD
+    expected_primary_group: Alternatives
+    expected_secondary_tags: [ETF, Gold, Hedge, CAD]
+    explanation: >
+      ZGLD is gold exposure and belongs in Alternatives.

@@ -1,0 +1,280 @@
+version: v1.0
+name: portfolio_classification_rules
+status: draft_for_review
+purpose: >
+  Rule-based decision logic for classifying portfolio holdings into approved
+  portfolio groups. This is not an ML classification model.
+
+approved_groups:
+  - Core
+  - Income
+  - Quality
+  - Growth
+  - Alternatives
+  - Cash
+  - Needs Review
+
+rule_priority:
+  - manual_overrides
+  - asset_class_and_etf_type_rules
+  - portfolio_role_rules
+  - ticker_or_security_metadata_rules
+  - sector_industry_bias_rules
+  - fallback_needs_review
+
+core_principles:
+  - Classification is based on portfolio role first, sector second.
+  - Do not invent new primary groups automatically.
+  - Use secondary tags for sector, theme, geography, currency, and risk notes.
+  - If multiple groups are plausible, choose the group that best reflects why the user owns the position.
+  - If required evidence is missing, lower confidence or assign Needs Review.
+  - Runtime portfolio values and holdings come from DuckDB through portfolio tools.
+  - YAML files define policy and rules only; they are not the holdings source of truth.
+
+decision_rules:
+  manual_overrides:
+    description: >
+      If ticker exists in manual_overrides_v1.yaml and the override is active,
+      use the assigned primary_group unless the user explicitly changes it.
+    output_confidence: high
+
+  asset_class_and_etf_type_rules:
+    rules:
+      - id: broad_market_etf_to_core
+        when:
+          asset_class: ETF
+          etf_category_any:
+            - global_equity
+            - total_market
+            - broad_us_equity
+            - broad_international_equity
+        assign_primary_group: Core
+        confidence: high
+
+      - id: dividend_etf_to_income
+        when:
+          asset_class: ETF
+          etf_category_any:
+            - dividend_growth
+            - high_dividend
+            - canadian_dividend
+            - covered_banking_income
+        assign_primary_group: Income
+        confidence: high
+
+      - id: sector_growth_etf_to_growth
+        when:
+          asset_class: ETF
+          etf_category_any:
+            - semiconductor
+            - artificial_intelligence
+            - technology_growth
+        assign_primary_group: Growth
+        confidence: medium_high
+
+      - id: gold_or_hedge_to_alternatives
+        when:
+          asset_class_any:
+            - commodity_etf
+            - gold_etf
+            - alternative_asset
+        assign_primary_group: Alternatives
+        confidence: high
+
+  portfolio_role_rules:
+    rules:
+      - id: user_thesis_core
+        when:
+          user_thesis_contains_any:
+            - core
+            - foundation
+            - long-term base
+            - broad exposure
+            - index exposure
+        assign_primary_group: Core
+        confidence: high
+
+      - id: user_thesis_income
+        when:
+          user_thesis_contains_any:
+            - dividend
+            - income
+            - yield
+            - cash flow
+            - stability
+        assign_primary_group: Income
+        confidence: high
+
+      - id: user_thesis_quality
+        when:
+          user_thesis_contains_any:
+            - quality
+            - compounder
+            - moat
+            - strong business
+            - balance sheet
+            - long-term individual stock
+        assign_primary_group: Quality
+        confidence: high
+
+      - id: user_thesis_growth
+        when:
+          user_thesis_contains_any:
+            - growth
+            - AI
+            - semiconductor
+            - high upside
+            - satellite
+            - disruptive
+            - emerging theme
+        assign_primary_group: Growth
+        confidence: high
+
+      - id: user_thesis_alternative
+        when:
+          user_thesis_contains_any:
+            - hedge
+            - gold
+            - low correlation
+            - defensive hedge
+            - alternative
+        assign_primary_group: Alternatives
+        confidence: high
+
+  ticker_or_security_metadata_rules:
+    rules:
+      - id: single_company_income_stock
+        when:
+          asset_class: equity
+          dividend_profile_any:
+            - high_yield
+            - dividend_growth
+            - stable_dividend
+          business_maturity_any:
+            - mature
+            - regulated
+            - stable_cash_flow
+        assign_primary_group: Income
+        confidence: medium
+
+      - id: single_company_quality_stock
+        when:
+          asset_class: equity
+          quality_profile_any:
+            - wide_moat
+            - strong_profitability
+            - strong_balance_sheet
+            - durable_compounder
+        assign_primary_group: Quality
+        confidence: medium
+
+      - id: high_growth_stock
+        when:
+          asset_class: equity
+          growth_profile_any:
+            - high_revenue_growth
+            - emerging_theme
+            - high_volatility
+            - unprofitable_or_early_stage
+        assign_primary_group: Growth
+        confidence: medium
+
+  sector_industry_bias_rules:
+    rules:
+      - id: technology_bias_quality_or_growth
+        sector: Technology
+        default_group_bias:
+          - Growth
+          - Quality
+        note: >
+          Use Growth for high-upside theme exposure; use Quality for mature profitable compounders.
+
+      - id: communication_services_bias_quality_growth_income
+        sector: Communication Services
+        default_group_bias:
+          - Quality
+          - Growth
+          - Income
+
+      - id: consumer_cyclical_bias_growth_quality
+        sector: Consumer Cyclical
+        default_group_bias:
+          - Growth
+          - Quality
+
+      - id: consumer_defensive_bias_income_quality
+        sector: Consumer Defensive
+        default_group_bias:
+          - Income
+          - Quality
+
+      - id: financial_services_bias_income_quality
+        sector: Financial Services
+        default_group_bias:
+          - Income
+          - Quality
+
+      - id: industrials_bias_quality_income_growth
+        sector: Industrials
+        default_group_bias:
+          - Quality
+          - Income
+          - Growth
+
+      - id: energy_bias_income_cyclical
+        sector: Energy
+        default_group_bias:
+          - Income
+          - Growth
+        note: Use Income for pipelines/infrastructure; Growth only when thesis is commodity or growth-driven.
+
+      - id: healthcare_bias_quality_growth
+        sector: Healthcare
+        default_group_bias:
+          - Quality
+          - Growth
+
+      - id: utilities_bias_income_defensive
+        sector: Utilities
+        default_group_bias:
+          - Income
+
+      - id: real_estate_bias_income
+        sector: Real Estate
+        default_group_bias:
+          - Income
+
+fallback:
+  group: Needs Review
+  confidence: low
+  reasons:
+    - missing_required_metadata
+    - no_user_thesis
+    - conflicting_rules
+    - unknown_asset_type
+
+confidence_rules:
+  high:
+    conditions:
+      - manual_override_exists
+      - or_user_thesis_and_metadata_agree
+      - or_clear_etf_category_match
+  medium:
+    conditions:
+      - metadata_supports_group_but_no_user_thesis
+      - or_sector_bias_supports_group_with_partial_data
+  low:
+    conditions:
+      - missing_key_fields
+      - conflicting_group_signals
+      - unknown_security_type
+
+output_schema:
+  ticker: string
+  primary_group: string
+  secondary_tags: list
+  confidence: high_medium_or_low
+  reason: string
+  evidence_used: list
+  missing_fields: list
+  review_needed: boolean

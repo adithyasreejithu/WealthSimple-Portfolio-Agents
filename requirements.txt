@@ -10,3 +10,4 @@ PyYAML
 yfinance
 curl_cffi
 duckdb
+markitdown[pdf,docx,pptx,xlsx]

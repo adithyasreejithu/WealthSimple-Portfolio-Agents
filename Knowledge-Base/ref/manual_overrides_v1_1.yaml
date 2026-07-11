@@ -1,0 +1,232 @@
+version: v1.1
+name: manual_group_overrides
+status: approved_reference
+purpose: >
+  User-approved ticker-level group assignments. These overrides have the
+  highest priority in the classifier.
+
+override_policy:
+  priority: highest
+  active_by_default: true
+  notes:
+    - Manual overrides represent the user's intended portfolio role.
+    - Do not change an override automatically based only on sector metadata.
+    - If a ticker's role changes, update this file explicitly.
+
+overrides:
+  - ticker: XEQT
+    primary_group: Core
+    secondary_tags: [ETF, Global, Broad Market, CAD]
+    rationale: Broad global equity ETF used as core market exposure.
+    active: true
+    review_needed: false
+
+  - ticker: VFV
+    primary_group: Core
+    secondary_tags: [ETF, United States, Broad Market, CAD]
+    rationale: Broad S&P 500 ETF exposure; core long-term market allocation.
+    active: true
+    review_needed: false
+
+  - ticker: SPLG
+    primary_group: Core
+    secondary_tags: [ETF, United States, Broad Market, USD]
+    rationale: Broad low-cost S&P 500 ETF exposure; core market allocation.
+    active: true
+    review_needed: false
+
+  - ticker: INDA
+    primary_group: Growth
+    secondary_tags: [ETF, India, Emerging Markets, Thematic Growth, Satellite, Bought On Whim]
+    rationale: Thematic India exposure bought on a whim; should be treated as Growth, not Core.
+    active: true
+    review_needed: false
+
+  - ticker: DGRO
+    primary_group: Income
+    secondary_tags: [ETF, Dividend Growth, USD]
+    rationale: Dividend growth ETF used for income and stability.
+    active: true
+    review_needed: false
+
+  - ticker: SCHD
+    primary_group: Income
+    secondary_tags: [ETF, Dividend, USD]
+    rationale: Dividend ETF used for income and stability.
+    active: true
+    review_needed: false
+
+  - ticker: VDY
+    primary_group: Income
+    secondary_tags: [ETF, Canadian Dividend, CAD]
+    rationale: Canadian dividend ETF used for income and Canadian stability.
+    active: true
+    review_needed: false
+
+  - ticker: ZEB
+    primary_group: Income
+    secondary_tags: [ETF, Canadian Banks, CAD]
+    rationale: Canadian bank ETF; income/stability role, not growth.
+    active: true
+    review_needed: false
+
+  - ticker: ENB
+    primary_group: Income
+    secondary_tags: [Equity, Energy, Pipeline, Dividend, CAD]
+    rationale: Pipeline/infrastructure stock primarily suited to income and stability.
+    active: true
+    review_needed: false
+
+  - ticker: RY
+    primary_group: Quality
+    secondary_tags: [Equity, Financials, Canadian Bank, Dividend, CAD]
+    rationale: Canadian blue-chip bank; Quality rather than Income unless the thesis changes.
+    active: true
+    review_needed: false
+
+  - ticker: TD
+    primary_group: Quality
+    secondary_tags: [Equity, Financials, Canadian Bank, Dividend, CAD]
+    rationale: Canadian blue-chip bank; Quality rather than Income unless the thesis changes.
+    active: true
+    review_needed: false
+
+  - ticker: L
+    primary_group: Quality
+    secondary_tags: [Equity, Consumer Defensive, Quality, CAD]
+    rationale: Long-term defensive compounder; Quality rather than Income.
+    active: true
+    review_needed: false
+
+  - ticker: T
+    primary_group: Quality
+    secondary_tags: [Equity, Communication Services, Telecom, Quality, CAD]
+    rationale: Defensive telecom blue chip; Quality rather than Income.
+    active: true
+    review_needed: false
+
+  - ticker: WN
+    primary_group: Quality
+    secondary_tags: [Equity, Consumer Defensive, Quality, CAD]
+    rationale: Durable defensive holding; Quality rather than Income.
+    active: true
+    review_needed: false
+
+  - ticker: AAPL
+    primary_group: Quality
+    secondary_tags: [Equity, Technology, Quality, USD]
+    rationale: Mature profitable technology compounder; Quality rather than Growth.
+    active: true
+    review_needed: false
+
+  - ticker: MSFT
+    primary_group: Quality
+    secondary_tags: [Equity, Technology, Cloud, AI, Quality, USD]
+    rationale: High-quality software/cloud compounder with AI exposure.
+    active: true
+    review_needed: false
+
+  - ticker: GOOGL
+    primary_group: Quality
+    secondary_tags: [Equity, Communication Services, AI, Quality, USD]
+    rationale: Large profitable platform compounder; Quality with AI tag.
+    active: true
+    review_needed: false
+
+  - ticker: META
+    primary_group: Quality
+    secondary_tags: [Equity, Communication Services, Quality, USD]
+    rationale: Large profitable platform company; Quality role.
+    active: true
+    review_needed: false
+
+  - ticker: BRK
+    primary_group: Quality
+    secondary_tags: [Equity, Financials, Conglomerate, Quality, USD]
+    rationale: Durable compounder, not an unclassified holding.
+    active: true
+    review_needed: false
+
+  - ticker: BN
+    primary_group: Quality
+    secondary_tags: [Equity, Asset Management, Quality, CAD]
+    rationale: Default to Quality, but mark for review because the final role is still under consideration.
+    active: true
+    review_needed: true
+
+  - ticker: RTX
+    primary_group: Quality
+    secondary_tags: [Equity, Industrials, Defense, Quality, USD]
+    rationale: Defense/industrial quality holding.
+    active: true
+    review_needed: false
+
+  - ticker: NOC
+    primary_group: Quality
+    secondary_tags: [Equity, Industrials, Defense, Quality, USD]
+    rationale: Defense/industrial quality holding.
+    active: true
+    review_needed: false
+
+  - ticker: NVDA
+    primary_group: Growth
+    secondary_tags: [Equity, Technology, Semiconductors, AI, High Volatility, USD]
+    rationale: AI/semiconductor high-growth satellite exposure.
+    active: true
+    review_needed: false
+
+  - ticker: PLTR
+    primary_group: Growth
+    secondary_tags: [Equity, Software, AI, High Volatility, USD]
+    rationale: Higher-growth AI/software satellite holding.
+    active: true
+    review_needed: false
+
+  - ticker: SMH
+    primary_group: Growth
+    secondary_tags: [ETF, Semiconductors, AI, High Volatility, USD]
+    rationale: Semiconductor sector ETF; growth satellite exposure, not core.
+    active: true
+    review_needed: false
+
+  - ticker: DRAM
+    primary_group: Growth
+    secondary_tags: [ETF, Semiconductors, High Volatility]
+    rationale: Semiconductor/memory theme exposure; growth satellite.
+    active: true
+    review_needed: false
+
+  - ticker: AXTI
+    primary_group: Growth
+    secondary_tags: [Equity, Semiconductors, Speculative, High Volatility, USD]
+    rationale: Higher-risk semiconductor satellite holding.
+    active: true
+    review_needed: false
+
+  - ticker: HIMS
+    primary_group: Growth
+    secondary_tags: [Equity, Healthcare, High Growth, High Volatility, USD]
+    rationale: Growth-oriented health-tech holding.
+    active: true
+    review_needed: false
+
+  - ticker: NBIS
+    primary_group: Growth
+    secondary_tags: [Equity, AI, High Growth, Speculative, High Volatility]
+    rationale: Higher-growth speculative satellite holding.
+    active: true
+    review_needed: false
+
+  - ticker: ZGLD
+    primary_group: Alternatives
+    secondary_tags: [ETF, Gold, Hedge, CAD]
+    rationale: Gold/hedge allocation; alternatives bucket.
+    active: true
+    review_needed: false
+
+  - ticker: GLD
+    primary_group: Alternatives
+    secondary_tags: [ETF, Gold, Hedge, USD]
+    rationale: Gold/hedge allocation; alternatives bucket.
+    active: true
+    review_needed: false

@@ -1,0 +1,52 @@
+version: v1.0
+name: decision_framework
+status: approved_reference
+purpose: >
+  Controlled vocabulary for portfolio decisions recorded on stock pages and in
+  the decision log. Complements the classification taxonomy in ref/ (which
+  owns groups, rules, and sector maps) — this file only defines decision
+  enums, which have no equivalent there.
+
+actions:
+  - Buy        # open a new position
+  - Sell       # exit the position entirely
+  - Hold       # keep the position unchanged
+  - Trim       # reduce the position size
+  - Add        # increase the position size
+  - Watchlist  # not held; keep researching
+  - Avoid      # researched and rejected
+
+confidence_levels:
+  - Low
+  - Medium
+  - High
+
+time_horizons:
+  - Short-term    # under 1 year
+  - Medium-term   # 1-3 years
+  - Long-term     # 3+ years
+
+thesis_verdicts:
+  - new        # first thesis for this ticker
+  - stronger   # new information supports the thesis
+  - weaker     # new information undermines parts of the thesis
+  - unchanged  # nothing material changed
+  - broken     # a core assumption failed; decision must be revisited
+
+stock_page_statuses:
+  - research   # page exists, research in progress, no decision yet
+  - watchlist  # candidate under consideration
+  - active     # currently held
+  - closed     # position exited; page preserved for the record
+  - rejected   # researched and passed on
+
+usage:
+  stock_page_status_block: >
+    The Status section of every stocks/TICKER.md page must draw its Decision,
+    Confidence, and Time Horizon values from the enums above.
+  decision_log: >
+    logs/decision-log.md rows use (Action, Verdict) from the enums above;
+    rows are append-only.
+  portfolio_roles: >
+    Portfolio Role values come from primary_groups in ref/policy_v1_1.yaml,
+    not from this file.

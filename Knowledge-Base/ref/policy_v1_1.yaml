@@ -1,0 +1,176 @@
+version: v1.1
+name: portfolio_grouping_policy
+status: approved_reference
+purpose: >
+  Defines the approved portfolio groups, their portfolio role, and the
+  portfolio-role-first classification principle used by the deterministic
+  portfolio classifier.
+
+portfolio_model:
+  name: Hybrid Core + Satellite
+  philosophy: >
+    The portfolio is organized by role first and sector second. Broad market
+    exposure forms the foundation, quality compounders come next, income-first
+    holdings are reserved for explicit yield roles, and higher-volatility growth
+    holdings remain satellite positions.
+  classification_principle: portfolio_role_first_sector_second
+  avoid:
+    - classifying_by_sector_only
+    - creating_unapproved_subgroups
+    - treating_every_dividend_payer_as_income
+    - hiding_manual_review_flags
+
+primary_groups:
+  - Core
+  - Income
+  - Quality
+  - Growth
+  - Alternatives
+  - Cash
+  - Needs Review
+
+allocation_targets:
+  Core:
+    target_percent: 60
+    min_percent: 55
+    max_percent: 70
+  Income:
+    target_percent: 15
+    min_percent: 10
+    max_percent: 20
+  Quality:
+    target_percent: 15
+    min_percent: 10
+    max_percent: 20
+  Growth:
+    target_percent: 10
+    min_percent: 5
+    max_percent: 15
+  Alternatives:
+    target_percent: 5
+    min_percent: 0
+    max_percent: 5
+  Cash:
+    target_percent: null
+    min_percent: 0
+    max_percent: null
+    note: Flexible operational bucket, not a strategic target group unless the user defines one.
+
+constraints:
+  single_name_max_percent: 10
+
+groups:
+  Core:
+    role: Long-term foundation holdings.
+    description: >
+      Broad-market ETFs and major index exposure used as the low-maintenance
+      base of the portfolio.
+    expected_traits:
+      - broad_market_exposure
+      - diversified_equity_exposure
+      - low_maintenance
+      - long_term_foundation
+    examples:
+      - XEQT
+      - VFV
+      - SPLG
+
+  Income:
+    role: Income-first holdings.
+    description: >
+      Holdings primarily owned to generate cash flow or harvest yield. High
+      yield or explicit income intent is required; a dividend by itself is not
+      enough.
+    expected_traits:
+      - income_first_thesis
+      - high_yield_focus
+      - cash_flow_generation
+      - explicit_dividend_role
+    examples:
+      - DGRO
+      - SCHD
+      - VDY
+      - ZEB
+      - ENB
+
+  Quality:
+    role: Durable long-term compounders.
+    description: >
+      Blue-chip businesses with durable franchises, strong balance sheets, and
+      long-term compounding potential. These can pay dividends, but dividends
+      are not the main reason for owning them.
+    expected_traits:
+      - durable_business
+      - strong_competitive_position
+      - long_term_compounder
+      - blue_chip
+    examples:
+      - AAPL
+      - MSFT
+      - GOOGL
+      - META
+      - BRK
+      - BN
+      - RY
+      - TD
+      - L
+      - T
+      - WN
+      - RTX
+      - NOC
+
+  Growth:
+    role: Higher-upside satellite holdings.
+    description: >
+      Higher-volatility or thematic holdings with greater upside potential.
+      This includes AI, semiconductor, speculative, and thematic growth ideas.
+    expected_traits:
+      - higher_volatility
+      - thematic_or_emerging_growth
+      - satellite_position
+      - upside_oriented_thesis
+    examples:
+      - NVDA
+      - PLTR
+      - SMH
+      - DRAM
+      - AXTI
+      - HIMS
+      - NBIS
+      - INDA
+
+  Alternatives:
+    role: Non-equity diversifiers.
+    description: >
+      Gold, commodity, or other diversifying exposures that are not primarily
+      part of the equity engine.
+    expected_traits:
+      - low_correlation_diversifier
+      - hedge
+      - commodity_or_gold_exposure
+    examples:
+      - ZGLD
+      - GLD
+
+  Cash:
+    role: Flexible liquidity bucket.
+    description: >
+      Uninvested cash or settlement balances. This is optional and should not be
+      forced into a strategic allocation unless explicitly configured.
+    expected_traits:
+      - uninvested_cash
+      - settlement_balance
+      - optional_bucket
+    examples: []
+
+  Needs Review:
+    role: Unclear or conflicting cases.
+    description: >
+      Use when required metadata is missing, the thesis is unclear, or the
+      classifier sees conflicting signals.
+    expected_traits:
+      - missing_metadata
+      - unclear_thesis
+      - conflicting_signals
+      - manual_review_flag
+    examples: []

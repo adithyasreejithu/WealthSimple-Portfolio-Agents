@@ -1,0 +1,78 @@
+version: v1.1
+name: required_fields_for_classification
+status: approved_reference
+purpose: >
+  Defines the minimum and optional fields needed by the portfolio classifier.
+
+required_inputs:
+  minimum_for_basic_classification:
+    - ticker
+    - company_name
+    - asset_class
+    - currency
+    - sector_or_etf_category
+
+  recommended_for_good_classification:
+    - ticker
+    - company_name
+    - asset_class
+    - currency
+    - exchange
+    - sector
+    - industry
+    - etf_category
+    - dividend_yield
+    - market_cap
+    - user_thesis
+    - current_weight_percent
+    - position_market_value
+
+  portfolio_context_fields:
+    - current_weight_percent
+    - target_weight_percent
+    - unrealized_gain_loss_percent
+    - first_purchase_date
+    - latest_purchase_date
+    - number_of_buys
+    - number_of_sells
+    - dividends_received
+    - account_type
+
+  review_fields:
+    - review_needed
+    - manual_review_flag
+    - review_reason
+    - notes
+
+missing_data_behavior:
+  if_manual_override_exists:
+    action: classify_using_override
+    confidence_floor: medium
+
+  if_no_manual_override_and_missing_asset_class:
+    action: Needs Review
+    confidence: low
+
+  if_no_manual_override_and_missing_sector_or_etf_category:
+    action: Needs Review
+    confidence: low
+
+  if_metadata_exists_but_no_user_thesis:
+    action: classify_by_rules
+    confidence_cap: medium
+
+  if_rules_conflict:
+    action: Needs Review
+    confidence: low
+    required_review_note: Explain which groups conflicted and which metadata is missing.
+
+classification_output_fields:
+  - ticker
+  - company_name
+  - primary_group
+  - secondary_tags
+  - confidence
+  - reasoning
+  - evidence_used
+  - missing_data
+  - review_needed

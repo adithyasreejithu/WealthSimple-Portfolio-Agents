@@ -5,10 +5,13 @@
 !.gitignore
 !CLAUDE.md
 !instructions.md
+!todo.md
 !src/
 !src/**
 !docs/
 !docs/**
+!Knowledge-Base/
+!Knowledge-Base/**
 !requirements.txt
 !tests/
 !tests/**

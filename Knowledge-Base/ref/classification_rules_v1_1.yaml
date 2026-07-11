@@ -1,0 +1,233 @@
+version: v1.1
+name: portfolio_classification_rules
+status: approved_reference
+purpose: >
+  Rule priority and decision logic for the deterministic portfolio classifier.
+
+approved_groups:
+  - Core
+  - Income
+  - Quality
+  - Growth
+  - Alternatives
+  - Cash
+  - Needs Review
+
+rule_priority:
+  - manual_overrides
+  - asset_class_and_etf_type_rules
+  - portfolio_role_rules
+  - ticker_or_security_metadata_rules
+  - sector_industry_bias_rules
+  - fallback_needs_review
+
+core_principles:
+  - Portfolio role comes first. Sector comes second.
+  - Income is reserved for income-first or high-yield holdings.
+  - Blue-chip long-term holdings generally belong in Quality, not Income.
+  - Use secondary tags for themes, geography, risk, and review notes.
+  - When signals conflict or required fields are missing, surface Needs Review.
+  - The classifier must remain deterministic without an LLM.
+
+decision_rules:
+  manual_overrides:
+    description: >
+      If a ticker appears in manual_overrides_v1_1.yaml and the override is
+      active, use that primary_group and tags first.
+
+  asset_class_and_etf_type_rules:
+    rules:
+      - id: broad_market_etf_to_core
+        when:
+          asset_class: ETF
+          etf_category_any:
+            - global_equity
+            - total_market
+            - broad_us_equity
+            - broad_international_equity
+        assign_primary_group: Core
+        confidence: high
+
+      - id: income_etf_to_income
+        when:
+          asset_class: ETF
+          etf_category_any:
+            - dividend_growth
+            - high_dividend
+            - canadian_dividend
+            - covered_banking_income
+        assign_primary_group: Income
+        confidence: high
+
+      - id: growth_or_thematic_etf_to_growth
+        when:
+          asset_class: ETF
+          etf_category_any:
+            - semiconductor
+            - artificial_intelligence
+            - thematic_growth
+            - country_specific_emerging_markets
+        assign_primary_group: Growth
+        confidence: high
+
+      - id: gold_or_commodity_to_alternatives
+        when:
+          asset_class_any:
+            - commodity_etf
+            - gold_etf
+            - alternative_asset
+        assign_primary_group: Alternatives
+        confidence: high
+
+  portfolio_role_rules:
+    rules:
+      - id: role_core
+        when:
+          user_thesis_contains_any:
+            - core
+            - foundation
+            - base
+            - broad market
+            - index
+        assign_primary_group: Core
+        confidence: high
+
+      - id: role_income
+        when:
+          user_thesis_contains_any:
+            - income
+            - yield
+            - cash flow
+            - dividend income
+            - high yield
+        assign_primary_group: Income
+        confidence: high
+
+      - id: role_quality
+        when:
+          user_thesis_contains_any:
+            - quality
+            - compounder
+            - blue chip
+            - durable
+            - moat
+            - long term hold
+        assign_primary_group: Quality
+        confidence: high
+
+      - id: role_growth
+        when:
+          user_thesis_contains_any:
+            - growth
+            - ai
+            - semiconductor
+            - thematic
+            - satellite
+            - speculative
+        assign_primary_group: Growth
+        confidence: high
+
+      - id: role_alternatives
+        when:
+          user_thesis_contains_any:
+            - gold
+            - hedge
+            - alternative
+            - low correlation
+        assign_primary_group: Alternatives
+        confidence: high
+
+  ticker_or_security_metadata_rules:
+    rules:
+      - id: quality_blue_chip_equity
+        when:
+          asset_class: equity
+          sector_any:
+            - Communication Services
+            - Consumer Defensive
+            - Financial Services
+            - Healthcare
+            - Industrials
+            - Technology
+        assign_primary_group: Quality
+        confidence: medium
+
+      - id: growth_equity
+        when:
+          asset_class: equity
+          sector_any:
+            - Technology
+            - Healthcare
+        assign_primary_group: Growth
+        confidence: medium
+
+  sector_industry_bias_rules:
+    rules:
+      - id: technology_bias
+        sector: Technology
+        default_group_bias:
+          - Growth
+          - Quality
+
+      - id: communication_services_bias
+        sector: Communication Services
+        default_group_bias:
+          - Quality
+          - Growth
+          - Income
+
+      - id: consumer_defensive_bias
+        sector: Consumer Defensive
+        default_group_bias:
+          - Quality
+          - Income
+
+      - id: financial_services_bias
+        sector: Financial Services
+        default_group_bias:
+          - Quality
+          - Income
+
+      - id: industrials_bias
+        sector: Industrials
+        default_group_bias:
+          - Quality
+          - Income
+          - Growth
+
+      - id: healthcare_bias
+        sector: Healthcare
+        default_group_bias:
+          - Quality
+          - Growth
+
+      - id: utilities_bias
+        sector: Utilities
+        default_group_bias:
+          - Income
+          - Quality
+
+      - id: real_estate_bias
+        sector: Real Estate
+        default_group_bias:
+          - Income
+
+fallback:
+  group: Needs Review
+  confidence: low
+  reasons:
+    - missing_required_metadata
+    - conflicting_rules
+    - unknown_asset_type
+    - manual_review_flag
+
+output_schema:
+  ticker: string
+  company_name: string
+  primary_group: string
+  secondary_tags: list
+  confidence: high_medium_or_low
+  reasoning: string
+  evidence_used: list
+  missing_data: list
+  review_needed: boolean

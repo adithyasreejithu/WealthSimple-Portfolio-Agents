@@ -21,6 +21,20 @@ Claude Code agents live in `.claude/agents/*.md` and skills live in `.claude/ski
 - Document each agent's purpose, runtime settings, skill dependencies, workflow, and guardrails under `docs/agents/<agent>/`, and keep it aligned with the actual agent config and skills.
 - See `docs/architecture/claude_agent_skill_structure.md` for the full recommended layout.
 
+### Research Knowledge Base
+
+`Knowledge-Base/` holds two zones: `ref/*.yaml` (the approved classifier
+reference, unchanged by this section) and the research wiki (everything
+else — portfolio, stocks, theses, earnings, dividends, market-research,
+sources, taxonomy, templates, logs). Every wiki page carries YAML front
+matter per `Knowledge-Base/templates/front-matter-spec.md` — pages without
+it are invisible to `kb-search`. Generated pages (`portfolio/holdings.md`,
+`portfolio/portfolio-overview.md`, and every `index.md` except the
+hand-curated `theses/index.md`, `logs/index.md`, `taxonomy/index.md`) are
+rebuilt by their owning skill, never hand-edited. KB agents (`kb-discovery`,
+`kb-intake`) never edit `Knowledge-Base/ref/*.yaml` or `CHANGELOG.md`. See
+`docs/architecture/knowledge_base.md` for the full layout.
+
 ## Build, Test, and Development Commands
 
 Use a Python virtual environment and install dependencies from `requirements.txt`.
@@ -48,6 +62,16 @@ changed output format), update `docs/reference/cli.md` in the same change,
 not as a follow-up — a command missing from this file is a bug. Related
 architecture docs (`docs/architecture/*.md`, `docs/agents/<agent>/*.md`) should
 also be updated when the change affects the behavior they describe.
+
+## Planning & Approved Plans
+
+All implementation plans approved during the planning process must be stored in
+`docs/plans/` with a descriptive filename (e.g., `docs/plans/position-engine.md`,
+`docs/plans/holdings-reconciliation.md`). This keeps the rationale, design
+decisions, and scope of major features retrievable for future reference and
+architecture reviews. Plans are reference material and should not be updated
+after implementation completes — they capture the approved approach at the time
+of execution.
 
 ## Commit & Pull Request Guidelines
 

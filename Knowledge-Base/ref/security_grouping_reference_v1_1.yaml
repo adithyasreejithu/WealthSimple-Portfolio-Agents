@@ -1,0 +1,223 @@
+version: v1.1
+name: security_grouping_reference
+status: approved_reference
+purpose: >
+  Reference taxonomy for sectors, industries, ETF categories, asset classes,
+  and tags used by the deterministic classifier.
+
+asset_classes:
+  equity:
+    description: Individual company stock.
+    eligible_primary_groups:
+      - Income
+      - Quality
+      - Growth
+      - Needs Review
+  ETF:
+    description: Exchange traded fund.
+    eligible_primary_groups:
+      - Core
+      - Income
+      - Growth
+      - Alternatives
+      - Needs Review
+  commodity_etf:
+    description: Commodity or gold-linked ETF.
+    eligible_primary_groups:
+      - Alternatives
+  cash:
+    description: Uninvested cash or settlement balance.
+    eligible_primary_groups:
+      - Cash
+
+etf_categories:
+  global_equity:
+    primary_group_bias: Core
+    examples:
+      - XEQT
+  total_market:
+    primary_group_bias: Core
+    examples: []
+  broad_us_equity:
+    primary_group_bias: Core
+    examples:
+      - VFV
+      - SPLG
+  broad_international_equity:
+    primary_group_bias: Core
+    examples: []
+  dividend_growth:
+    primary_group_bias: Income
+    examples:
+      - DGRO
+      - SCHD
+  high_dividend:
+    primary_group_bias: Income
+    examples: []
+  canadian_dividend:
+    primary_group_bias: Income
+    examples:
+      - VDY
+      - ZEB
+  covered_banking_income:
+    primary_group_bias: Income
+    examples: []
+  semiconductor:
+    primary_group_bias: Growth
+    examples:
+      - SMH
+      - DRAM
+  artificial_intelligence:
+    primary_group_bias: Growth
+    examples:
+      - NBIS
+  thematic_growth:
+    primary_group_bias: Growth
+    examples:
+      - INDA
+  country_specific_emerging_markets:
+    primary_group_bias: Growth
+    examples:
+      - INDA
+  gold:
+    primary_group_bias: Alternatives
+    examples:
+      - ZGLD
+      - GLD
+
+sectors:
+  Technology:
+    common_industries:
+      - Software
+      - Semiconductors
+      - Consumer Electronics
+      - Information Technology Services
+    default_group_bias:
+      - Growth
+      - Quality
+
+  Communication Services:
+    common_industries:
+      - Internet Content & Information
+      - Telecom Services
+      - Entertainment
+    default_group_bias:
+      - Quality
+      - Growth
+      - Income
+
+  Consumer Cyclical:
+    common_industries:
+      - Internet Retail
+      - Auto Manufacturers
+      - Restaurants
+      - Travel Services
+    default_group_bias:
+      - Growth
+      - Quality
+
+  Consumer Defensive:
+    common_industries:
+      - Grocery Stores
+      - Discount Stores
+      - Household & Personal Products
+      - Packaged Foods
+    default_group_bias:
+      - Quality
+      - Income
+
+  Financial Services:
+    common_industries:
+      - Banks
+      - Asset Management
+      - Insurance
+      - Credit Services
+    default_group_bias:
+      - Quality
+      - Income
+
+  Industrials:
+    common_industries:
+      - Aerospace & Defense
+      - Specialty Industrial Machinery
+      - Railroads
+      - Engineering & Construction
+    default_group_bias:
+      - Quality
+      - Income
+      - Growth
+
+  Energy:
+    common_industries:
+      - Oil & Gas Midstream
+      - Oil & Gas Integrated
+      - Oil & Gas Exploration & Production
+    default_group_bias:
+      - Income
+      - Growth
+
+  Healthcare:
+    common_industries:
+      - Biotechnology
+      - Medical Care Facilities
+      - Health Information Services
+      - Drug Manufacturers
+    default_group_bias:
+      - Quality
+      - Growth
+
+  Utilities:
+    common_industries:
+      - Regulated Electric
+      - Renewable Utilities
+      - Diversified Utilities
+    default_group_bias:
+      - Income
+      - Quality
+
+  Real Estate:
+    common_industries:
+      - REITs
+      - Real Estate Services
+    default_group_bias:
+      - Income
+
+  Basic Materials:
+    common_industries:
+      - Gold
+      - Copper
+      - Specialty Chemicals
+    default_group_bias:
+      - Alternatives
+      - Growth
+
+tags:
+  geography:
+    - Canada
+    - United States
+    - Global
+    - International
+    - Emerging Markets
+    - India
+  currency:
+    - CAD
+    - USD
+  themes:
+    - AI
+    - Semiconductors
+    - Cloud
+    - Defense
+    - Dividend
+    - Canadian Stability
+    - Gold Hedge
+    - Broad Market
+    - Thematic Growth
+    - Satellite
+    - Bought On Whim
+  risk:
+    - Core
+    - Satellite
+    - Speculative
+    - Defensive
+    - High Volatility
+    - Needs Review
