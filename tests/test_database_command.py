@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +16,7 @@ from database_command import (
     upload_email_transactions,
     upload_portfolio_classifications,
     reconcile_email_transactions,
+    reconcile_statement_activities,
     upload_security_metadata,
 )
 
@@ -237,6 +239,285 @@ class DatabaseCommandTest(unittest.TestCase):
             "SELECT reconciliation_status FROM email_transactions"
         ).fetchone()[0]
         self.assertEqual(status, "review_required")
+
+    def _insert_activity_import(self, suffix="1"):
+        return int(
+            self.connection.execute(
+                """
+                INSERT INTO activity_imports (source_file, file_hash, status)
+                VALUES (?, ?, 'succeeded') RETURNING import_id
+                """,
+                [f"file-{suffix}", f"hash-{suffix}"],
+            ).fetchone()[0]
+        )
+
+    def _insert_trade_activity(
+        self,
+        ticker_id,
+        import_id,
+        fingerprint,
+        *,
+        transaction_date,
+        subtype="BUY",
+        quantity,
+        net_cash_amount,
+        activity_type="Trade",
+        currency="CAD",
+    ):
+        self.connection.execute(
+            """
+            INSERT INTO activities (
+                transaction_date, account_id, account_type, activity_type, activity_subtype,
+                activity_code, direction, ticker_id, transaction_currency, quantity,
+                net_cash_amount, row_fingerprint, duplicate_ordinal,
+                first_seen_import_id, last_seen_import_id
+            ) VALUES (?, 'A1', 'TFSA', ?, ?, ?, 'LONG', ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            [
+                transaction_date, activity_type, subtype, subtype, ticker_id,
+                currency, quantity, net_cash_amount, fingerprint, import_id, import_id,
+            ],
+        )
+
+    def test_statement_row_exactly_matching_activities_is_superseded(self):
+        connection = database.get_shared_connection(self.db_path)
+        self.connection = connection
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit)
+               VALUES (?, 'BUY', ?, 1, NULL)""",
+            [date(2025, 4, 2), ticker_id],
+        )
+        import_id = self._insert_activity_import()
+        self._insert_trade_activity(
+            ticker_id, import_id, "fp-1",
+            transaction_date=date(2025, 4, 2), quantity=1, net_cash_amount=-100,
+        )
+
+        self.assertEqual(reconcile_statement_activities(self.db_path), 1)
+
+        transaction_status = connection.execute(
+            "SELECT superseded_by_activity_id FROM transactions"
+        ).fetchone()[0]
+        self.assertIsNotNone(transaction_status)
+
+        # The statement row had NULL debit (a statement-extraction gap); the
+        # activities row's cost is what survives into the unified event view.
+        events = connection.execute(
+            "SELECT source, amount_cad FROM v_trade_events WHERE ticker_id = ?", [ticker_id]
+        ).fetchall()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "activities")
+        self.assertEqual(events[0][1], Decimal("100.0000"))
+
+    def test_statement_activities_match_within_quantity_and_date_tolerance(self):
+        connection = database.get_shared_connection(self.db_path)
+        self.connection = connection
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('DRAM', 'NYSE', 'USD', 'Dram Corp', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        # Statement date is 4 days after the activities date (within the
+        # widened 5-day window) and quantity is off by 0.3% (within 0.5%).
+        connection.execute(
+            """INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit)
+               VALUES (?, 'BUY', ?, 1.003, 90.80)""",
+            [date(2025, 7, 13), ticker_id],
+        )
+        import_id = self._insert_activity_import()
+        self._insert_trade_activity(
+            ticker_id, import_id, "fp-2",
+            transaction_date=date(2025, 7, 9), quantity=1.000, net_cash_amount=-90.80,
+        )
+
+        self.assertEqual(reconcile_statement_activities(self.db_path), 1)
+        linked = connection.execute(
+            "SELECT superseded_by_activity_id FROM transactions"
+        ).fetchone()[0]
+        self.assertIsNotNone(linked)
+
+    def test_statement_activities_reconciliation_is_idempotent(self):
+        connection = database.get_shared_connection(self.db_path)
+        self.connection = connection
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit)
+               VALUES (?, 'BUY', ?, 1, 100)""",
+            [date(2025, 4, 2), ticker_id],
+        )
+        import_id = self._insert_activity_import()
+        self._insert_trade_activity(
+            ticker_id, import_id, "fp-3",
+            transaction_date=date(2025, 4, 2), quantity=1, net_cash_amount=-100,
+        )
+
+        first = reconcile_statement_activities(self.db_path)
+        link_after_first = connection.execute(
+            "SELECT superseded_by_activity_id FROM transactions"
+        ).fetchone()[0]
+        second = reconcile_statement_activities(self.db_path)
+        link_after_second = connection.execute(
+            "SELECT superseded_by_activity_id FROM transactions"
+        ).fetchone()[0]
+
+        self.assertEqual(first, second)
+        self.assertEqual(link_after_first, link_after_second)
+
+    def test_duplicate_same_day_trades_pair_off_one_to_one(self):
+        connection = database.get_shared_connection(self.db_path)
+        self.connection = connection
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('PZA', 'TSX', 'CAD', 'Pizza Pizza', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        for _ in range(2):
+            connection.execute(
+                """INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit)
+                   VALUES (?, 'BUY', ?, 2, 26.26)""",
+                [date(2023, 7, 25), ticker_id],
+            )
+        import_id = self._insert_activity_import()
+        for ordinal, fingerprint in enumerate(("fp-dup-a", "fp-dup-b")):
+            self._insert_trade_activity(
+                ticker_id, import_id, fingerprint,
+                transaction_date=date(2023, 7, 25), quantity=2, net_cash_amount=-26.26,
+            )
+
+        self.assertEqual(reconcile_statement_activities(self.db_path), 2)
+        linked_activity_ids = [
+            row[0]
+            for row in connection.execute(
+                "SELECT superseded_by_activity_id FROM transactions ORDER BY transaction_id"
+            ).fetchall()
+        ]
+        self.assertEqual(len(linked_activity_ids), 2)
+        self.assertEqual(len(set(linked_activity_ids)), 2)
+        self.assertNotIn(None, linked_activity_ids)
+
+    def test_email_trade_matches_activities_before_statement(self):
+        connection = database.get_shared_connection(self.db_path)
+        self.connection = connection
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('SPYM', 'BATS', 'USD', 'SPYM ETF', 'etf') RETURNING ticker_id"""
+        ).fetchone()[0]
+        # A statement row on the same day is present but unrelated to the DRIP;
+        # the activities Trade row for the DRIP itself should win.
+        connection.execute(
+            """INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit)
+               VALUES (?, 'BUY', ?, 0.0025, 0.28)""",
+            [date(2025, 10, 2), ticker_id],
+        )
+        import_id = self._insert_activity_import()
+        self._insert_trade_activity(
+            ticker_id, import_id, "fp-4",
+            transaction_date=date(2025, 10, 2), quantity=0.0025, net_cash_amount=-0.28,
+        )
+        # This makes the statement row NOT superseded (different date/qty so
+        # it survives on its own) while the email row should still prefer
+        # the activities row over the leftover statement row.
+        connection.execute(
+            """INSERT INTO email_transactions (
+                   account, transaction_type, ticker_id, quantity, total_cost, transaction_date,
+                   source_symbol, price_currency, ticker_resolution_status, reconciliation_status
+               ) VALUES ('TFSA', 'Fractional Buy', ?, 0.0025, 0.28, ?, 'SPYM', 'USD', 'resolved', 'provisional')""",
+            [ticker_id, date(2025, 10, 1)],
+        )
+
+        reconcile_statement_activities(self.db_path)
+        self.assertEqual(reconcile_email_transactions(self.db_path), 1)
+
+        status = connection.execute(
+            "SELECT reconciliation_status, matched_activity_id, matched_transaction_id "
+            "FROM email_transactions"
+        ).fetchone()
+        self.assertEqual(status[0], "superseded")
+        self.assertIsNotNone(status[1])
+        self.assertIsNone(status[2])
+
+    def test_email_quantity_within_relative_tolerance_matches(self):
+        connection = database.get_shared_connection(self.db_path)
+        self.connection = connection
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('L', 'TSX', 'CAD', 'Loblaw', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit)
+               VALUES (?, 'BUY', ?, 1.0, 100)""",
+            [date(2025, 12, 31), ticker_id],
+        )
+        # 1.5% off from the statement quantity, within the 2% email tolerance.
+        connection.execute(
+            """INSERT INTO email_transactions (
+                   account, transaction_type, ticker_id, quantity, total_cost, transaction_date,
+                   source_symbol, price_currency, ticker_resolution_status, reconciliation_status
+               ) VALUES ('TFSA', 'Fractional Buy', ?, 1.015, 100, ?, 'L', 'CAD', 'resolved', 'provisional')""",
+            [ticker_id, date(2025, 12, 31)],
+        )
+
+        self.assertEqual(reconcile_email_transactions(self.db_path), 1)
+        status = connection.execute(
+            "SELECT reconciliation_status, matched_transaction_id FROM email_transactions"
+        ).fetchone()
+        self.assertEqual(status[0], "superseded")
+        self.assertIsNotNone(status[1])
+
+    def test_email_reconciliation_rematches_after_statement_superseded(self):
+        """A rerun after upstream data changes should stay idempotent.
+
+        The email row is first matched to the live statement row; once
+        activities import makes that statement row superseded, rerunning
+        both passes should relink the email row to the activities row
+        instead of leaving a dangling `matched_transaction_id`.
+        """
+        connection = database.get_shared_connection(self.db_path)
+        self.connection = connection
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit)
+               VALUES (?, 'BUY', ?, 1, 100)""",
+            [date(2025, 4, 2), ticker_id],
+        )
+        connection.execute(
+            """INSERT INTO email_transactions (
+                   account, transaction_type, ticker_id, quantity, total_cost, transaction_date,
+                   source_symbol, price_currency, ticker_resolution_status, reconciliation_status
+               ) VALUES ('TFSA', 'Market Buy', ?, 1, 100, ?, 'AAPL', 'USD', 'resolved', 'provisional')""",
+            [ticker_id, date(2025, 4, 2)],
+        )
+        reconcile_email_transactions(self.db_path)
+        first_match = connection.execute(
+            "SELECT matched_transaction_id, matched_activity_id FROM email_transactions"
+        ).fetchone()
+        self.assertIsNotNone(first_match[0])
+        self.assertIsNone(first_match[1])
+
+        # Now an activities row for the same trade arrives later.
+        import_id = self._insert_activity_import()
+        self._insert_trade_activity(
+            ticker_id, import_id, "fp-5",
+            transaction_date=date(2025, 4, 2), quantity=1, net_cash_amount=-100,
+        )
+        reconcile_statement_activities(self.db_path)
+        reconcile_email_transactions(self.db_path)
+
+        second_match = connection.execute(
+            "SELECT reconciliation_status, matched_transaction_id, matched_activity_id "
+            "FROM email_transactions"
+        ).fetchone()
+        self.assertEqual(second_match[0], "superseded")
+        self.assertIsNone(second_match[1])
+        self.assertIsNotNone(second_match[2])
 
     def test_non_finite_optional_etf_metadata_is_stored_as_null(self):
         def fetcher(_tickers):

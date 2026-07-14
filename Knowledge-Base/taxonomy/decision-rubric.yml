@@ -1,0 +1,301 @@
+version: v1.1
+name: decision_rubric
+status: hand_curated
+framework: decision-framework.yml
+purpose: >
+  Hand-curated scoring rubric that turns fetched research evidence into a
+  Buy/Sell/Hold/Trim/Add/Watchlist/Avoid recommendation. The LLM never predicts
+  markets -- it applies these human-authored gates and weighted criteria to
+  cited evidence and scores each one. Every number below (gate thresholds,
+  dimension weights, anchor cutoffs, verdict bands, confidence rules) is meant
+  to be tuned by the portfolio owner via the author-decision-rubric skill; KB
+  agents read this file, never write it. Actions, confidence levels, and time
+  horizons come from decision-framework.yml -- this file does not redefine them.
+
+# Research sources the rubric may cite. Evidence fields are written as
+# "source:path". A criterion whose source is not supplied at scoring time is
+# marked unknown (not an error), so future sources slot in without breaking the
+# contract. "derived" metrics are computed deterministically by
+# scoring_worksheet.py; "classification" is the classify-portfolio output JSON.
+sources:
+  yfinance:
+    skill: fetch-stock-research-data
+    groups:
+      - overview
+      - valuation
+      - financials
+      - earnings
+      - analyst
+      - options
+      - news
+      - insider
+      - institutional
+      - dividends
+      - history
+  classification:
+    skill: classify-portfolio
+    groups:
+      - holdings
+  derived:
+    computed_by: scoring_worksheet.py
+    groups:
+      - fcf_yield
+      - revenue_growth_yoy
+      - net_income_latest
+      - debt_to_equity
+      - current_ratio
+      - return_30d
+      - return_90d
+      - return_365d
+      - net_insider_shares
+      - put_call_oi_ratio
+      - groups_ok_count
+
+# Hard disqualifiers. Any gate that FAILS forces the verdict to Avoid (not held)
+# or Sell (held), regardless of the weighted score. A gate that cannot be
+# evaluated is "unknown", never "pass": an unknown gate caps confidence at Low
+# (see confidence_rules) and is treated conservatively by the analyst.
+gates:
+  - id: solvency
+    description: Company is not in balance-sheet distress.
+    applies_when: always
+    fail_when: >
+      Free cash flow is negative AND debt-to-equity is above 2.0 (or unknown)
+      AND the current ratio is below 1.0 -- i.e. burning cash with heavy
+      leverage and weak short-term liquidity.
+    evidence_fields:
+      - yfinance:data.valuation.freeCashflow
+      - derived:debt_to_equity
+      - derived:current_ratio
+  - id: profitability_or_path
+    description: The business is profitable or credibly heading there.
+    applies_when: always
+    fail_when: >
+      Latest net income is negative AND free cash flow is negative AND revenue
+      is shrinking year over year -- unprofitable, cash-burning, and
+      decelerating at the same time.
+    evidence_fields:
+      - derived:net_income_latest
+      - yfinance:data.valuation.freeCashflow
+      - derived:revenue_growth_yoy
+  - id: dividend_integrity
+    description: An income holding's dividend is actually covered.
+    applies_when: income_role
+    fail_when: >
+      Trailing payout ratio is above 1.0 (dividend exceeds earnings) -- the
+      dividend is being funded from something other than profit and is at risk.
+    evidence_fields:
+      - yfinance:data.dividends.summary.payoutRatio
+  - id: data_sufficiency
+    description: Enough of the research pull succeeded to judge the stock.
+    applies_when: always
+    fail_when: >
+      Fewer than 6 of the 11 yfinance research groups were fetched without
+      error -- too little evidence to reach a defensible verdict.
+    evidence_fields:
+      - derived:groups_ok_count
+
+# Weighted 1-5 dimensions. Weights sum to 1.0. A dimension whose applies_when is
+# not met (e.g. dividend_safety for a non-payer) is dropped and its weight is
+# redistributed pro-rata across the remaining scored dimensions. A dimension
+# scored "unknown" is excluded from the weighted average the same way.
+#
+# `section` names the thesis-page `## {section}` header this dimension's
+# narrative belongs in (see stock-thesis-template.md). The analyst's
+# `narratives.section_updates` key for a scored dimension MUST equal its
+# `section` value verbatim -- ingest_recommendation.py transcribes by exact
+# header match and drops (with a warning) anything that doesn't match. When
+# two dimensions share a `section` (financial_health + growth both target
+# "Financial Analysis"), combine their commentary into one prose block.
+dimensions:
+  - id: valuation
+    weight: 0.20
+    applies_when: always
+    section: "Valuation Analysis"
+    evidence_fields:
+      - yfinance:data.valuation.forwardPE
+      - yfinance:data.valuation.trailingPE
+      - yfinance:data.valuation.pegRatio
+      - derived:fcf_yield
+      - yfinance:data.valuation.currentPrice
+      - yfinance:data.valuation.targetMeanPrice
+    anchors:
+      "5": >
+        Clearly cheap for the quality: FCF yield above 6% or forward P/E below
+        12 with stable margins, and price is more than 15% below the analyst
+        mean target.
+      "3": >
+        Roughly fairly valued: forward P/E about 15-25, PEG about 1-2, FCF yield
+        about 3-5%, price near the analyst mean target.
+      "1": >
+        Expensive for the fundamentals: forward P/E above 40 with decelerating
+        growth, or negative FCF with a rich EV/EBITDA, well above the mean
+        target.
+  - id: financial_health
+    weight: 0.20
+    applies_when: always
+    section: "Financial Analysis"
+    evidence_fields:
+      - yfinance:data.valuation.returnOnEquity
+      - derived:debt_to_equity
+      - derived:current_ratio
+      - yfinance:data.valuation.freeCashflow
+      - yfinance:data.valuation.profitMargins
+    anchors:
+      "5": >
+        Strong balance sheet and returns: ROE above 15%, debt-to-equity below
+        1.0, positive and growing free cash flow, current ratio above 1.2.
+      "3": >
+        Adequate: ROE roughly 8-15%, debt-to-equity 1-2, positive but flat free
+        cash flow, current ratio near 1.0.
+      "1": >
+        Weak: negative ROE or free cash flow, debt-to-equity above 3, or a
+        current ratio below 0.8.
+  - id: growth
+    weight: 0.10
+    applies_when: always
+    section: "Financial Analysis"
+    evidence_fields:
+      - derived:revenue_growth_yoy
+      - yfinance:data.financials.income_statement_annual
+      - yfinance:data.analyst.price_targets
+    anchors:
+      "5": Revenue and earnings growing above 15% year over year with margin expansion.
+      "3": Revenue growth roughly 3-15%, earnings roughly flat to up.
+      "1": Revenue flat or shrinking with margin compression.
+  - id: earnings_catalysts
+    weight: 0.05
+    applies_when: always
+    section: "Earnings and Catalysts"
+    evidence_fields:
+      - yfinance:data.earnings.calendar
+      - yfinance:data.earnings.earnings_dates
+      - yfinance:data.analyst.upgrades_downgrades
+    anchors:
+      "5": >
+        A near-term earnings date with a credible beat-and-raise setup:
+        recent upgrades or raised targets and no red flags in the calendar.
+      "3": >
+        Routine upcoming earnings with no strong catalyst either way; analyst
+        activity is mixed or quiet.
+      "1": >
+        A near-term earnings date with elevated miss/guide-down risk: recent
+        downgrades or cut targets heading into the print.
+  - id: dividend_safety
+    weight: 0.10
+    applies_when: dividend_payer
+    section: "Dividend Analysis"
+    evidence_fields:
+      - yfinance:data.dividends.summary.payoutRatio
+      - yfinance:data.dividends.summary.dividendYield
+      - yfinance:data.valuation.freeCashflow
+      - yfinance:data.dividends.history
+    anchors:
+      "5": Payout ratio below 60%, well covered by free cash flow, multi-year uninterrupted growth.
+      "3": Payout ratio roughly 60-80%, covered, stable dividend.
+      "1": Payout ratio above 90% or a recent cut, coverage in doubt.
+  - id: market_sentiment
+    weight: 0.15
+    applies_when: always
+    section: "Market Sentiment"
+    evidence_fields:
+      - yfinance:data.analyst.recommendations_summary
+      - yfinance:data.analyst.upgrades_downgrades
+      - derived:return_90d
+      - derived:return_365d
+      - yfinance:data.news.headlines
+    anchors:
+      "5": Net analyst upgrades in the last 90 days, buy-skewed ratings, and positive 90-day and 365-day price returns.
+      "3": Mixed or neutral ratings and roughly flat price trend.
+      "1": Net downgrades, sell-skewed ratings, and negative 90-day and 365-day returns.
+  - id: insider_activity
+    weight: 0.02
+    applies_when: always
+    section: "Insider Activity"
+    evidence_fields:
+      - derived:net_insider_shares
+      - yfinance:data.insider.purchases
+      - yfinance:data.insider.transactions
+    anchors:
+      "5": Net insider buying, with officers/board accumulating shares.
+      "3": Routine or neutral insider activity, no clear buy or sell skew.
+      "1": Clustered insider selling across multiple officers or board members.
+  - id: options_activity
+    weight: 0.03
+    applies_when: always
+    section: "Options Activity"
+    evidence_fields:
+      - derived:put_call_oi_ratio
+      - yfinance:data.options.expirations
+    anchors:
+      "5": Call-skewed positioning, put/call open-interest ratio below 0.7.
+      "3": Balanced put/call open-interest ratio near 1.0.
+      "1": Put-skewed positioning, put/call open-interest ratio above 1.3.
+  - id: portfolio_fit
+    weight: 0.15
+    applies_when: always
+    section: "Portfolio Fit"
+    evidence_fields:
+      - classification:holdings.primary_group
+      - classification:holdings.position_weight
+      - classification:holdings.secondary_tags
+    anchors:
+      "5": >
+        Fills an underweight role or group and adds sector, currency, or
+        geographic diversification; resulting position stays below 5%.
+      "3": Reasonable fit; overlaps somewhat with existing exposure; position 5-8%.
+      "1": >
+        Duplicates an already-overweight group or would push the single-name
+        position above 10% (the policy cap).
+
+scoring:
+  scale: [1, 5]
+  unknown:
+    # Missing evidence scores as null and is excluded from the weighted average
+    # (remaining weights are renormalized). Never guess a score for missing data.
+    score_as: null
+    never_guess: true
+
+# Position-aware verdict. After all gates pass, the weighted score maps to an
+# action through the band for the current position state. Bands are read in
+# descending order: the first band whose `min` is <= the weighted score wins.
+verdict_bands:
+  not_held:
+    - {min: 4.0, action: Buy}
+    - {min: 3.0, action: Watchlist}
+    - {min: 1.0, action: Avoid}
+  held:
+    - {min: 4.0, action: Add}
+    - {min: 2.75, action: Hold}
+    - {min: 2.0, action: Trim}
+    - {min: 1.0, action: Sell}
+  gate_fail:
+    not_held: Avoid
+    held: Sell
+
+# Confidence is a function of how much evidence was available. Rules are checked
+# High -> Medium -> Low; the first whose thresholds are all met wins. Any unknown
+# gate forces Low (both High and Medium require max_unknown_gates: 0).
+confidence_rules:
+  High:
+    max_unknown_dimensions: 0
+    max_unknown_gates: 0
+    min_groups_ok: 10
+  Medium:
+    max_unknown_dimensions: 2
+    max_unknown_gates: 0
+    min_groups_ok: 8
+  Low:
+    default: true
+
+time_horizon_rules:
+  default_by_role:
+    Core: Long-term
+    Quality: Long-term
+    Income: Long-term
+    Growth: Medium-term
+    Alternatives: Medium-term
+    Cash: Short-term
+    Unassigned: Medium-term
+  # Use Short-term only when the action is driven by a dated catalyst.
+  catalyst_driven: Short-term

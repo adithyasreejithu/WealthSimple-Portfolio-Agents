@@ -238,6 +238,39 @@ def replace_index_section(page_text: str, section: str, *, source: str = "<index
     return page_text[:begin] + section + page_text[end + len(INDEX_END):]
 
 
+def replace_section(body: str, header: str, content: str) -> str:
+    """Replace a markdown section (## header) with new content.
+
+    Finds the line starting with '## {header}', replaces everything from that
+    line up to (but not including) the next '## ' line or EOF with the header
+    plus the new content. Raises KBPageError if the header is not found.
+    """
+    lines = body.splitlines(keepends=True)
+    header_prefix = f"## {header}"
+    header_idx = None
+    for idx, line in enumerate(lines):
+        if line.strip().startswith(header_prefix):
+            header_idx = idx
+            break
+    if header_idx is None:
+        raise KBPageError(f"section '{header}' not found")
+
+    # Find the next section header or EOF.
+    next_section_idx = len(lines)
+    for idx in range(header_idx + 1, len(lines)):
+        if lines[idx].strip().startswith("## "):
+            next_section_idx = idx
+            break
+
+    # Rebuild: keep everything before the section, insert new content, keep everything after.
+    new_content = f"\n{header_prefix}\n\n{content}\n"
+    if body.endswith("\n"):
+        new_content = new_content.rstrip() + "\n"
+
+    result = "".join(lines[:header_idx]) + new_content + "".join(lines[next_section_idx:])
+    return result
+
+
 def _sort_key(item: tuple[dict, str]) -> tuple[str, str]:
     meta, link = item
     updated = _date_text(meta.get("updated")) or "0000-00-00"

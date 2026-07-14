@@ -113,6 +113,60 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(table_exists, 1)
         self.assertTrue(database.is_database_active(connection))
 
+    def test_version_nine_schema_is_upgraded_to_position_engine_schema(self):
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute("DROP VIEW v_trade_events")
+        connection.execute("DROP TABLE position_ledger")
+        connection.execute("DROP TABLE position_snapshots")
+        connection.execute("DROP TABLE position_engine_meta")
+        # The v9->v10 migration's ALTER TABLE ... ADD COLUMN IF NOT EXISTS is
+        # idempotent, so a genuine v9 database (missing these columns) and
+        # this simulated one (columns present, since dropping an
+        # FK-referenced column requires dropping the FK first) both migrate
+        # the same way.
+        connection.execute(
+            "UPDATE schema_metadata SET schema_version = 9 WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        )
+
+        created = database.initialize_database(self.db_path)
+
+        version = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        ).fetchone()[0]
+        self.assertFalse(created)
+        self.assertEqual(version, database.DATABASE_SCHEMA_VERSION)
+        self.assertTrue(database.is_database_active(connection))
+        self.assertIn("position_ledger", database._get_table_names(connection))
+        self.assertIn("position_snapshots", database._get_table_names(connection))
+        self.assertIn("position_engine_meta", database._get_table_names(connection))
+        transaction_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info('transactions')").fetchall()
+        }
+        email_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info('email_transactions')").fetchall()
+        }
+        self.assertIn("superseded_by_activity_id", transaction_columns)
+        self.assertIn("matched_activity_id", email_columns)
+        # The view must exist and be queryable (empty result on an empty DB).
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM v_trade_events").fetchone()[0], 0)
+
+    def test_trade_events_view_is_recreated_on_every_startup(self):
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute("CREATE OR REPLACE VIEW v_trade_events AS SELECT 1 AS stale_marker")
+
+        database.initialize_database(self.db_path)
+
+        columns = {
+            row[0]
+            for row in connection.execute("DESCRIBE v_trade_events").fetchall()
+        }
+        self.assertNotIn("stale_marker", columns)
+        self.assertIn("event_type", columns)
+
     def test_tickers_owns_shared_listing_identity(self):
         database.initialize_database(self.db_path)
         connection = database.get_shared_connection(self.db_path)

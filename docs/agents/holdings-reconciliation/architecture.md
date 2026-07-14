@@ -66,6 +66,10 @@ isolate into a sibling skill.
 - Do not persist anything to the database; this workflow is fully read-only
   and only ever produces a markdown file.
 
+## Handoffs
+
+None — this agent's output is terminal.
+
 ## Code Location
 
 `.claude/skills/reconcile-holdings-report/scripts/generate_reconciliation_report.py`

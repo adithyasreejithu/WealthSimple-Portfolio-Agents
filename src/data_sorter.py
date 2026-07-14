@@ -33,7 +33,12 @@ from config import (
     SOURCE_PREFIX,
 )
 from database import get_shared_connection, initialize_database
-from database_command import SecurityFetcher, ensure_tickers
+from database_command import (
+    SecurityFetcher,
+    ensure_tickers,
+    reconcile_email_transactions,
+    reconcile_statement_activities,
+)
 from system_logger import get_logger
 from ticker_pipeline import base_ticker_symbol, listing_currency_from_fx
 
@@ -672,6 +677,8 @@ def sort_data(
             import_id,
             normalized_rows,
         )
+        reconcile_statement_activities(db_path)
+        reconcile_email_transactions(db_path)
         connection.execute(
             """
             UPDATE activity_imports

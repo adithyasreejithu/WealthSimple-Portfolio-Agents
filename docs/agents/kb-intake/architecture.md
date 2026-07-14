@@ -39,7 +39,7 @@ skills:
 |---|---|---|
 | `kb-search` | Find existing pages before writing (mandatory first step for every request) | `kb-intake` agent, always first |
 | `kb-intake-document` | markitdown conversion, filing under `sources/`, optional companion note | `kb-intake` agent (document ingestion requests) |
-| `kb-update-thesis` | Deterministic edges of thesis lifecycle: create/validate/set-status, append-only logs | `kb-intake` agent (thesis create/update/status-change requests) |
+| `kb-update-thesis` | Deterministic edges of thesis lifecycle: create/validate/set-status, append-only logs, and `ingest_recommendation.py` (commit a stock-analyst recommendation) | `kb-intake` agent (thesis create/update/status-change and recommendation-ingest requests) |
 | `kb-sync-portfolio` | Regenerate `portfolio/holdings.md` and `portfolio/portfolio-overview.md` from the classification JSON | `kb-intake` agent (sync requests) |
 
 ## Workflow
@@ -55,6 +55,12 @@ skills:
    stock page to fill in or update prose sections — the scripts create
    structure and enforce immutability elsewhere, but do not write thesis
    content themselves (see `kb-update-thesis/references/thesis-contract.md`).
+   For recommendation ingestion, `ingest_recommendation.py` does the
+   deterministic Status-block/Decision-History/log updates from a validated
+   `stock-analyst` artifact (never changing Portfolio Status), and the agent
+   transcribes the artifact's narratives — including the Analyst View — into the
+   prose sections. See
+   [`docs/architecture/decision_support_flow.md`](../../architecture/decision_support_flow.md).
 5. It runs `thesis_page.py validate` before finishing any thesis edit, and
    appends the relevant log rows.
 6. It reports a Wiki Update Summary (pages touched, thesis verdict, log
@@ -67,7 +73,19 @@ skills:
 - Never deletes pages or log rows; never rewrites Original Thesis.
 - Every mutation gets an `update-log.md` entry.
 - No fabricated data — cites sources or records gaps as Open Questions.
-- Declines pure-lookup requests and points to `kb-discovery`.
+- Declines pure-lookup requests (see Handoffs).
+- Never processes multiple tickers concurrently — `kb-update-thesis`'s
+  index/log helpers (`src/kb_pages.py`) read a shared file whole and
+  overwrite it whole with no locking, so concurrent commits across tickers
+  can silently drop another ticker's row. Commit tickers one at a time. See
+  "Multi-ticker / batch runs" in
+  [`docs/architecture/decision_support_flow.md`](../../architecture/decision_support_flow.md).
+
+## Handoffs
+
+| Label | Agent | Prompt |
+| --- | --- | --- |
+| Redirect pure lookups | kb-discovery | "This is a read-only lookup with no write intent — kb-discovery searches the knowledge base without writing." |
 
 ## Code Location
 

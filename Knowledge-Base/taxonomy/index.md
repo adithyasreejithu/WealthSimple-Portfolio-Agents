@@ -37,6 +37,12 @@ edit `ref/`**.
 | File | Owns |
 |---|---|
 | [decision-framework.yml](decision-framework.yml) | Decision actions (Buy/Sell/Hold/Trim/Add/Watchlist/Avoid), confidence levels, time horizons, thesis verdicts, stock-page statuses. |
+| [decision-rubric.yml](decision-rubric.yml) | The hand-curated scoring rubric: hard gates, weighted 1-5 dimensions with anchors, position-aware verdict bands, confidence rules, and the research-source registry. Turns fetched evidence into a recommendation. Draws its action/confidence/horizon enums from `decision-framework.yml`. |
+
+`decision-rubric.yml` is edited only through the `author-decision-rubric` skill
+(validated and version-bumped); the `stock-analyst` agent reads it but never
+writes it. Every tunable number (gate thresholds, weights, anchor cutoffs,
+bands) lives there for the portfolio owner to tune.
 
 Risk levels per group are defined inside `ref/policy_v1_1.yaml` (`risk_level`
 on each group) — no separate risk-levels file is needed.

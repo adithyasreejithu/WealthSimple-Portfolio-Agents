@@ -21,7 +21,7 @@ LOG_FOLDER = BASE_DIR / "logs"
 DATABASE_PATH = Path(
     os.getenv("DB_PATH", str(DATA_FOLDER / "PRD_WealthSimple.duckdb"))
 ).expanduser()
-DATABASE_SCHEMA_VERSION = 9
+DATABASE_SCHEMA_VERSION = 10
 
 """
 Financial analytics assumptions. Keep business constants here so calculations
@@ -37,6 +37,22 @@ SINGLE_NAME_MAX_WEIGHT = Decimal("0.10")
 ANALYTICS_EXPORT_FOLDER = EXPORT_FOLDER / "analytics"
 ANALYTICS_EXPORT_FILENAME = "portfolio-analytics.json"
 POLICY_FILE = PORTFOLIO_GROUPING_FOLDER / "policy_v1_1.yaml"
+
+"""
+Position reconciliation config used by `database_command.py` (statement <->
+activities <-> email trade matching) and `position_engine.py` (average-cost
+book value computation). Tolerances are sized to the confirmed DRIP/rounding
+mismatches found during holdings reconciliation
+(docs/holdings_reconciliation_2026-07-07.md): email quantities can drift up to
+~2% from the matching statement/activities row, statement-vs-activities
+quantities are tighter (~0.5%) since both come from the same broker.
+"""
+RECON_QTY_ABS_TOL = Decimal("0.0005")
+RECON_QTY_REL_TOL_STMT = Decimal("0.005")
+RECON_QTY_REL_TOL_EMAIL = Decimal("0.02")
+RECON_DATE_WINDOW_DAYS_STMT = 5
+RECON_DATE_WINDOW_DAYS_EMAIL = 4
+FX_PAIR_SYMBOL = "USDCAD=X"
 
 """
 Logging config used by `system_logger.py`.

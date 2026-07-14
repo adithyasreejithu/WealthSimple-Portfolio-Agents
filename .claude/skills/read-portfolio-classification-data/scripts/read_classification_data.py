@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from config import DATABASE_PATH, DATABASE_SCHEMA_VERSION
 from database import REQUIRED_TABLES, SCHEMA_COMPONENT
+from position_engine import FINGERPRINT_COMPONENT, compute_fingerprint
 
 
 def _json_value(value: Any) -> Any:
@@ -58,52 +59,62 @@ def _validate_database(connection: duckdb.DuckDBPyConnection) -> None:
         raise RuntimeError("Configured database schema version is inactive or incompatible")
 
 
+def _validate_positions_fresh(connection: duckdb.DuckDBPyConnection) -> None:
+    """Ensure `position_snapshots` reflects the current source tables.
+
+    This script only ever opens a read-only connection, so it cannot itself
+    recompute positions (see `position_engine.py`). Instead of silently
+    reading stale holdings, it raises an actionable error naming the CLI
+    command that fixes it.
+    """
+    row = connection.execute(
+        "SELECT ledger_fingerprint FROM position_engine_meta WHERE component = ?",
+        [FINGERPRINT_COMPONENT],
+    ).fetchone()
+    stored_fingerprint = row[0] if row else None
+    if stored_fingerprint != compute_fingerprint(connection):
+        raise RuntimeError(
+            "Position data is stale (transactions/activities/email changed since the "
+            "last recompute). Run `python src/app.py recompute-positions` and retry."
+        )
+
+
 def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[str, Any]]:
-    """Read current holdings using a hard-coded query and a read-only connection."""
+    """Read current holdings from `position_snapshots`, the average-cost engine's
+    output, using a read-only connection.
+
+    See `docs/architecture/ingestion_and_reconciliation.md` for how
+    `position_snapshots`/`position_ledger` are built (statement + activities
+    export + email trades, deduplicated by source precedence, splits applied,
+    average-cost book value in CAD).
+    """
     path = Path(db_path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Configured database does not exist: {path}")
     connection = duckdb.connect(str(path), read_only=True)
     try:
         _validate_database(connection)
+        _validate_positions_fresh(connection)
         rows = connection.execute(
             """
-            WITH statement_activity AS (
+            WITH ledger_stats AS (
                 SELECT ticker_id,
-                       SUM(CASE WHEN UPPER(transaction_type) = 'SELL' THEN -ABS(quantity) ELSE ABS(quantity) END) quantity,
-                       SUM(COALESCE(debit, 0)) - SUM(COALESCE(credit, 0)) cost_basis,
-                       MIN(CASE WHEN UPPER(transaction_type) = 'BUY' THEN transaction_date END) first_purchase_date,
-                       MAX(CASE WHEN UPPER(transaction_type) = 'BUY' THEN transaction_date END) latest_purchase_date,
-                       COUNT(*) FILTER (WHERE UPPER(transaction_type) = 'BUY') number_of_buys,
-                       COUNT(*) FILTER (WHERE UPPER(transaction_type) = 'SELL') number_of_sells,
-                       SUM(CASE WHEN UPPER(transaction_type) = 'DIV' THEN COALESCE(credit, 0) ELSE 0 END) dividends_received
+                       MIN(CASE WHEN event_type = 'BUY' THEN event_date END) first_purchase_date,
+                       MAX(CASE WHEN event_type = 'BUY' THEN event_date END) latest_purchase_date,
+                       COUNT(*) FILTER (WHERE event_type = 'BUY') number_of_buys,
+                       COUNT(*) FILTER (WHERE event_type = 'SELL') number_of_sells
+                FROM position_ledger
+                GROUP BY ticker_id
+            ), dividends AS (
+                SELECT ticker_id, SUM(COALESCE(credit, 0)) dividends_received
                 FROM transactions
-                WHERE UPPER(transaction_type) IN ('BUY', 'SELL', 'DIV')
+                WHERE UPPER(transaction_type) = 'DIV'
                 GROUP BY ticker_id
-            ), provisional AS (
-                SELECT ticker_id,
-                       SUM(CASE WHEN UPPER(transaction_type) LIKE '%SELL%' THEN -ABS(quantity) ELSE ABS(quantity) END) quantity,
-                       MIN(CASE WHEN UPPER(transaction_type) LIKE '%BUY%' THEN transaction_date END) first_purchase_date,
-                       MAX(CASE WHEN UPPER(transaction_type) LIKE '%BUY%' THEN transaction_date END) latest_purchase_date,
-                       COUNT(*) FILTER (WHERE UPPER(transaction_type) LIKE '%BUY%') number_of_buys,
-                       COUNT(*) FILTER (WHERE UPPER(transaction_type) LIKE '%SELL%') number_of_sells,
-                       STRING_AGG(DISTINCT account, ', ' ORDER BY account) account_type
-                FROM email_transactions
-                WHERE ticker_id IS NOT NULL AND ticker_resolution_status = 'resolved'
-                  AND reconciliation_status = 'provisional'
-                  AND (UPPER(transaction_type) LIKE '%BUY%' OR UPPER(transaction_type) LIKE '%SELL%')
+            ), accounts AS (
+                SELECT ticker_id, STRING_AGG(DISTINCT account_type, ', ' ORDER BY account_type) account_type
+                FROM activities
+                WHERE ticker_id IS NOT NULL
                 GROUP BY ticker_id
-            ), positions AS (
-                SELECT COALESCE(s.ticker_id, p.ticker_id) ticker_id,
-                       COALESCE(s.quantity, 0) + COALESCE(p.quantity, 0) quantity,
-                       COALESCE(s.cost_basis, 0) cost_basis,
-                       LEAST(s.first_purchase_date, p.first_purchase_date) first_purchase_date,
-                       GREATEST(s.latest_purchase_date, p.latest_purchase_date) latest_purchase_date,
-                       COALESCE(s.number_of_buys, 0) + COALESCE(p.number_of_buys, 0) number_of_buys,
-                       COALESCE(s.number_of_sells, 0) + COALESCE(p.number_of_sells, 0) number_of_sells,
-                       COALESCE(s.dividends_received, 0) dividends_received,
-                       p.account_type
-                FROM statement_activity s FULL OUTER JOIN provisional p USING (ticker_id)
             ), latest_prices AS (
                 SELECT ticker_id, close,
                        ROW_NUMBER() OVER (PARTITION BY ticker_id ORDER BY record_date DESC) rn
@@ -113,17 +124,23 @@ def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[s
                        t.security_type asset_class, t.currency, t.financial_currency, t.exchange,
                        sd.sector, sd.industry, ed.fund_family, ed.yield dividend_yield,
                        ed.expense_ratio, ed.aum, ed.nav, ed.top_holdings, ed.sector_weights,
-                       m.provider_symbol, p.quantity, p.cost_basis,
-                       p.first_purchase_date, p.latest_purchase_date, p.number_of_buys,
-                       p.number_of_sells, p.dividends_received, p.account_type,
-                       CASE WHEN lp.close IS NULL THEN NULL ELSE p.quantity * lp.close END position_market_value
-                FROM positions p JOIN tickers t USING (ticker_id)
+                       m.provider_symbol, s.quantity, s.book_value_cad cost_basis,
+                       s.provisional_quantity, s.data_quality_flags,
+                       ls.first_purchase_date, ls.latest_purchase_date,
+                       COALESCE(ls.number_of_buys, 0) number_of_buys,
+                       COALESCE(ls.number_of_sells, 0) number_of_sells,
+                       COALESCE(d.dividends_received, 0) dividends_received, a.account_type,
+                       CASE WHEN lp.close IS NULL THEN NULL ELSE s.quantity * lp.close END position_market_value
+                FROM position_snapshots s JOIN tickers t USING (ticker_id)
+                LEFT JOIN ledger_stats ls USING (ticker_id)
+                LEFT JOIN dividends d USING (ticker_id)
+                LEFT JOIN accounts a USING (ticker_id)
                 LEFT JOIN stock_details sd USING (ticker_id)
                 LEFT JOIN etf_details ed USING (ticker_id)
                 LEFT JOIN ticker_provider_mappings m ON m.ticker_id = t.ticker_id
                     AND m.provider = 'yahoo' AND m.verification_status = 'verified'
                 LEFT JOIN latest_prices lp ON lp.ticker_id = t.ticker_id AND lp.rn = 1
-                WHERE COALESCE(p.quantity, 0) <> 0
+                WHERE s.quantity <> 0
             )
             SELECT *, CASE WHEN SUM(position_market_value) OVER () > 0
                            THEN 100 * position_market_value / SUM(position_market_value) OVER () END current_weight_percent
@@ -141,8 +158,22 @@ def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[s
         record["user_thesis"] = None
         record["target_weight_percent"] = None
         record["unrealized_gain_loss_percent"] = None
+        # data_quality_flags is a JSON column; DuckDB returns it as JSON text
+        # (see analytics.py's identical json.loads(flags_json) handling), so
+        # unwrap it into a real list here rather than leaving raw JSON text
+        # for downstream consumers to parse themselves.
+        raw_flags = record.get("data_quality_flags")
+        record["data_quality_flags"] = json.loads(raw_flags) if raw_flags else []
+        # A non-zero provisional_quantity means part of this holding's quantity
+        # is still sourced from an unmatched email trade, not yet confirmed by
+        # a statement or activities export (see ingestion_and_reconciliation.md).
+        record["has_provisional_activity"] = bool(record.get("provisional_quantity"))
         record["field_provenance"] = {
-            key: ("derived" if key in {"position_market_value", "current_weight_percent"} else "database")
+            key: (
+                "derived"
+                if key in {"position_market_value", "current_weight_percent", "has_provisional_activity"}
+                else "database"
+            )
             for key, value in record.items()
             if key != "field_provenance" and not _is_missing(value)
         }

@@ -28,6 +28,7 @@ from database import get_shared_connection, initialize_database
 from database_command import (
     get_email_checkpoint,
     reconcile_email_transactions,
+    reconcile_statement_activities,
     update_email_checkpoint,
     upload_email_transactions,
     upload_portfolio_classifications,
@@ -35,7 +36,9 @@ from database_command import (
 )
 from analytics import portfolio_report
 from email_extractor import fetch_email_transactions
+from holdings_reconciler import format_report, reconcile_holdings
 from market_data import sync_market_data
+from position_engine import ensure_positions_fresh, recompute_positions
 from statement_extractor import extract_statement_pdf
 from staging import (
     complete_batch, create_batch, mark_file, resolve_batch,
@@ -147,6 +150,7 @@ def _publish_statement_file(
     connection.execute("BEGIN TRANSACTION")
     try:
         rows = upload_statement_transactions(prepared, db_path)
+        reconcile_statement_activities(db_path)
         reconcile_email_transactions(db_path)
         connection.execute("COMMIT")
     except Exception:
@@ -168,6 +172,7 @@ def _publish_email_batch(
     connection.execute("BEGIN TRANSACTION")
     try:
         rows = upload_email_transactions(prepared, db_path)
+        reconcile_statement_activities(db_path)
         reconcile_email_transactions(db_path)
         received = (
             pd.to_datetime(prepared["received_at"], errors="coerce")
@@ -585,6 +590,7 @@ def run_pipeline(
                     mark_file(staged_file_id, "quarantined", str(exc), db_path)
                     results.append(SourceResult("export", file, "failed", error=str(exc)))
 
+    ensure_positions_fresh(get_shared_connection(db_path))
     complete_batch(batch_id, db_path)
     if not results:
         results.append(SourceResult(source, None, "skipped"))
@@ -639,6 +645,14 @@ def _print_root_help() -> None:
     commands.add_parser(
         "classification-sync",
         help="Sync the classify-portfolio JSON output into DuckDB.",
+    )
+    commands.add_parser(
+        "recompute-positions",
+        help="Rebuild position_ledger/position_snapshots from source tables.",
+    )
+    commands.add_parser(
+        "reconcile-holdings",
+        help="Compare computed holdings against a broker holdings CSV export.",
     )
     parser.print_help()
 
@@ -1012,6 +1026,37 @@ def _run_classification_sync_command(argv: list[str]) -> int:
     return 0
 
 
+def _run_recompute_positions_command(argv: list[str]) -> int:
+    """Force a full rebuild of position_ledger/position_snapshots.
+
+    Normally unnecessary -- every holdings-reading command calls
+    `ensure_positions_fresh` itself -- but useful after a manual database
+    edit, a reconciliation-tolerance config change, or when debugging.
+    """
+    parser = argparse.ArgumentParser(
+        description="Rebuild position_ledger and position_snapshots from the current source tables."
+    )
+    parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    args = parser.parse_args(argv)
+    connection = get_shared_connection(args.database)
+    ticker_count = recompute_positions(connection)
+    print(f"recompute-positions: succeeded ({ticker_count} ticker(s))")
+    return 0
+
+
+def _run_reconcile_holdings_command(argv: list[str]) -> int:
+    """Compare computed holdings against a broker holdings CSV export."""
+    parser = argparse.ArgumentParser(
+        description="Compare computed holdings against a Wealthsimple holdings CSV export."
+    )
+    parser.add_argument("--report", type=Path, required=True, help="Path to the broker holdings CSV export.")
+    parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    args = parser.parse_args(argv)
+    result = reconcile_holdings(args.report, args.database)
+    print(format_report(result))
+    return 0 if result.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Dispatch every user-facing command from the canonical application entry point."""
     raw_args = list(sys.argv[1:] if argv is None else argv)
@@ -1028,6 +1073,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_classification_sync_command(raw_args[1:])
     if raw_args and raw_args[0] == "resolve-tickers":
         return _run_resolve_tickers_command(raw_args[1:])
+    if raw_args and raw_args[0] == "recompute-positions":
+        return _run_recompute_positions_command(raw_args[1:])
+    if raw_args and raw_args[0] == "reconcile-holdings":
+        return _run_reconcile_holdings_command(raw_args[1:])
 
     # Delegate to module entry points so each command keeps one argument contract.
     delegated_commands = {

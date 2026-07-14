@@ -301,6 +301,48 @@ python src/app.py import-activities --source-file Data/activities-export.csv --d
 - `--enrich-tickers` enables provider metadata lookup and is the default.
 - `--no-enrich-tickers` disables provider metadata lookup.
 
+## Recompute Positions
+
+```powershell
+python src/app.py recompute-positions
+python src/app.py recompute-positions --database Data/PRD_WealthSimple.duckdb
+```
+
+Rebuilds `position_ledger` and `position_snapshots` — the average-cost
+holdings computed from the unified `v_trade_events` view (statements,
+activities export, and email trades, deduplicated by reconciliation
+precedence). Every holdings-reading command (`analytics`, `portfolio-classify`,
+and a full `pipeline` run) already calls this automatically when the
+underlying source tables have changed, so running it directly is normally
+unnecessary. Use it after a manual database edit, a reconciliation-tolerance
+change in `config.py`, or when investigating a holdings discrepancy.
+
+- `--database PATH` selects the DuckDB database.
+
+See `docs/architecture/ingestion_and_reconciliation.md` for how ownership is
+reconstructed from the three source tables and how average cost is computed.
+
+## Reconcile Holdings
+
+```powershell
+python src/app.py reconcile-holdings --report ref/holdings-report-2026-07-07.csv
+python src/app.py reconcile-holdings --report holdings.csv --database Data/PRD_WealthSimple.duckdb
+```
+
+Compares computed holdings (`analytics.get_holdings`) against a Wealthsimple
+holdings CSV export, treated as ground truth. Checks, per ticker: quantity
+(exact to 1e-6), CAD book value (within `max($0.05, 0.1%)`), and
+market-currency unrealized P/L (within `max($2, 1.5%)`, sized to absorb the
+gap between the CSV's intraday price and the database's last stored close).
+Also flags tickers present in only one side. Prints a per-ticker mismatch
+report and exits 1 if anything mismatches, 0 otherwise — usable as a
+regression gate after a database rebuild or a reconciliation-tolerance
+change. This is the tool the holdings/P&L root-cause investigation
+(`docs/holdings_reconciliation_2026-07-07.md`) was validated against.
+
+- `--report PATH` selects the broker holdings CSV (required).
+- `--database PATH` selects the DuckDB database.
+
 ## Compatibility Commands
 
 Existing direct commands remain available for scripts and local workflows:

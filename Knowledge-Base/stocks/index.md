@@ -16,4 +16,5 @@ One canonical page per ticker (`TICKER.md`). The page's front-matter `status` (`
 <!-- kb-index:begin -->
 | Page | Type | Tickers | Status | Updated | Summary |
 |---|---|---|---|---|---|
+| [Apple Inc. (AAPL) — Stock Page](AAPL.md) | stock-page | AAPL | active | 2026-07-13 | Research page for AAPL, created 2026-07-13. |
 <!-- kb-index:end -->

@@ -37,6 +37,10 @@ That skill depends on `read-portfolio-classification-data` for read-only databas
 - Do not edit classification policy YAML, mutate the database, or persist enrichment results.
 - Do not invent an alternate workflow. If the request is anything other than classifying the portfolio, decline and explain that this agent only classifies the portfolio.
 
+## Handoffs
+
+None — this agent's output is terminal.
+
 ## Output Format
 
 Report the JSON output path returned by the script on success, or relay the workflow's safe failure message verbatim on failure. Do not fabricate classification results yourself — the script is the sole source of truth.

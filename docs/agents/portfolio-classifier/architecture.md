@@ -65,6 +65,10 @@ safer to change without widening the agent's permissions.
 - Do not persist enrichment back to DuckDB or cache it outside the workflow.
 - Do not override populated database values with enrichment data.
 
+## Handoffs
+
+None — this agent's output is terminal.
+
 ## Code Location
 
 Each skill's `scripts/` directory owns its own logic, not a shared borrowed
@@ -79,7 +83,15 @@ module:
   imports shared, pipeline-wide constants (`DATABASE_PATH`,
   `DATABASE_SCHEMA_VERSION` from `src/config.py`; `REQUIRED_TABLES`,
   `SCHEMA_COMPONENT` from `src/database.py`) since those are also used
-  elsewhere in the pipeline, not skill-exclusive logic.
+  elsewhere in the pipeline, not skill-exclusive logic. Its holdings query
+  reads `position_snapshots`/`position_ledger` (the average-cost position
+  engine's output, `src/position_engine.py`) rather than deriving positions
+  live from `transactions`/`email_transactions` — see
+  `docs/architecture/ingestion_and_reconciliation.md` for the full design.
+  Because the connection is read-only, it cannot recompute a stale
+  `position_snapshots` itself; it checks the same ledger fingerprint the
+  engine uses and raises a `RuntimeError` naming `recompute-positions`
+  instead of silently reading stale holdings.
 - `.claude/skills/fetch-yfinance-classification-data/scripts/fetch_classification_data.py`
   owns the yfinance field allowlists and fetch logic itself, with **no
   imports from `src/` at all** — it calls `yfinance` directly.

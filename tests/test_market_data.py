@@ -39,6 +39,7 @@ class MarketDataSyncTest(unittest.TestCase):
         history_fetcher = Mock(return_value=self._history())
         with (
             patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "ensure_fx_history", return_value=0),
             patch.object(market_data, "get_market_targets", return_value=[self.target]),
             patch.object(market_data, "get_shared_connection", return_value=connection),
             patch.object(market_data, "upload_security_metadata") as metadata_upload,
@@ -172,6 +173,94 @@ class MarketDataSyncTest(unittest.TestCase):
 
         self.assertFalse(result.succeeded)
         self.assertEqual(connection.execute.call_args_list[-1].args[0], "ROLLBACK")
+
+
+class FxHistorySyncTest(unittest.TestCase):
+    """Exercise `ensure_fx_history` against a real database (not mocks)."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        import database
+
+        self.database = database
+        database.close_connection()
+        self.temp_dir = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
+        self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
+        database.initialize_database(self.db_path)
+        self.connection = database.get_shared_connection(self.db_path)
+
+    def _fx_frame(self, dates_and_closes):
+        return pd.DataFrame(
+            [
+                {
+                    "Date": day, "Ticker": market_data.FX_PAIR_SYMBOL,
+                    "Open": close, "High": close, "Low": close,
+                    "Close": close, "Adj Close": close, "Volume": 0,
+                }
+                for day, close in dates_and_closes
+            ]
+        )
+
+    def test_no_owned_activity_skips_fetch(self):
+        history_fetcher = Mock(return_value=pd.DataFrame())
+        rows = market_data.ensure_fx_history(self.db_path, history_fetcher=history_fetcher)
+        self.assertEqual(rows, 0)
+        history_fetcher.assert_not_called()
+
+    def test_creates_fx_ticker_and_backfills_from_earliest_owned_date(self):
+        ticker_id = self.connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        self.connection.execute(
+            "INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit) "
+            "VALUES (?, 'BUY', ?, 1, 100)",
+            [date(2025, 1, 2), ticker_id],
+        )
+        history_fetcher = Mock(
+            return_value=self._fx_frame([("2025-01-02", 1.35), ("2025-01-03", 1.36)])
+        )
+
+        rows = market_data.ensure_fx_history(
+            self.db_path, as_of=date(2025, 1, 10), history_fetcher=history_fetcher
+        )
+
+        self.assertEqual(rows, 2)
+        history_fetcher.assert_called_once_with(
+            [market_data.FX_PAIR_SYMBOL], date(2025, 1, 2), date(2025, 1, 11)
+        )
+        fx_ticker = self.connection.execute(
+            "SELECT exchange, currency, security_type FROM tickers WHERE ticker_symbol = ?",
+            [market_data.FX_PAIR_SYMBOL],
+        ).fetchone()
+        self.assertEqual(fx_ticker, ("FX", "CAD", "fx_rate"))
+
+    def test_second_call_fetches_incrementally_from_latest_stored_date(self):
+        ticker_id = self.connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        self.connection.execute(
+            "INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit) "
+            "VALUES (?, 'BUY', ?, 1, 100)",
+            [date(2025, 1, 2), ticker_id],
+        )
+        first_fetcher = Mock(return_value=self._fx_frame([("2025-01-02", 1.35)]))
+        market_data.ensure_fx_history(self.db_path, as_of=date(2025, 1, 5), history_fetcher=first_fetcher)
+
+        second_fetcher = Mock(return_value=self._fx_frame([("2025-01-03", 1.36)]))
+        rows = market_data.ensure_fx_history(
+            self.db_path, as_of=date(2025, 1, 5), history_fetcher=second_fetcher
+        )
+
+        self.assertEqual(rows, 1)
+        second_fetcher.assert_called_once_with(
+            [market_data.FX_PAIR_SYMBOL], date(2025, 1, 3), date(2025, 1, 6)
+        )
 
 
 if __name__ == "__main__":

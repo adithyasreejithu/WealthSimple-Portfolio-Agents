@@ -20,6 +20,7 @@ Claude Code agents live in `.claude/agents/*.md` and skills live in `.claude/ski
 - Put Python that is used only by one agent/skill beside that skill in its `scripts/` directory, not in `src/`. `src/` is for general pipeline code that is not owned by a single agent. For example, the classifier workflow modules live in `.claude/skills/classify-portfolio/scripts/`.
 - Document each agent's purpose, runtime settings, skill dependencies, workflow, and guardrails under `docs/agents/<agent>/`, and keep it aligned with the actual agent config and skills.
 - See `docs/architecture/claude_agent_skill_structure.md` for the full recommended layout.
+- Agent and skill invocations (with per-subagent token usage and session separators) are logged by the `.claude/hooks/usage_tracker.py` hook to `logs/AgentSkillUsage.txt`, separate from the pipeline log `logs/SystemLogs.txt`. See `docs/architecture/usage_tracking.md`.
 
 ### Research Knowledge Base
 
@@ -34,6 +35,31 @@ hand-curated `theses/index.md`, `logs/index.md`, `taxonomy/index.md`) are
 rebuilt by their owning skill, never hand-edited. KB agents (`kb-discovery`,
 `kb-intake`) never edit `Knowledge-Base/ref/*.yaml` or `CHANGELOG.md`. See
 `docs/architecture/knowledge_base.md` for the full layout.
+
+### Decision-support scoring
+
+`Knowledge-Base/taxonomy/decision-rubric.yml` is the hand-curated scoring
+rubric that turns fetched research evidence into a
+Buy/Sell/Hold/Trim/Add/Watchlist/Avoid recommendation. **Every tunable number
+lives there** — hard-gate thresholds, dimension weights, 1/3/5 anchor cutoffs,
+verdict bands, confidence rules. Edit it only through the
+`author-decision-rubric` skill (which validates it, checks the weights still
+sum to 1.0, and requires a version bump); the `stock-analyst` agent and every
+other KB agent read it but never write it. The rubric never redefines the
+action/confidence/horizon enums — those stay in `taxonomy/decision-framework.yml`.
+
+The workflow is two agents by model: `stock-data-prep` (`haiku`) runs the
+mechanical steps (fetch data, build the scoring worksheet), and `stock-analyst`
+(`opus`, Opus 4.8) applies the rubric — scoring each criterion against cited
+evidence — because that judgment is the one place the strongest model is worth
+it. `fetch-stock-research-data` is the first registered research **source**
+(`yfinance`); more sources are added via the rubric's `sources:` registry
+without changing the recommendation contract. The analyst emits a validated
+artifact under `exports/stock-recommendations/`; `kb-intake` commits it to
+`stocks/TICKER.md` (Decision/Confidence/Time Horizon + a Decision History row,
+never Portfolio Status). The LLM never predicts markets — it applies the
+owner's written rubric and cites everything. See
+`docs/architecture/decision_support_flow.md`.
 
 ## Build, Test, and Development Commands
 

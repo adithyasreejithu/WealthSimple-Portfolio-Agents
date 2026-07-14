@@ -11,7 +11,15 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from config import BASE_DIR, DATABASE_PATH
+from config import (
+    BASE_DIR,
+    DATABASE_PATH,
+    RECON_DATE_WINDOW_DAYS_EMAIL,
+    RECON_DATE_WINDOW_DAYS_STMT,
+    RECON_QTY_ABS_TOL,
+    RECON_QTY_REL_TOL_EMAIL,
+    RECON_QTY_REL_TOL_STMT,
+)
 from database import get_shared_connection
 from portfolio_metrics import estimate_wealthsimple_fx_fee_cad
 from system_logger import get_logger
@@ -503,6 +511,7 @@ def upload_statement_transactions(
     fx_count = 0
     fx_exposure = Decimal("0")
     estimated_fx_fees = Decimal("0")
+    null_money_buy_sell_count = 0
     for row in data.to_dict(orient="records"):
         ticker_id = row.get("ticker_id")
         transaction_date = _optional_date(row.get("date"))
@@ -513,6 +522,18 @@ def upload_statement_transactions(
         fx_rate = _decimal(row.get("fx_rate"))
         kind = transaction_type.upper()
         cad_amount = debit if kind == "BUY" else credit if kind == "SELL" else None
+        if kind in ("BUY", "SELL") and debit is None and credit is None:
+            # A statement-extraction gap (see statement_extractor.py's money
+            # parsing): the position engine's activities-precedence rule
+            # (database_command.reconcile_statement_activities) self-heals
+            # this automatically when the same trade is also present in an
+            # activities export, so this is a heads-up, not a hard failure.
+            null_money_buy_sell_count += 1
+            logger.warning(
+                "Statement %s row has no debit/credit; book value depends on an "
+                "activities export covering the same trade | date=%s | ticker_id=%s",
+                kind, transaction_date, ticker_id,
+            )
         if fx_rate is not None and fx_rate > 0 and cad_amount is not None and cad_amount > 0:
             fx_count += 1
             fx_exposure += cad_amount
@@ -590,6 +611,11 @@ def upload_statement_transactions(
             )
         written += 1
     logger.info("Statement upload complete | inserted=%d | input=%d", written, len(data))
+    if null_money_buy_sell_count:
+        logger.warning(
+            "Statement upload | %d BUY/SELL row(s) missing debit/credit",
+            null_money_buy_sell_count,
+        )
     logger.info(
         "Statement FX summary | transactions=%d | cad_exposure=%s | estimated_fee=%s",
         fx_count,
@@ -688,9 +714,195 @@ def upload_email_transactions(
     return written
 
 
-def reconcile_email_transactions(db_path: Path | str = DATABASE_PATH) -> int:
-    """Supersede provisional email trades when one statement row matches exactly."""
-    connection = get_shared_connection(db_path)
+def reconcile_statement_activities(
+    db_path: Path | str = DATABASE_PATH, connection: Any | None = None
+) -> int:
+    """Link statement BUY/SELL rows to the activities Trade row that reports them.
+
+    Precedence is activities > statements (see `v_trade_events` in
+    `database.py`): once a statement row is linked here, `v_trade_events`
+    stops emitting it and the activities row is used instead. This is what
+    heals statement rows with missing debit/credit (a statement-extraction
+    gap) without any manual backfill -- the covering activities row simply
+    takes over.
+
+    This pass is clear-and-rebuild: every `superseded_by_activity_id` link is
+    reset before rematching, so it is idempotent and safe to rerun after every
+    import or from `recompute-positions`. Matching is one-to-one and
+    deterministic (exact quantity first, then closest quantity, then closest
+    date, then lowest id) so repeated identical trades on the same day pair
+    off consistently.
+    """
+    connection = connection if connection is not None else get_shared_connection(db_path)
+    connection.execute("UPDATE transactions SET superseded_by_activity_id = NULL")
+
+    statement_rows = connection.execute(
+        """
+        SELECT transaction_id, ticker_id, UPPER(transaction_type) AS direction,
+               ABS(quantity) AS quantity, COALESCE(execution_date, transaction_date) AS event_date
+        FROM transactions
+        WHERE UPPER(transaction_type) IN ('BUY', 'SELL')
+          AND ticker_id IS NOT NULL
+        ORDER BY transaction_id
+        """
+    ).fetchall()
+    activity_rows = connection.execute(
+        """
+        SELECT activity_id, ticker_id,
+               CASE
+                   WHEN quantity < 0 OR UPPER(COALESCE(activity_subtype, '')) = 'SELL' THEN 'SELL'
+                   ELSE 'BUY'
+               END AS direction,
+               ABS(quantity) AS quantity, transaction_date AS event_date
+        FROM activities
+        WHERE activity_type = 'Trade' AND ticker_id IS NOT NULL
+        ORDER BY activity_id
+        """
+    ).fetchall()
+
+    activities_by_key: dict[tuple[int, str], list[tuple[int, Decimal, date]]] = {}
+    for activity_id, ticker_id, direction, quantity, event_date in activity_rows:
+        activities_by_key.setdefault((ticker_id, direction), []).append(
+            (activity_id, quantity, event_date)
+        )
+
+    # (is_tolerant_match, qty_diff, date_diff, transaction_id, activity_id)
+    candidates: list[tuple[int, Decimal, int, int, int]] = []
+    for transaction_id, ticker_id, direction, quantity, event_date in statement_rows:
+        for activity_id, act_quantity, act_date in activities_by_key.get((ticker_id, direction), []):
+            qty_diff = abs(quantity - act_quantity)
+            tolerance = max(RECON_QTY_ABS_TOL, RECON_QTY_REL_TOL_STMT * act_quantity)
+            if qty_diff > tolerance:
+                continue
+            date_diff = abs((event_date - act_date).days)
+            if date_diff > RECON_DATE_WINDOW_DAYS_STMT:
+                continue
+            is_tolerant = 0 if qty_diff == 0 else 1
+            candidates.append((is_tolerant, qty_diff, date_diff, transaction_id, activity_id))
+
+    candidates.sort()
+    matched_transactions: set[int] = set()
+    matched_activities: set[int] = set()
+    reconciled = 0
+    for _is_tolerant, _qty_diff, _date_diff, transaction_id, activity_id in candidates:
+        if transaction_id in matched_transactions or activity_id in matched_activities:
+            continue
+        connection.execute(
+            "UPDATE transactions SET superseded_by_activity_id = ? WHERE transaction_id = ?",
+            [activity_id, transaction_id],
+        )
+        matched_transactions.add(transaction_id)
+        matched_activities.add(activity_id)
+        reconciled += 1
+
+    logger.info(
+        "Statement/activities reconciliation complete | superseded=%d | "
+        "statement_candidates=%d | activity_candidates=%d",
+        reconciled, len(statement_rows), len(activity_rows),
+    )
+    return reconciled
+
+
+def _email_match_candidates(
+    connection: Any,
+    *,
+    table: str,
+    id_column: str,
+    date_expr: str,
+    extra_where: str,
+    already_matched_column: str,
+    ticker_id: int,
+    direction: str,
+    quantity: Decimal,
+    event_date: date,
+) -> list[tuple[int, Decimal, int]]:
+    """Return (id, qty_diff, date_diff) rows within tolerance, closest first."""
+    tolerance = max(RECON_QTY_ABS_TOL, RECON_QTY_REL_TOL_EMAIL * quantity)
+    rows = connection.execute(
+        f"""
+        SELECT {id_column}, ABS(quantity) AS qty, {date_expr} AS event_date
+        FROM {table}
+        WHERE ticker_id = ?
+          AND {extra_where}
+          AND NOT EXISTS (
+              SELECT 1 FROM email_transactions et
+              WHERE et.{already_matched_column} = {table}.{id_column}
+          )
+        """,
+        [ticker_id],
+    ).fetchall()
+    candidates = []
+    for row_id, row_qty, row_date in rows:
+        qty_diff = abs(quantity - row_qty)
+        if qty_diff > tolerance:
+            continue
+        date_diff = abs((event_date - row_date).days)
+        if date_diff > RECON_DATE_WINDOW_DAYS_EMAIL:
+            continue
+        candidates.append((row_id, qty_diff, date_diff))
+    candidates.sort(key=lambda item: (item[1], item[2], item[0]))
+    return candidates
+
+
+def _resolve_email_match(
+    candidates: list[tuple[int, Decimal, int]],
+) -> tuple[int | None, bool]:
+    """Pick a single match id from candidates, or flag ambiguity.
+
+    Exact matches (same quantity, same date) are preferred and resolved
+    deterministically by id even when more than one exists (repeated
+    identical trades on the same day). Once no exact match exists, a single
+    tolerant candidate is accepted; two or more tolerant candidates cannot be
+    told apart with confidence, so the row is left for human review instead
+    of guessing based on which happens to be numerically closest.
+    """
+    exact = [c for c in candidates if c[1] == 0 and c[2] == 0]
+    if exact:
+        return exact[0][0], False
+    if len(candidates) == 1:
+        return candidates[0][0], False
+    if len(candidates) > 1:
+        return None, True
+    return None, False
+
+
+def reconcile_email_transactions(
+    db_path: Path | str = DATABASE_PATH, connection: Any | None = None
+) -> int:
+    """Match provisional email BUY/SELL trades to activities or statement rows.
+
+    Activities rows are tried before statement rows, matching the precedence
+    used by `v_trade_events`, so a DRIP buy that shows up in both an
+    activities export and a statement is only ever linked once. Quantity
+    tolerance is wider than the statement/activities pass
+    (`RECON_QTY_REL_TOL_EMAIL`) because DRIP fractional-share quantities can
+    drift a little between the email confirmation and the broker's settled
+    record.
+
+    Rows this pass previously marked 'superseded' are reset to 'provisional'
+    and rematched when their link target no longer exists (e.g. a statement
+    row that has since been superseded by an activities row), which keeps the
+    pass idempotent across reruns. Rows a human marked 'review_required', or
+    rows that are 'not_applicable' (Interac transfers), are left untouched.
+    """
+    connection = connection if connection is not None else get_shared_connection(db_path)
+
+    connection.execute(
+        """
+        UPDATE email_transactions
+        SET reconciliation_status = 'provisional', matched_transaction_id = NULL, matched_activity_id = NULL
+        WHERE reconciliation_status = 'superseded'
+          AND (
+                (matched_activity_id IS NOT NULL
+                 AND matched_activity_id NOT IN (SELECT activity_id FROM activities))
+             OR (matched_transaction_id IS NOT NULL
+                 AND matched_transaction_id NOT IN (
+                     SELECT transaction_id FROM transactions WHERE superseded_by_activity_id IS NULL
+                 ))
+          )
+        """
+    )
+
     rows = connection.execute(
         """
         SELECT email_transaction_id, ticker_id, transaction_type,
@@ -704,75 +916,89 @@ def reconcile_email_transactions(db_path: Path | str = DATABASE_PATH) -> int:
         ORDER BY email_transaction_id
         """
     ).fetchall()
+
     reconciled = 0
     for email_id, ticker_id, transaction_type, quantity, transaction_date in rows:
         direction = "SELL" if "SELL" in str(transaction_type).upper() else "BUY"
-        candidates = connection.execute(
-            """
-            SELECT transaction_id
-            FROM transactions tr
-            WHERE tr.ticker_id = ?
-              AND UPPER(tr.transaction_type) = ?
-              AND ABS(tr.quantity) = ?
-              AND COALESCE(tr.execution_date, tr.transaction_date) = ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM email_transactions et
-                  WHERE et.matched_transaction_id = tr.transaction_id
-              )
-            ORDER BY transaction_id
-            """,
-            [ticker_id, direction, quantity, transaction_date],
-        ).fetchall()
-        if not candidates:
-            nearby = connection.execute(
-                """
-                SELECT transaction_id
-                FROM transactions tr
-                WHERE tr.ticker_id = ?
-                  AND UPPER(tr.transaction_type) = ?
-                  AND ABS(tr.quantity) = ?
-                  AND ABS(date_diff('day', COALESCE(tr.execution_date, tr.transaction_date), ?)) <= 3
-                  AND NOT EXISTS (
-                      SELECT 1 FROM email_transactions et
-                      WHERE et.matched_transaction_id = tr.transaction_id
-                  )
-                ORDER BY transaction_id
-                """,
-                [ticker_id, direction, quantity, transaction_date],
-            ).fetchall()
-            if len(nearby) == 1:
-                candidates = nearby
-            elif len(nearby) > 1:
+
+        activity_candidates = _email_match_candidates(
+            connection,
+            table="activities",
+            id_column="activity_id",
+            date_expr="transaction_date",
+            extra_where=(
+                "activity_type = 'Trade' AND "
+                "(CASE WHEN quantity < 0 OR UPPER(COALESCE(activity_subtype, '')) = 'SELL' "
+                "THEN 'SELL' ELSE 'BUY' END) = '" + direction + "'"
+            ),
+            already_matched_column="matched_activity_id",
+            ticker_id=ticker_id,
+            direction=direction,
+            quantity=quantity,
+            event_date=transaction_date,
+        )
+        if activity_candidates:
+            match_id, ambiguous = _resolve_email_match(activity_candidates)
+            if ambiguous:
                 connection.execute(
-                    """
-                    UPDATE email_transactions
-                    SET reconciliation_status = 'review_required'
-                    WHERE email_transaction_id = ?
-                    """,
+                    "UPDATE email_transactions SET reconciliation_status = 'review_required' "
+                    "WHERE email_transaction_id = ?",
                     [email_id],
                 )
                 logger.warning(
-                    "Email reconciliation requires review | email_transaction_id=%d | candidates=%d",
-                    email_id, len(nearby),
+                    "Email reconciliation requires review (activities) | "
+                    "email_transaction_id=%d | candidates=%d",
+                    email_id, len(activity_candidates),
                 )
                 continue
-            else:
-                continue
-        if len(candidates) > 1:
-            logger.info(
-                "Email reconciliation pairing repeated trade deterministically | "
-                "email_transaction_id=%d | candidates=%d",
-                email_id, len(candidates),
+            connection.execute(
+                """
+                UPDATE email_transactions
+                SET reconciliation_status = 'superseded', matched_activity_id = ?, matched_transaction_id = NULL
+                WHERE email_transaction_id = ?
+                """,
+                [match_id, email_id],
             )
+            reconciled += 1
+            continue
+
+        statement_candidates = _email_match_candidates(
+            connection,
+            table="transactions",
+            id_column="transaction_id",
+            date_expr="COALESCE(execution_date, transaction_date)",
+            extra_where=f"UPPER(transaction_type) = '{direction}' AND superseded_by_activity_id IS NULL",
+            already_matched_column="matched_transaction_id",
+            ticker_id=ticker_id,
+            direction=direction,
+            quantity=quantity,
+            event_date=transaction_date,
+        )
+        if not statement_candidates:
+            continue
+        match_id, ambiguous = _resolve_email_match(statement_candidates)
+        if ambiguous:
+            connection.execute(
+                "UPDATE email_transactions SET reconciliation_status = 'review_required' "
+                "WHERE email_transaction_id = ?",
+                [email_id],
+            )
+            logger.warning(
+                "Email reconciliation requires review (statements) | "
+                "email_transaction_id=%d | candidates=%d",
+                email_id, len(statement_candidates),
+            )
+            continue
         connection.execute(
             """
             UPDATE email_transactions
-            SET reconciliation_status = 'superseded', matched_transaction_id = ?
+            SET reconciliation_status = 'superseded', matched_transaction_id = ?, matched_activity_id = NULL
             WHERE email_transaction_id = ?
             """,
-            [candidates[0][0], email_id],
+            [match_id, email_id],
         )
         reconciled += 1
+
     logger.info("Email reconciliation complete | reconciled=%d | candidates=%d", reconciled, len(rows))
     return reconciled
 

@@ -46,8 +46,14 @@ skills:
 
 - No write tools; cannot edit, move, or create wiki pages.
 - Never touches `Knowledge-Base/ref/*.yaml` or `CHANGELOG.md`.
-- Declines create/update/ingest/sync requests and points to `kb-intake`.
+- Declines create/update/ingest/sync requests (see Handoffs).
 - States explicitly when nothing matches instead of fabricating content.
+
+## Handoffs
+
+| Label | Agent | Prompt |
+| --- | --- | --- |
+| Route write requests | kb-intake | "This request needs to create/update a page, ingest a document, or sync portfolio data — kb-intake handles writes to the knowledge base." |
 
 ## Code Location
 

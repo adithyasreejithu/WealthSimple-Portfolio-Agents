@@ -33,6 +33,7 @@ the `kb-discovery` agent searches it, the `kb-intake` agent writes to it.
 <!-- kb-index:begin -->
 | Page | Type | Tickers | Status | Updated | Summary |
 |---|---|---|---|---|---|
+| [Apple Inc. (AAPL) — Stock Page](stocks/AAPL.md) | stock-page | AAPL | active | 2026-07-13 | Research page for AAPL, created 2026-07-13. |
 | [Allocation Policy](portfolio/allocation-policy.md) | portfolio-page |  | final | 2026-07-11 | Narrative summary of the approved allocation policy; source of truth is ref/policy_v1_1.yaml. |
 | [Holdings](portfolio/holdings.md) | portfolio-page | AAPL, AMZN, BN, DGRO, DRAM, ENB, HIMS, INDA, L, MDA, META, NOW, NVDA, PLTR, PZA, RTX, SCHD, SMH, SPYM, T, WN, XEQT, XNDU, ZEB, ZEQT, ZGLD | generated | 2026-07-11 | Current holdings synced from the classification workflow (26 positions). |
 | [Portfolio Overview](portfolio/portfolio-overview.md) | portfolio-page |  | generated | 2026-07-11 | 26 holdings, 4 needing review, total market value 4,112.85. |

@@ -97,6 +97,7 @@ class AppPipelineTest(unittest.TestCase):
             patch.object(app, "_pending_email_symbols", return_value=[]),
             patch.object(app, "_publish_email_batch", side_effect=lambda *_: events.append("email") or 0),
             patch.object(app, "complete_batch", side_effect=lambda *_: events.append("batch")),
+            patch.object(app, "ensure_positions_fresh"),
             patch.object(
                 app,
                 "sync_market_data",
@@ -120,6 +121,7 @@ class AppPipelineTest(unittest.TestCase):
             patch.object(app, "create_batch", return_value=7),
             patch.object(app, "_stage_statement_files", return_value=([], 1, [])),
             patch.object(app, "complete_batch"),
+            patch.object(app, "ensure_positions_fresh"),
             patch.object(app, "sync_market_data") as sync,
         ):
             app.run_pipeline("statements", self.data_dir, self.data_dir / "db.duckdb")
@@ -135,6 +137,7 @@ class AppPipelineTest(unittest.TestCase):
             patch.object(app, "_stage_email_batch", return_value=([], 2, [])),
             patch.object(app, "_stage_export_files", return_value=([], 3, [])),
             patch.object(app, "complete_batch"),
+            patch.object(app, "ensure_positions_fresh"),
             patch.object(app, "sync_market_data") as sync,
             patch.object(
                 app, "_run_portfolio_classification",
@@ -152,6 +155,7 @@ class AppPipelineTest(unittest.TestCase):
             patch.object(app, "create_batch", return_value=7),
             patch.object(app, "_stage_statement_files", return_value=([], 1, [])),
             patch.object(app, "complete_batch"),
+            patch.object(app, "ensure_positions_fresh"),
             patch.object(app, "_run_portfolio_classification") as classify,
         ):
             app.run_pipeline("statements", self.data_dir, self.data_dir / "db.duckdb")
@@ -426,6 +430,47 @@ class AppPipelineTest(unittest.TestCase):
             output = app.main(["classification-sync"])
 
         self.assertEqual(output, 1)
+
+    def test_reconcile_holdings_command_exit_codes(self):
+        db_path = self.data_dir / "db.duckdb"
+        database.initialize_database(db_path)
+        connection = database.get_shared_connection(db_path)
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('PZA', 'TSX', 'CAD', 'Pizza Pizza', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit) "
+            "VALUES ('2025-01-02', 'BUY', ?, 5, 100)",
+            [ticker_id],
+        )
+        connection.execute(
+            "INSERT INTO historical_records VALUES (?, '2025-01-03', 20, 20, 20, 20, 20, 100)",
+            [ticker_id],
+        )
+
+        matching_csv = self.data_dir / "matching.csv"
+        matching_csv.write_text(
+            'Symbol,Quantity,"Book Value (CAD)","Market Unrealized Returns"\n'
+            'PZA,5,100.00,0.00\n',
+            encoding="utf-8",
+        )
+        mismatched_csv = self.data_dir / "mismatched.csv"
+        mismatched_csv.write_text(
+            'Symbol,Quantity,"Book Value (CAD)","Market Unrealized Returns"\n'
+            'PZA,999,100.00,0.00\n',
+            encoding="utf-8",
+        )
+
+        ok_output = app.main([
+            "reconcile-holdings", "--report", str(matching_csv), "--database", str(db_path),
+        ])
+        mismatch_output = app.main([
+            "reconcile-holdings", "--report", str(mismatched_csv), "--database", str(db_path),
+        ])
+
+        self.assertEqual(ok_output, 0)
+        self.assertEqual(mismatch_output, 1)
 
 
 if __name__ == "__main__":

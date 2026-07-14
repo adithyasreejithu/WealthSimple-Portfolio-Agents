@@ -35,8 +35,6 @@ This document maps the investment research knowledge base (`Knowledge-Base/`) wo
 | `Knowledge-Base/templates/front-matter-spec.md` | Central specification for all wiki page metadata | YAML front matter field names, types, allowed values | Hand-curated | Read (by validation scripts) |
 | `Knowledge-Base/templates/stock-thesis-template.md` | Template for new `stocks/TICKER.md` pages | Markdown structure with all required sections | Hand-curated | Read (by `thesis_page.py create`) |
 | `Knowledge-Base/templates/research-note-template.md` | Template for earnings/market-research notes | Markdown structure for analysis notes | Hand-curated | Read (by intake agent when scaffolding) |
-| `Knowledge-Base/templates/portfolio-review-template.md` | Template for portfolio-level review notes | Quarterly/annual review structure | Hand-curated | Read (by intake agent) |
-| `Knowledge-Base/templates/sell-decision-template.md` | Template for documenting sell decisions | Sell thesis structure | Hand-curated | Read (by intake agent) |
 | `Knowledge-Base/logs/index.md` | Log section navigation | Link documentation | Hand-curated (static) | Read-only |
 | `Knowledge-Base/logs/decision-log.md` | **Append-only** record of all buy/sell/trim/add/reject decisions | Rows: date, tickers, action, verdict, note | Append-only via `kb_pages.append_log()` | Read; Append (via `kb-update-thesis` skill) |
 | `Knowledge-Base/logs/research-log.md` | **Append-only** record of what was researched, when, from what sources | Rows: date, tickers, action, sources, note | Append-only via `kb_pages.append_log()` | Read; Append (via `kb-intake-document` skill) |
@@ -377,6 +375,13 @@ Return: Wiki Update Summary
 - `Open Questions` section — adds or resolves questions as research progresses
 - `Monitoring Checklist` — adjusted as thesis evolves
 - Front-matter `updated` date and `status` field — managed by skill scripts on status change or agent edit
+
+**No standalone decision-record or portfolio-review pages:** sell/trim
+decisions and periodic portfolio reviews are recorded entirely within the
+relevant `stocks/TICKER.md` page(s) — `Decision`/`status` field changes,
+an appended `Decision History` row, and an `Updated Thesis` edit
+explaining the reasoning. There is no separate `portfolio/decisions/` or
+`portfolio/review-*.md` file type in this workflow.
 
 ---
 

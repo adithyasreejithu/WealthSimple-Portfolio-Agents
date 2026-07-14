@@ -36,8 +36,12 @@ REQUIRED_TABLES = frozenset(
         "activity_imports",
         "raw_activity_exports",
         "activities",
+        "position_ledger",
+        "position_snapshots",
+        "position_engine_meta",
     }
 )
+TRADE_EVENTS_VIEW = "v_trade_events"
 
 _connection: duckdb.DuckDBPyConnection | None = None
 _connection_path: Path | None = None
@@ -124,6 +128,157 @@ def is_database_active(connection: duckdb.DuckDBPyConnection) -> bool:
         [SCHEMA_COMPONENT],
     ).fetchone()
     return row is not None and row[0] == DATABASE_SCHEMA_VERSION
+
+
+def _create_position_engine_tables(connection: duckdb.DuckDBPyConnection) -> None:
+    """Create the position engine's ledger/snapshot/fingerprint tables.
+
+    Shared between `_deploy_schema` (fresh installs) and the v9->10 migration
+    so both paths stay in lockstep; see `src/position_engine.py` for the
+    Python code that populates these tables.
+    """
+    connection.execute("CREATE SEQUENCE IF NOT EXISTS position_ledger_id_sequence START 1")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS position_ledger (
+            ledger_id BIGINT PRIMARY KEY DEFAULT nextval('position_ledger_id_sequence'),
+            ticker_id BIGINT NOT NULL,
+            event_date DATE NOT NULL,
+            event_type VARCHAR NOT NULL,
+            source VARCHAR NOT NULL,
+            source_id BIGINT NOT NULL,
+            quantity_delta DECIMAL(20, 8) NOT NULL,
+            cost_cad DECIMAL(20, 4),
+            proceeds_cad DECIMAL(20, 4),
+            fx_rate DECIMAL(18, 8),
+            running_quantity DECIMAL(20, 8) NOT NULL,
+            running_book_cad DECIMAL(20, 4) NOT NULL,
+            running_book_mkt DECIMAL(20, 4) NOT NULL,
+            realized_gain_cad DECIMAL(20, 4) NOT NULL DEFAULT 0,
+            FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS position_snapshots (
+            ticker_id BIGINT PRIMARY KEY,
+            quantity DECIMAL(20, 8) NOT NULL,
+            book_value_cad DECIMAL(20, 4) NOT NULL,
+            book_value_mkt DECIMAL(20, 4) NOT NULL,
+            realized_gain_cad DECIMAL(20, 4) NOT NULL,
+            provisional_quantity DECIMAL(20, 8) NOT NULL DEFAULT 0,
+            data_quality_flags JSON,
+            computed_at TIMESTAMP NOT NULL,
+            FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS position_engine_meta (
+            component VARCHAR PRIMARY KEY,
+            ledger_fingerprint VARCHAR NOT NULL,
+            computed_at TIMESTAMP NOT NULL
+        )
+        """
+    )
+
+
+def _apply_v10_position_engine_schema(connection: duckdb.DuckDBPyConnection) -> None:
+    """Migrate an existing v9 database up to the v10 position-engine schema."""
+    connection.execute(
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS superseded_by_activity_id BIGINT"
+    )
+    connection.execute(
+        "ALTER TABLE email_transactions ADD COLUMN IF NOT EXISTS matched_activity_id BIGINT"
+    )
+    _create_position_engine_tables(connection)
+
+
+def _create_trade_events_view(connection: duckdb.DuckDBPyConnection) -> None:
+    """(Re)create the unified BUY/SELL/SPLIT event view read by the position engine.
+
+    Source precedence is activities > statements > email (see
+    docs/architecture/ingestion_and_reconciliation.md). Precedence is applied
+    here by excluding statement rows that a reconciliation pass has linked to
+    an activities row (`superseded_by_activity_id`) and by only including
+    email rows still `provisional` (matched/superseded email rows are already
+    represented by the statement or activities row they were matched to).
+    STKREORG statement rows carry no quantity and are intentionally excluded;
+    a split with no corresponding `activities` CorporateAction row is invisible
+    to this view, which the position engine flags as `split_without_quantity`.
+    """
+    connection.execute(
+        f"""
+        CREATE OR REPLACE VIEW {TRADE_EVENTS_VIEW} AS
+        WITH activity_events AS (
+            SELECT
+                activity_id AS source_id,
+                ticker_id,
+                transaction_date AS event_date,
+                CASE
+                    WHEN activity_type = 'CorporateAction' THEN 'SPLIT'
+                    WHEN quantity < 0 OR UPPER(COALESCE(activity_subtype, '')) = 'SELL' THEN 'SELL'
+                    ELSE 'BUY'
+                END AS event_type,
+                CASE
+                    WHEN activity_type = 'CorporateAction' THEN quantity
+                    ELSE ABS(quantity)
+                END AS quantity,
+                CASE WHEN activity_type = 'Trade' THEN ABS(net_cash_amount) END AS amount_cad,
+                transaction_currency AS amount_currency,
+                CAST(NULL AS DECIMAL(18, 8)) AS fx_rate,
+                'activities' AS source,
+                1 AS source_priority
+            FROM activities
+            WHERE ticker_id IS NOT NULL
+              AND (
+                    activity_type = 'Trade'
+                    OR (activity_type = 'CorporateAction' AND quantity IS NOT NULL)
+              )
+        ),
+        statement_events AS (
+            SELECT
+                transaction_id AS source_id,
+                ticker_id,
+                COALESCE(execution_date, transaction_date) AS event_date,
+                UPPER(transaction_type) AS event_type,
+                ABS(quantity) AS quantity,
+                CASE WHEN UPPER(transaction_type) = 'BUY' THEN debit ELSE credit END AS amount_cad,
+                'CAD' AS amount_currency,
+                fx_rate,
+                'statements' AS source,
+                2 AS source_priority
+            FROM transactions
+            WHERE UPPER(transaction_type) IN ('BUY', 'SELL')
+              AND superseded_by_activity_id IS NULL
+        ),
+        email_events AS (
+            SELECT
+                email_transaction_id AS source_id,
+                ticker_id,
+                transaction_date AS event_date,
+                CASE WHEN UPPER(transaction_type) LIKE '%SELL%' THEN 'SELL' ELSE 'BUY' END AS event_type,
+                ABS(quantity) AS quantity,
+                total_cost AS amount_cad,
+                'CAD' AS amount_currency,
+                CAST(NULL AS DECIMAL(18, 8)) AS fx_rate,
+                'email' AS source,
+                3 AS source_priority
+            FROM email_transactions
+            WHERE ticker_id IS NOT NULL
+              AND ticker_resolution_status = 'resolved'
+              AND reconciliation_status = 'provisional'
+              AND (UPPER(transaction_type) LIKE '%BUY%' OR UPPER(transaction_type) LIKE '%SELL%')
+        )
+        SELECT * FROM activity_events
+        UNION ALL
+        SELECT * FROM statement_events
+        UNION ALL
+        SELECT * FROM email_events
+        """
+    )
 
 
 def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
@@ -392,6 +547,11 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
                 debit DECIMAL(20, 4),
                 credit DECIMAL(20, 4),
                 fx_rate DECIMAL(18, 8),
+                -- Soft link to activities.activity_id, deliberately not a
+                -- FOREIGN KEY: reconciliation passes bulk-UPDATE this table,
+                -- and DuckDB disallows updating a table that is a live FK
+                -- target from another table's column.
+                superseded_by_activity_id BIGINT,
                 FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id),
                 UNIQUE (
                     transaction_date,
@@ -496,10 +656,14 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
                 price_currency VARCHAR(10),
                 ticker_resolution_status VARCHAR NOT NULL DEFAULT 'resolved',
                 reconciliation_status VARCHAR NOT NULL DEFAULT 'provisional',
+                -- Soft links to transactions.transaction_id / activities.activity_id,
+                -- deliberately not FOREIGN KEYs: reconciliation passes bulk-UPDATE
+                -- both parent tables, and DuckDB disallows updating a table that
+                -- is a live FK target from another table's column.
                 matched_transaction_id BIGINT,
+                matched_activity_id BIGINT,
                 FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id),
                 FOREIGN KEY (email_message_id) REFERENCES email_messages(email_message_id),
-                FOREIGN KEY (matched_transaction_id) REFERENCES transactions(transaction_id),
                 UNIQUE (
                     account,
                     transaction_type,
@@ -513,6 +677,7 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
             )
             """
         )
+        _create_position_engine_tables(connection)
         connection.execute(
             """
             INSERT INTO schema_metadata (component, schema_version)
@@ -539,6 +704,9 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
                 "Database schema is active at version %d",
                 DATABASE_SCHEMA_VERSION,
             )
+            # View logic ships with code, not with the DB file, so it is
+            # recreated on every startup regardless of migration state.
+            _create_trade_events_view(connection)
             return False
 
         existing_tables = _get_table_names(connection)
@@ -816,14 +984,30 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
                     )
                     connection.execute(
                         "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
-                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                        [9, SCHEMA_COMPONENT],
                     )
                     connection.execute("COMMIT")
                 except Exception:
                     connection.execute("ROLLBACK")
                     logger.exception("Database migration from version 8 failed")
                     raise
-                logger.info("Database migrated from schema version 8 to %d", DATABASE_SCHEMA_VERSION)
+                logger.info("Database migrated from schema version 8 to 9")
+                row = (9,)
+            if row and row[0] == 9:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    _apply_v10_position_engine_schema(connection)
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 9 failed")
+                    raise
+                logger.info("Database migrated from schema version 9 to %d", DATABASE_SCHEMA_VERSION)
+                _create_trade_events_view(connection)
                 return False
         if existing_tables:
             raise RuntimeError(
@@ -836,5 +1020,6 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
             DATABASE_SCHEMA_VERSION,
         )
         _deploy_schema(connection)
+        _create_trade_events_view(connection)
         logger.info("Database schema creation complete")
         return True

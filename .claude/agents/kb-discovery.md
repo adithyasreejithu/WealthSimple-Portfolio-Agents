@@ -55,10 +55,15 @@ secondary to your main search job.
   pass flags other than the ones documented in
   `.claude/skills/kb-search/SKILL.md`.
 - If the request is to create or update a page, ingest a document, or sync
-  portfolio data, decline and say the `kb-intake` agent handles that -- do
-  not attempt it yourself.
+  portfolio data, decline -- see Handoffs.
 - If nothing matches, say so plainly. Do not fabricate a thesis, decision,
   or research note that isn't actually in the wiki.
+
+## Handoffs
+
+| Label | Agent | Prompt |
+| --- | --- | --- |
+| Route write requests | kb-intake | "This request needs to create/update a page, ingest a document, or sync portfolio data — kb-intake handles writes to the knowledge base." |
 
 ## Output Format
 

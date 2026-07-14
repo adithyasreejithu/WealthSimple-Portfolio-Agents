@@ -55,6 +55,38 @@ so the page appears under its new status view. Does not touch Decision,
 Confidence, or Time Horizon — edit those directly with `Edit` if they also
 changed.
 
+## `ingest_recommendation.py`
+
+Commits a validated `stock-recommendation.v1` artifact (from the `stock-analyst`
+agent, under `exports/stock-recommendations/`) into an existing `stocks/TICKER.md`.
+Deterministic parts only:
+
+- Re-validates the artifact against `decision-rubric.yml` (reusing the analyst's
+  `validate_recommendation.py`); refuses an invalid artifact.
+- Requires the page to already exist (creation stays an explicit `create` step).
+- Rewrites the Status block's **Decision / Confidence / Time Horizon / Last
+  Updated** lines only. **Portfolio Status is never changed here** — a Sell
+  recommendation is decision support, not a position change; only a
+  user-confirmed trade drives `set-status`.
+- Appends one Decision History row: `| date | Action | verdict | Rubric v1.x
+  score X.XX; <exec summary> |` (append-only, like every other Decision History
+  row).
+- Appends one `decision-log` and one `update-log` row.
+- Idempotence guard: refuses an artifact whose `generated` date is older than the
+  latest rubric-driven Decision History row already on the page.
+
+The prose sections (Updated Thesis, analysis `section_updates`, **Analyst View**,
+Bull/Bear, Key Risks, Open Questions, Monitoring, Sources) are transcribed from
+the artifact's `narratives` by the agent with `Edit` afterward — the script does
+not write prose, and Original Thesis is never touched.
+
+## Analyst View section
+
+`## Analyst View` is the model's own qualitative opinion, kept distinct from the
+mechanical rubric verdict in the Status block. Unlike Original Thesis and
+Decision History, it is **rewritten each update** (not append-only). It may
+agree with or dissent from the Decision, but it never overrides it.
+
 ## `append_log.py` columns
 
 | `--log` | Columns |

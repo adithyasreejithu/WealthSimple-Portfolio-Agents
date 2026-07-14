@@ -45,6 +45,28 @@ class StatementExtractorTest(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertIn("FX Rate: 1.4664", merged.loc[0, "raw_text"])
 
+    def test_wrapped_row_with_money_on_continuation_line_is_not_dropped(self):
+        # Shaped after the META/CDZ statement rows found during holdings
+        # reconciliation (docs/holdings_reconciliation_2026-07-07.md): a wide
+        # description pushes the debit/credit/balance cells onto the wrapped
+        # continuation line instead of the dated first line.
+        raw = pd.DataFrame(
+            [
+                ["Date", "Transaction Description", "", "Debit ($)", "Credit ($)", "Balance ($)"],
+                ["2025-11-04", "BUY", "META - Meta Platforms Inc: Bought 0.1919 shares (executed at", "", "", ""],
+                ["", "", "2025-11-04)", "$180.45", "$0.00", "$412.10"],
+            ]
+        )
+
+        merged = merge_wrapped_activity_rows(raw)
+        parsed = parse_activity_rows(merged)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(parsed.loc[0, "debit"], "$180.45")
+        self.assertEqual(parsed.loc[0, "credit"], "$0.00")
+        self.assertEqual(parsed.loc[0, "balance"], "$412.10")
+        self.assertEqual(parsed.loc[0, "quantity"], "0.1919")
+
     def test_parse_activity_rows_retains_statement_code_and_expanded_fields(self):
         rows = pd.DataFrame(
             {

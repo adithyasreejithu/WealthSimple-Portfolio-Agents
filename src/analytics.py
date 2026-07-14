@@ -15,6 +15,7 @@ import yaml
 from config import (
     DATABASE_PATH,
     DEFAULT_BENCHMARK_SYMBOL,
+    FX_PAIR_SYMBOL,
     POLICY_FILE,
     SINGLE_NAME_MAX_WEIGHT,
     STALE_PRICE_MAX_AGE_DAYS,
@@ -22,6 +23,7 @@ from config import (
     WEALTHSIMPLE_FX_FEE_RATE,
 )
 from database import get_shared_connection
+from position_engine import ensure_positions_fresh, latest_fx_rate
 from portfolio_metrics import (
     calculate_adjusted_daily_returns,
     calculate_adjusted_sharpe_ratio,
@@ -62,6 +64,16 @@ def _date(value: Any) -> date:
 
 @dataclass(frozen=True)
 class Holding:
+    """A current position, valued in CAD unless a `_mkt` field says otherwise.
+
+    `cost_basis` and `market_value` are always CAD (average-cost book value
+    and quantity * price * fx respectively), so allocation weights,
+    concentration, and portfolio totals can sum across USD- and CAD-listed
+    holdings without a currency-mixing bug. `market_value_mkt` and
+    `unrealized_mkt` carry the same figures in the ticker's listing currency,
+    matching the units a broker holdings export reports unrealized P/L in.
+    """
+
     ticker_id: int
     ticker_symbol: str
     exchange: str
@@ -75,6 +87,11 @@ class Holding:
     last_price_date: date | None = None
     provisional_quantity: Decimal = Decimal("0")
     has_provisional_activity: bool = False
+    market_value_mkt: Decimal = Decimal("0")
+    cost_basis_mkt: Decimal = Decimal("0")
+    unrealized_mkt: Decimal = Decimal("0")
+    realized_gain_cad: Decimal = Decimal("0")
+    data_quality_flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -91,46 +108,24 @@ class PortfolioSummary:
 
 
 def _get_net_positions(db_path: str = DATABASE_PATH) -> list[Holding]:
-    """Reconstruct every nonzero net position, positive or negative.
+    """Reconstruct every position needing attention, positive or flagged, from
+    `position_snapshots` -- the average-cost engine's output (see
+    `position_engine.py` and `docs/architecture/ingestion_and_reconciliation.md`).
 
-    A negative net position means recorded sells exceed recorded buys (a data
-    or reconciliation issue), so callers must not treat it as a live holding.
+    Includes zero-quantity positions the engine flagged (e.g. an oversell
+    clamped to zero rather than left negative -- see `position_engine.py`'s
+    SELL handling) so a "sold more than bought" data error stays visible to
+    `get_excluded_positions`/`build_data_quality` instead of silently
+    disappearing once quantity reaches exactly zero. `cost_basis`/`market_value`
+    are CAD; `market_value_mkt`/`unrealized_mkt` are in the ticker's own
+    listing currency.
     """
     connection = get_shared_connection(db_path)
+    ensure_positions_fresh(connection)
+
     rows = connection.execute(
         """
-        WITH statement_positions AS (
-            SELECT
-                ticker_id,
-                SUM(CASE WHEN UPPER(transaction_type) = 'SELL'
-                         THEN -ABS(quantity) ELSE ABS(quantity) END) AS total_amount,
-                SUM(COALESCE(debit, 0)) AS total_debit,
-                SUM(COALESCE(credit, 0)) AS total_credit
-            FROM transactions
-            WHERE UPPER(transaction_type) IN ('BUY', 'SELL')
-            GROUP BY ticker_id
-        ),
-        email_positions AS (
-            SELECT ticker_id,
-                   SUM(CASE WHEN UPPER(transaction_type) LIKE '%SELL%'
-                            THEN -ABS(quantity) ELSE ABS(quantity) END) AS provisional_amount
-            FROM email_transactions
-            WHERE ticker_id IS NOT NULL
-              AND ticker_resolution_status = 'resolved'
-              AND reconciliation_status = 'provisional'
-              AND (UPPER(transaction_type) LIKE '%BUY%'
-                   OR UPPER(transaction_type) LIKE '%SELL%')
-            GROUP BY ticker_id
-        ),
-        net_transactions AS (
-            SELECT COALESCE(s.ticker_id, e.ticker_id) AS ticker_id,
-                   COALESCE(s.total_amount, 0) + COALESCE(e.provisional_amount, 0) AS total_amount,
-                   COALESCE(s.total_debit, 0) AS total_debit,
-                   COALESCE(s.total_credit, 0) AS total_credit,
-                   COALESCE(e.provisional_amount, 0) AS provisional_amount
-            FROM statement_positions s FULL OUTER JOIN email_positions e USING (ticker_id)
-        ),
-        latest_prices AS (
+        WITH latest_prices AS (
             SELECT DISTINCT ON (ticker_id)
                 ticker_id,
                 record_date,
@@ -145,30 +140,42 @@ def _get_net_positions(db_path: str = DATABASE_PATH) -> list[Holding]:
             t.security_name,
             t.security_type,
             t.currency,
-            nt.total_amount,
-            nt.total_debit,
-            nt.total_credit,
+            s.quantity,
+            s.book_value_cad,
+            s.book_value_mkt,
+            s.provisional_quantity,
+            s.realized_gain_cad,
+            s.data_quality_flags,
             lp.record_date,
-            lp.close,
-            nt.provisional_amount
-        FROM net_transactions nt
-        JOIN tickers t ON t.ticker_id = nt.ticker_id
-        LEFT JOIN latest_prices lp ON lp.ticker_id = nt.ticker_id
-        WHERE COALESCE(nt.total_amount, 0) <> 0
+            lp.close
+        FROM position_snapshots s
+        JOIN tickers t ON t.ticker_id = s.ticker_id
+        LEFT JOIN latest_prices lp ON lp.ticker_id = s.ticker_id
+        WHERE s.quantity <> 0 OR s.data_quality_flags IS NOT NULL
         ORDER BY t.ticker_symbol, t.exchange
         """
     ).fetchall()
+
+    fx_cache: dict[str, Decimal] = {}
     holdings: list[Holding] = []
     for row in rows:
         (
             ticker_id, symbol, exchange, name, security_type, currency,
-            total_amount, debit, credit, price_date, close, provisional,
+            quantity, book_cad, book_mkt, provisional, realized_cad, flags_json,
+            price_date, close,
         ) = row
-        quantity_value = _decimal(total_amount)
-        cost_basis = _decimal(debit) - _decimal(credit)
+        quantity_value = _decimal(quantity)
         last_price = _decimal(close) if close is not None else None
-        # If no usable price exists yet, keep the holding value neutral instead of guessing.
-        market_value = quantity_value * last_price if last_price is not None else Decimal("0")
+        if currency not in fx_cache:
+            fx_cache[currency], _flag = latest_fx_rate(connection, currency)
+        fx_rate = fx_cache[currency]
+
+        market_value_mkt = quantity_value * last_price if last_price is not None else Decimal("0")
+        market_value_cad = market_value_mkt * fx_rate
+        cost_basis_cad = _decimal(book_cad)
+        cost_basis_mkt = _decimal(book_mkt)
+        flags = tuple(json.loads(flags_json)) if flags_json else ()
+
         holdings.append(
             Holding(
                 ticker_id=int(ticker_id),
@@ -178,12 +185,17 @@ def _get_net_positions(db_path: str = DATABASE_PATH) -> list[Holding]:
                 security_type=security_type,
                 currency=currency,
                 quantity=quantity_value,
-                cost_basis=cost_basis,
-                market_value=market_value,
+                cost_basis=cost_basis_cad,
+                market_value=market_value_cad,
                 last_price=last_price,
                 last_price_date=_date(price_date) if price_date is not None else None,
                 provisional_quantity=_decimal(provisional),
                 has_provisional_activity=_decimal(provisional) != 0,
+                market_value_mkt=market_value_mkt,
+                cost_basis_mkt=cost_basis_mkt,
+                unrealized_mkt=market_value_mkt - cost_basis_mkt,
+                realized_gain_cad=_decimal(realized_cad),
+                data_quality_flags=flags,
             )
         )
     return holdings
@@ -195,13 +207,19 @@ def get_holdings(db_path: str = DATABASE_PATH) -> list[Holding]:
 
 
 def get_excluded_positions(db_path: str = DATABASE_PATH) -> list[Holding]:
-    """Return net-negative positions excluded from current-holdings analytics.
+    """Return positions excluded from current-holdings analytics as a data error.
 
     A negative quantity means recorded sells exceed recorded buys for that
-    ticker, which points at a reconciliation or data-entry issue rather than a
-    real short position, so these are surfaced only in data-quality reporting.
+    ticker; an `oversell_clamped` flag means the position engine clamped an
+    oversell at zero rather than let it go negative (see `position_engine.py`).
+    Either points at a reconciliation or data-entry issue rather than a real
+    short position, so these are surfaced only in data-quality reporting.
     """
-    return [holding for holding in _get_net_positions(db_path) if holding.quantity < 0]
+    return [
+        holding
+        for holding in _get_net_positions(db_path)
+        if holding.quantity < 0 or "oversell_clamped" in holding.data_quality_flags
+    ]
 
 
 def get_cash_summary(db_path: str = DATABASE_PATH) -> CashSummary:
@@ -259,50 +277,43 @@ def get_position(ticker_id: int, db_path: str = DATABASE_PATH) -> Holding:
 def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[str, Any]]:
     """Build a chronological valuation series (securities + cash) as one set-based query.
 
-    Quantities are signed BUY/SELL deltas (statement and provisional email
-    activity) cumulatively summed per ticker and clamped at zero so a
-    data-error negative position never subtracts from the series, matching
-    ``get_holdings`` excluding negative net positions from current value.
-    Prices are carried forward from the latest known close on or before each
-    date. Cash uses the latest explicit balance on or before each date,
-    falling back to cumulative net cash flow, mirroring ``get_cash_summary``.
+    Quantities come from `position_ledger`'s running_quantity (the average-cost
+    engine's deduplicated, split-adjusted event stream), taking each ticker's
+    last event of the day and forward-filling across the date grid; a
+    data-error negative position is clamped at zero, matching ``get_holdings``
+    excluding negative net positions from current value. Prices are carried
+    forward from the latest known close on or before each date and converted
+    to CAD using the configured FX pair's close (forward-filled the same way),
+    so the series stays in one currency throughout. Cash uses the latest
+    explicit balance on or before each date, falling back to cumulative net
+    cash flow, mirroring ``get_cash_summary``.
     """
     connection = get_shared_connection(db_path)
+    ensure_positions_fresh(connection)
     rows = connection.execute(
         """
-        WITH statement_deltas AS (
-            SELECT ticker_id, transaction_date AS d,
-                   SUM(CASE WHEN UPPER(transaction_type) = 'SELL'
-                            THEN -ABS(quantity) ELSE ABS(quantity) END) AS dq
-            FROM transactions
-            WHERE UPPER(transaction_type) IN ('BUY', 'SELL')
-            GROUP BY ticker_id, transaction_date
-        ),
-        email_deltas AS (
-            SELECT ticker_id, transaction_date AS d,
-                   SUM(CASE WHEN UPPER(transaction_type) LIKE '%SELL%'
-                            THEN -ABS(quantity) ELSE ABS(quantity) END) AS dq
-            FROM email_transactions
-            WHERE ticker_id IS NOT NULL
-              AND ticker_resolution_status = 'resolved'
-              AND reconciliation_status = 'provisional'
-              AND (UPPER(transaction_type) LIKE '%BUY%' OR UPPER(transaction_type) LIKE '%SELL%')
-            GROUP BY ticker_id, transaction_date
-        ),
-        deltas AS (
-            SELECT ticker_id, d, SUM(dq) AS dq
+        WITH day_end_state AS (
+            SELECT ticker_id, event_date AS d, running_quantity AS qty
             FROM (
-                SELECT ticker_id, d, dq FROM statement_deltas
-                UNION ALL
-                SELECT ticker_id, d, dq FROM email_deltas
+                SELECT ticker_id, event_date, running_quantity,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY ticker_id, event_date ORDER BY ledger_id DESC
+                       ) AS rn
+                FROM position_ledger
             )
-            GROUP BY ticker_id, d
+            WHERE rn = 1
         ),
-        traded_tickers AS (SELECT DISTINCT ticker_id FROM deltas),
+        traded_tickers AS (SELECT DISTINCT ticker_id FROM day_end_state),
+        fx_history AS (
+            SELECT h.record_date AS d, h.close AS rate
+            FROM historical_records h
+            JOIN tickers t ON t.ticker_id = h.ticker_id
+            WHERE t.ticker_symbol = ?
+        ),
         value_dates AS (
             SELECT DISTINCT value_date
             FROM (
-                SELECT d AS value_date FROM deltas
+                SELECT d AS value_date FROM day_end_state
                 UNION
                 SELECT record_date AS value_date FROM historical_records
                 UNION
@@ -317,14 +328,17 @@ def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[s
         qty_series AS (
             SELECT g.value_date, g.ticker_id,
                    GREATEST(
-                       SUM(COALESCE(d.dq, 0)) OVER (
-                           PARTITION BY g.ticker_id ORDER BY g.value_date
-                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       COALESCE(
+                           LAST_VALUE(des.qty IGNORE NULLS) OVER (
+                               PARTITION BY g.ticker_id ORDER BY g.value_date
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                           ),
+                           0
                        ),
                        0
                    ) AS qty
             FROM grid g
-            LEFT JOIN deltas d ON d.ticker_id = g.ticker_id AND d.d = g.value_date
+            LEFT JOIN day_end_state des ON des.ticker_id = g.ticker_id AND des.d = g.value_date
         ),
         price_series AS (
             SELECT g.value_date, g.ticker_id,
@@ -335,10 +349,25 @@ def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[s
             FROM grid g
             LEFT JOIN historical_records hr ON hr.ticker_id = g.ticker_id AND hr.record_date = g.value_date
         ),
+        fx_series AS (
+            SELECT vd.value_date,
+                   LAST_VALUE(fx.rate IGNORE NULLS) OVER (
+                       ORDER BY vd.value_date
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                   ) AS rate
+            FROM value_dates vd
+            LEFT JOIN fx_history fx ON fx.d = vd.value_date
+        ),
         securities_series AS (
-            SELECT q.value_date, SUM(q.qty * COALESCE(p.close, 0)) AS securities_value
+            SELECT q.value_date,
+                   SUM(
+                       q.qty * COALESCE(p.close, 0) *
+                       CASE WHEN t.currency = 'CAD' THEN 1 ELSE COALESCE(fx.rate, 1) END
+                   ) AS securities_value
             FROM qty_series q
             JOIN price_series p ON p.ticker_id = q.ticker_id AND p.value_date = q.value_date
+            JOIN tickers t ON t.ticker_id = q.ticker_id
+            LEFT JOIN fx_series fx ON fx.value_date = q.value_date
             GROUP BY q.value_date
         ),
         cash_by_date AS (
@@ -367,7 +396,8 @@ def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[s
         LEFT JOIN securities_series sv ON sv.value_date = vd.value_date
         LEFT JOIN cash_series cs ON cs.value_date = vd.value_date
         ORDER BY vd.value_date
-        """
+        """,
+        [FX_PAIR_SYMBOL],
     ).fetchall()
     results: list[dict[str, Any]] = []
     for value_date, securities_value, cash_balance in rows:
@@ -643,33 +673,46 @@ def get_realized_gain_summary(
     date_from: date | None = None,
     date_to: date | None = None,
 ) -> dict[str, Any]:
-    """Calculate realized gains using a running weighted-average CAD cost."""
+    """Calculate realized gains using a running weighted-average CAD cost.
+
+    Reads the deduplicated, split-adjusted ``v_trade_events`` view (see
+    ``database.py``) rather than raw ``transactions``, so a trade recorded in
+    more than one source is counted once and a split adjusts the running
+    share count without disturbing cost basis.
+    """
+    connection = get_shared_connection(db_path)
     # Prior BUY rows are required to establish cost basis even when the report
     # begins later, so only the upper boundary belongs in the SQL ledger query.
-    clause, params = _date_filters(None, date_to, "tr.transaction_date")
-    rows = get_shared_connection(db_path).execute(
+    clause, params = _date_filters(None, date_to, "v.event_date")
+    rows = connection.execute(
         f"""
-        SELECT tr.transaction_date, tr.transaction_type, tr.ticker_id,
-               tr.quantity, tr.debit, tr.credit, t.ticker_symbol
-        FROM transactions tr JOIN tickers t ON t.ticker_id = tr.ticker_id
-        WHERE UPPER(tr.transaction_type) IN ('BUY', 'SELL') {clause}
-        ORDER BY tr.transaction_date, tr.transaction_id
+        SELECT v.event_date, v.event_type, v.ticker_id, v.quantity, v.amount_cad, t.ticker_symbol
+        FROM v_trade_events v JOIN tickers t ON t.ticker_id = v.ticker_id
+        WHERE v.event_type IN ('BUY', 'SELL', 'SPLIT') {clause}
+        ORDER BY v.event_date, v.source_priority, v.source_id
         """, params,
     ).fetchall()
     state: dict[int, tuple[Decimal, Decimal]] = {}
     gains: dict[str, Decimal] = {}
-    for transaction_date, kind, ticker_id, quantity, debit, credit, symbol in rows:
+    for event_date, kind, ticker_id, quantity, amount_cad, symbol in rows:
         held, cost = state.get(int(ticker_id), (Decimal("0"), Decimal("0")))
-        qty = abs(_decimal(quantity))
-        if str(kind).upper() == "BUY":
-            state[int(ticker_id)] = (held + qty, cost + _decimal(debit))
+        qty = _decimal(quantity)
+        if kind == "BUY":
+            state[int(ticker_id)] = (held + qty, cost + _decimal(amount_cad))
+            continue
+        if kind == "SPLIT":
+            state[int(ticker_id)] = (held + qty, cost)
             continue
         sold = min(qty, held)
         allocated_cost = (cost / held) * sold if held > 0 else Decimal("0")
-        if date_from is None or _date(transaction_date) >= date_from:
-            gains[str(symbol)] = gains.get(str(symbol), Decimal("0")) + _decimal(credit) - allocated_cost
+        if date_from is None or _date(event_date) >= date_from:
+            gains[str(symbol)] = gains.get(str(symbol), Decimal("0")) + _decimal(amount_cad) - allocated_cost
         state[int(ticker_id)] = (held - sold, cost - allocated_cost)
-    return {"source": "statements", "by_ticker": gains, "total_realized_gain": sum(gains.values(), Decimal("0"))}
+    return {
+        "source": "v_trade_events",
+        "by_ticker": gains,
+        "total_realized_gain": sum(gains.values(), Decimal("0")),
+    }
 
 
 def get_cash_flow_summary(
@@ -1158,6 +1201,18 @@ def build_data_quality(
                     "ticker_symbol": holding.ticker_symbol,
                     "detail": "Includes unreconciled provisional email activity.",
                     "severity": "info",
+                }
+            )
+        for flag_code in holding.data_quality_flags:
+            flags.append(
+                {
+                    "code": f"position_engine_{flag_code}",
+                    "ticker_symbol": holding.ticker_symbol,
+                    "detail": (
+                        "Position engine could not fully resolve this ticker's book value; "
+                        f"see `docs/architecture/ingestion_and_reconciliation.md` for `{flag_code}`."
+                    ),
+                    "severity": "warning",
                 }
             )
         if holding.last_price_date is None:

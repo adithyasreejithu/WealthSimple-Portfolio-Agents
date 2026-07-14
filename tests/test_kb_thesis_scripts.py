@@ -99,6 +99,12 @@ class CreateTest(ThesisScriptsFixture):
         _, body = kb_pages.parse_page_file(self.kb_root / "stocks" / "ZZZZ.md")
         self.assertIn("Portfolio Role: Unassigned", body)
 
+    def test_create_includes_analyst_view_section(self):
+        self._run_thesis(["create", "--ticker", "AAPL", "--status", "research"])
+        _, body = kb_pages.parse_page_file(self.kb_root / "stocks" / "AAPL.md")
+        self.assertIn("## Analyst View", body)
+        self.assertIn("## Analyst View", thesis_page.REQUIRED_SECTIONS)
+
 
 class ValidateTest(ThesisScriptsFixture):
     def test_valid_page_passes(self):

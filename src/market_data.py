@@ -9,7 +9,7 @@ from typing import Callable, Iterable
 
 import pandas as pd
 
-from config import DATABASE_PATH
+from config import DATABASE_PATH, FX_PAIR_SYMBOL
 from database import get_shared_connection, initialize_database
 from database_command import upload_security_history, upload_security_metadata
 from system_logger import get_logger
@@ -115,6 +115,89 @@ def get_market_targets(
     ]
 
 
+def _ensure_fx_ticker(db_path: Path | str) -> int:
+    """Return the ticker_id for the configured FX pair, creating it if needed.
+
+    Modeled as a `tickers` row with `security_type='fx_rate'` so it reuses
+    `historical_records` storage and forward-fill machinery, but it is not a
+    portfolio holding: `analytics.py`/`position_engine.py` never treat it as
+    an ownable position, and `get_market_targets` never returns it (it has no
+    `ticker_provider_mappings` row and no owned transactions).
+    """
+    connection = get_shared_connection(db_path)
+    row = connection.execute(
+        "SELECT ticker_id FROM tickers WHERE ticker_symbol = ? AND exchange = 'FX'",
+        [FX_PAIR_SYMBOL],
+    ).fetchone()
+    if row:
+        return int(row[0])
+    return int(
+        connection.execute(
+            """
+            INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+            VALUES (?, 'FX', 'CAD', 'USD/CAD Exchange Rate', 'fx_rate')
+            RETURNING ticker_id
+            """,
+            [FX_PAIR_SYMBOL],
+        ).fetchone()[0]
+    )
+
+
+def ensure_fx_history(
+    db_path: Path | str = DATABASE_PATH,
+    *,
+    as_of: date | None = None,
+    history_fetcher: HistoryFetcher = _fetch_security_history_strict,
+) -> int:
+    """Incrementally fetch and store the configured FX pair's daily closes.
+
+    Backfills from the earliest transaction of any kind in the database (so
+    the historical portfolio value series has an FX rate for every date it
+    might need), then fetches forward from the latest stored FX date on
+    subsequent calls. Returns the number of rows written.
+    """
+    today = as_of or date.today()
+    connection = get_shared_connection(db_path)
+    ticker_id = _ensure_fx_ticker(db_path)
+
+    earliest_row = connection.execute(
+        """
+        SELECT MIN(d) FROM (
+            SELECT MIN(transaction_date) AS d FROM transactions
+            UNION ALL
+            SELECT MIN(transaction_date) FROM email_transactions
+            UNION ALL
+            SELECT MIN(transaction_date) FROM activities
+        )
+        """
+    ).fetchone()
+    if not earliest_row or earliest_row[0] is None:
+        return 0
+    earliest_owned_date = earliest_row[0]
+
+    latest_row = connection.execute(
+        "SELECT MAX(record_date) FROM historical_records WHERE ticker_id = ?", [ticker_id]
+    ).fetchone()
+    start = (latest_row[0] + timedelta(days=1)) if latest_row and latest_row[0] else earliest_owned_date
+    if start > today:
+        return 0
+
+    history = history_fetcher([FX_PAIR_SYMBOL], start, today + timedelta(days=1))
+    if history.empty:
+        return 0
+
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        rows = upload_security_history(history, {FX_PAIR_SYMBOL: ticker_id}, db_path)
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        logger.exception("FX history synchronization database write failed")
+        raise
+    logger.info("FX history synchronization complete | symbol=%s | rows=%d", FX_PAIR_SYMBOL, rows)
+    return rows
+
+
 def sync_market_data(
     db_path: Path | str = DATABASE_PATH,
     symbols: Iterable[str] | None = None,
@@ -127,6 +210,13 @@ def sync_market_data(
     """Fetch and atomically persist metadata and incremental price history."""
     initialize_database(db_path)
     today = as_of or date.today()
+    try:
+        ensure_fx_history(db_path, as_of=today, history_fetcher=history_fetcher)
+    except Exception:
+        # FX history backs CAD valuation of USD holdings but is not itself a
+        # portfolio holding; a transient fetch failure here should not abort
+        # syncing the tickers the user actually owns.
+        logger.exception("FX history synchronization failed; continuing with ticker sync")
     targets = get_market_targets(db_path, symbols)
     if not targets:
         return MarketSyncResult(0, 0, 0)

@@ -1,5 +1,10 @@
 # Logger Notes
 
+These notes cover the pipeline logger (`src/system_logger.py` →
+`logs/SystemLogs.txt`). Claude Code agent/skill invocations and token usage
+are logged separately to `logs/AgentSkillUsage.txt` — see
+`docs/architecture/usage_tracking.md`.
+
 ## Findings
 
 - `src/system_logger.py` was present but not yet wired into `src/data_sorter.py`.

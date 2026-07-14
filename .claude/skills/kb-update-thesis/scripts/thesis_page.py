@@ -37,6 +37,7 @@ REQUIRED_SECTIONS = (
     "## Portfolio Fit",
     "## Bull Case",
     "## Bear Case",
+    "## Analyst View",
     "## Key Risks",
     "## Open Questions",
     "## Decision History",

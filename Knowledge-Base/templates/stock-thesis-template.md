@@ -20,6 +20,13 @@ constrained by [../taxonomy/decision-framework.yml](../taxonomy/decision-framewo
 **Immutability rules:** once written, *Original Thesis* is never edited — new
 thinking goes in *Updated Thesis*. *Decision History* rows are append-only.
 
+**Sell/trim decisions and portfolio reviews live here too** — there is no
+separate decision-record page type. A sell or trim updates the `Decision`
+and `status` fields, appends a *Decision History* row (via
+`append_log.py decision`), and explains the reasoning in *Updated Thesis*.
+A portfolio review is the same treatment applied across the affected
+tickers' thesis pages, not a standalone review document.
+
 ---
 
 ```markdown
@@ -84,6 +91,13 @@ overlap, currency, diversification effect.
 ## Bull Case
 
 ## Bear Case
+
+## Analyst View
+
+The model's own qualitative opinion, distinct from the mechanical rubric
+verdict in the Status block. State where you agree with or dissent from the
+rubric's action and what the scored numbers miss. Rewritten each update (not
+append-only). Never overrides the Decision field.
 
 ## Key Risks
 

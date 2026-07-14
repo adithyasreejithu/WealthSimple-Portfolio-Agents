@@ -1,5 +1,17 @@
 # TODO
 
+## Priority
+
+- Cross-reference `classify-portfolio`'s holdings against the Knowledge-Base
+  wiki: nothing today diffs "what the DB says I hold" against "what has a
+  `stocks/TICKER.md` page." `classify-portfolio` only connects to DuckDB and
+  never reads `Knowledge-Base/`; `kb-search`/`kb-discovery` only read the wiki
+  and never touch the database. Add a step (likely owned by `kb-discovery` or
+  a new skill) that reports held tickers with no thesis page, and/or thesis
+  pages for tickers no longer held.
+
+## Backlog
+
 - Add operational monitoring for partial email runs and failed Yahoo symbols.
 - Add a review command for email/statement rows that cannot be reconciled by ticker,
   direction, execution date, and quantity.

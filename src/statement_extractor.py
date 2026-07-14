@@ -88,6 +88,37 @@ def _normalize_raw_activity_table(df: pd.DataFrame) -> pd.DataFrame:
     return trim_activity_table(data)
 
 
+def _close_activity_group(lines: list[str]) -> str:
+    """Compose one activity row's text, extracting money from whichever line has it.
+
+    Money almost always sits at the end of the dated (first) line, but a wide
+    description can push the PDF table extraction to place the debit/credit/
+    balance cells on a wrapped continuation line instead. Trying only the
+    first line (as the original implementation did) silently dropped money
+    for exactly the wide-description rows that wrap, leaving BUY/SELL rows
+    with NULL debit/credit -- the root cause behind the META/CDZ statement
+    rows found during holdings reconciliation
+    (docs/holdings_reconciliation_2026-07-07.md). Trying the fully merged
+    group text as a fallback recovers those cases without changing the
+    common case where money is already on the first line.
+    """
+    if not lines:
+        return ""
+    prefix, money = _split_money_from_text(lines[0])
+    if all(money.values()):
+        return _compose_activity_text([prefix, *lines[1:]], money)
+
+    merged = _merge_text(lines)
+    remainder, merged_money = _split_money_from_text(merged)
+    if all(merged_money.values()):
+        return _compose_activity_text([remainder], merged_money)
+
+    # No line, nor the full merged text, contains a complete money triple;
+    # keep the raw merged text so downstream parsing still sees the amounts
+    # if they are only partially present, rather than discarding them.
+    return merged
+
+
 def merge_wrapped_activity_rows(df: pd.DataFrame) -> pd.DataFrame:
     """Merge continuation rows into the preceding dated activity row."""
     data = _normalize_raw_activity_table(df)
@@ -96,7 +127,6 @@ def merge_wrapped_activity_rows(df: pd.DataFrame) -> pd.DataFrame:
 
     groups: list[str] = []
     current: list[str] = []
-    current_money = {"debit": None, "credit": None, "balance": None}
 
     for _, row in data.iterrows():
         text = _row_text(row)
@@ -104,15 +134,14 @@ def merge_wrapped_activity_rows(df: pd.DataFrame) -> pd.DataFrame:
             continue
         if DATE_CODE_PATTERN.match(text):
             if current:
-                groups.append(_compose_activity_text(current, current_money))
-            prefix, current_money = _split_money_from_text(text)
-            current = [prefix]
+                groups.append(_close_activity_group(current))
+            current = [text]
             continue
         if current:
             current.append(text)
 
     if current:
-        groups.append(_compose_activity_text(current, current_money))
+        groups.append(_close_activity_group(current))
 
     return pd.DataFrame({"raw_text": groups})
 

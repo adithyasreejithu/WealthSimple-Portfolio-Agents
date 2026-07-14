@@ -59,7 +59,12 @@ Claude Code uses these folders for different jobs:
 
 ## Current Repo Mapping
 
-The repo has `CLAUDE.md` and the `.claude/` tree with one real agent (`portfolio-classifier`) and its three skills.
+The repo has `CLAUDE.md` and the `.claude/` tree with six real agents:
+`portfolio-classifier` and `holdings-reconciliation` (each a single
+deterministic report workflow), `kb-discovery` and `kb-intake` (read and
+write sides of the research wiki), and the stock decision-support pipeline
+`stock-data-prep` and `stock-analyst` (mechanical prep vs. rubric judgment;
+see `docs/architecture/decision_support_flow.md`).
 
 | Current file or folder | What it does now | Recommendation |
 | --- | --- | --- |
@@ -70,6 +75,7 @@ The repo has `CLAUDE.md` and the `.claude/` tree with one real agent (`portfolio
 | `src/data_sorter.py` | Cleans Wealthsimple activity CSV exports and moves processed source files. | Good candidate for a data-pipeline subagent to inspect during refactors. |
 | `src/system_logger.py` | Provides shared file-backed logging. | Mention in `CLAUDE.md` so future runtime code uses it. |
 | `.claude/skills/classify-portfolio/scripts/` | Holds the classification workflow modules (`classification_workflow.py`, `portfolio_classifier.py`) used only by the classifier agent. | Keep agent-only Python beside its skill, not in `src/`. |
+| `.claude/skills/reconcile-holdings-report/scripts/` | Holds `generate_reconciliation_report.py`, the deterministic markdown-report renderer used only by the `holdings-reconciliation` agent (see `docs/agents/holdings-reconciliation/`). Calls existing `src/holdings_reconciler.py`/`src/analytics.py` functions rather than reimplementing reconciliation logic. | Keep agent-only Python beside its skill, not in `src/`. |
 | `tests/` | Verifies config, extraction, and classification behavior. | Mention the test command in `CLAUDE.md`. |
 | `.env` | Local runtime secrets and environment-specific values. | Do not move secrets into `CLAUDE.md` or `src/config.py`. |
 
@@ -105,6 +111,7 @@ Front matter fields:
 | `model` | Yes | `inherit`, `haiku`, `sonnet`, or `opus`. |
 | `color` | Yes | Visual identifier in the UI. |
 | `tools` | No | Array restricting the agent to specific tools (least privilege). |
+| `skills` | No | Array of skill names this agent depends on — dependency documentation only, not enforced by Claude Code. |
 
 Example `.claude/agents/reviewer.md`:
 
@@ -143,6 +150,26 @@ Look for broken assumptions, data loss risks, weak validation, and missing tests
 Treat Data/, exports/, logs/, and .env as sensitive local artifacts.
 Return a concise summary with risks, affected files, and recommended tests.
 ```
+
+### Handoffs between agents
+
+No agent in this repo holds the `Task` tool, so agents cannot invoke each
+other directly. When an agent's work is meant to continue in another agent
+(e.g. `stock-data-prep` finishing a worksheet that `stock-analyst` must
+score), document that as a `## Handoffs` section in the agent's body, placed
+after `## Guardrails` and before `## Output Format`:
+
+| Label | Agent | Prompt |
+| --- | --- | --- |
+| Short description of the trigger | target-agent-name | Exact prompt text to send when invoking it |
+
+This is the single canonical place for cross-agent handoff instructions --
+don't duplicate the same "call X next" guidance in `When to invoke`,
+`Workflow`, or `Output Format`; point back to `Handoffs` instead. The table
+is prose read by the orchestrating Claude session or the user, not an
+executable mechanism. Agents with no downstream handoff should state that
+explicitly (e.g. "None -- this agent's output is terminal.") rather than
+omitting the section, so its absence is never ambiguous with an oversight.
 
 ### `.claude/skills/*/SKILL.md`
 

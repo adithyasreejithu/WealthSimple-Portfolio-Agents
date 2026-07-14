@@ -86,9 +86,12 @@ class AnalyticsTest(unittest.TestCase):
 
         holding = get_position(ticker_id, self.db_path)
 
+        # Average-cost accounting: 10 shares bought at $100/share average;
+        # selling 4 reduces the book by 4 * $100 = $400 (not by the $480 sale
+        # proceeds), leaving 6 shares at $600 book value.
         self.assertEqual(holding.quantity, Decimal("6"))
-        self.assertEqual(holding.cost_basis, Decimal("520"))
-        self.assertEqual(holding.market_value, Decimal("552"))
+        self.assertEqual(holding.cost_basis, Decimal("600.0000"))
+        self.assertEqual(holding.market_value, Decimal("552.0000"))
 
     def test_resolved_provisional_email_trade_updates_live_quantity(self):
         ticker_id = self._ticker()
@@ -294,7 +297,11 @@ class AnalyticsTest(unittest.TestCase):
 
         self.assertEqual(holdings, [])
         self.assertEqual(len(excluded), 1)
-        self.assertEqual(excluded[0].quantity, Decimal("-3"))
+        # The position engine clamps an oversell at zero rather than letting
+        # the running quantity go negative (see position_engine.py's SELL
+        # handling), flagging it instead so the error stays visible here.
+        self.assertEqual(excluded[0].quantity, Decimal("0.00000000"))
+        self.assertIn("oversell_clamped", excluded[0].data_quality_flags)
         # Portfolio value must not be reduced by the excluded negative position.
         self.assertEqual(summary.portfolio_value, summary.cash.balance)
 
