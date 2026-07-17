@@ -111,33 +111,38 @@ Use this document when signing off, clearing context, or resuming work after a b
 - `src/` is intended to stay flat; there should be no Camelot subfolder or separate extractor runner file.
 - `instructions.md` is the repo-wide implementation guide.
 
-## Next Session: Constrained Portfolio Classification Agent
+## KB/Decision-Support System Status
 
-- Use `docs/plans/constrained_portfolio_classification_agent.md` as the source of
-  truth for the first implementation.
-- The `portfolio-classifier` subagent (`.claude/agents/portfolio-classifier.md`)
-  has one fixed job and one supported prompt: `Classify my portfolio`.
-- Script-backed skills under `.claude/skills/` provide orchestration, read-only
-  portfolio data access, and restricted yfinance classification enrichment.
-- The public agent workflow may invoke only the classification orchestrator. The
-  database and yfinance scripts are constrained implementation dependencies, not
-  open-ended tools exposed to the agent.
-- Open the configured DuckDB database with `read_only=True`. Do not accept SQL or a
-  production database path from the prompt or command line.
-- Use hard-coded, parameterized database queries and return only approved holdings,
-  security metadata, transaction-derived context, and verified provider symbols.
-- Select yfinance modes internally by security type. Allow only `identity`,
-  `equity-classification`, and `etf-classification`; do not expose mode or field
-  selection to the agent.
-- Yfinance may fill only empty allowlisted fields. It must never replace populated
-  database values or write enrichment results to DuckDB or a cache.
-- Apply manual overrides and the YAML classification rules deterministically. Send
-  incomplete or conflicting records to `Needs Review`.
-- Emit schema-validated JSON with field-level provenance and per-ticker enrichment
-  errors. One ticker failure must not abort the remaining portfolio.
-- Before implementation is complete, test that the database is unchanged, arguments
-  cannot escape the allowlists, yfinance is mocked in unit tests, and malformed
-  policy or output data fails safely.
+The research knowledge base and decision-support system (`.claude/agents/_archive/`,
+`.claude/skills/_archive/`) was archived per `docs/plans/goals/project-vision.md`
+Phase 0. It is real, substantial work that is parked as reference material, not
+abandoned. The system includes agents (`kb-discovery`, `kb-intake`, `stock-data-prep`,
+`stock-analyst`, `holdings-reconciliation`) and supporting skills for thesis
+management, portfolio classification, and stock research scoring. It will be
+rebuilt incrementally per `docs/plans/goals/development-roadmap.md` (Phases 4–5:
+single-ticker decision support, then portfolio-wide scaling), not restored in
+one pass. The archived code and rubric serve as the design baseline for this
+future work.
+
+## Next Session: Phase 2 — Pipeline Hardening
+
+Per `docs/plans/goals/development-roadmap.md`, Phase 2 focuses on the data
+pipeline foundation:
+
+- Separate activity-export database orchestration out of `data_sorter.py` into
+  its own pipeline stage.
+- Add FX-normalized cross-currency portfolio totals.
+- Add operational monitoring for partial email syncs and failed Yahoo symbol
+  lookups.
+- Add a review command for statement/email rows that can't be reconciled
+  automatically.
+- Cross-reference `classify-portfolio` holdings against the Knowledge-Base wiki
+  (held tickers with no thesis page, and vice versa) — marked as `Priority` in
+  `docs/project/todo.md`.
+
+Exit criteria: pipeline runs end to end from a fresh `Data/` drop with no manual
+intervention; full test suite green; `analytics` output matches actual current
+holdings with no known gaps.
 
 ## Next Session: Activity Export Pipeline
 

@@ -1,8 +1,8 @@
 # Agent Development Lessons Learned
 
 Retrospective from the `Agent-Development` branch (portfolio classifier,
-holdings reconciliation, and the stock decision-support system: `kb-discovery`,
-`kb-intake`, `stock-data-prep`, `stock-analyst`). Written for planning the next
+holdings reconciliation, and the stock decision-support system: `[old] kb-discovery`,
+`[old] kb-intake`, `[old] stock-data-prep`, `[old] stock-analyst`). Written for planning the next
 agent/skill project — what worked, what broke, and what to design for up front
 rather than retrofit later.
 
@@ -16,13 +16,13 @@ The single biggest structural decision: one Claude Code agent runs on one
 model, so any workflow mixing cheap deterministic steps with expensive
 reasoning should be **two agents**, not one agent doing both.
 
-- `stock-data-prep` (haiku) — fetch data, read context, build a worksheet.
+- `[old] stock-data-prep` (haiku) — fetch data, read context, build a worksheet.
   Zero judgment.
-- `stock-analyst` (opus) — score the worksheet against a rubric, write
+- `[old] stock-analyst` (opus) — score the worksheet against a rubric, write
   narratives. Only judgment.
 
 Applied the same way to ETF vs. equity scoring: fund-track judgment is
-materially simpler than company judgment, so ETF-batch `stock-analyst` runs
+materially simpler than company judgment, so ETF-batch `[old] stock-analyst` runs
 get a `model: sonnet` override on the Agent tool call rather than a separate
 agent definition. A deterministic validator recomputes the actual math
 regardless of which model scored it, so verdict quality can't drift with the
@@ -54,7 +54,7 @@ decision without a recompute step.
 
 ## 3. Constrain agents by tool access and script wrappers, not prompt wording
 
-The `portfolio-classifier` agent's access model: no arbitrary SQL, no
+The `[old] portfolio-classifier` agent's access model: no arbitrary SQL, no
 database path input, no raw ticker lists, no yfinance field/mode selection —
 all enforced via `tools: ["Bash"]` restricting it to script wrappers, and the
 wrapper scripts hard-coding the allowed queries/modes internally. The
@@ -70,7 +70,7 @@ to just what invokes that wrapper.
 
 `src/` is for pipeline code with no single owner. Code used by exactly one
 skill/agent belongs in that skill's `scripts/` directory (e.g.
-`classify-portfolio/scripts/`, `evaluate-stock-decision/scripts/`). This was
+`[old] classify-portfolio/scripts/`, `[old] evaluate-stock-decision/scripts/`). This was
 a repo convention set early and held throughout — it kept `src/` from
 accumulating one-off logic and made each skill's dependencies self-contained.
 
@@ -99,7 +99,7 @@ Root causes, in order of impact:
    is explicitly told never to Read the large JSON directly.
 3. **A fully deterministic step routed through one LLM agent spawn per
    unit of work.** Committing N tickers to the wiki via N separate
-   `kb-intake` spawns cost ~1M+ tokens each for work with no judgment in it
+   `[old] kb-intake` spawns cost ~1M+ tokens each for work with no judgment in it
    at all. Fix: one agent invocation loops the deterministic script over
    the whole batch sequentially — the loop belongs in Bash, not in N agent
    contexts.
@@ -142,7 +142,7 @@ just a final pass/fail gate.
 ## 6. Fan out per-unit-of-work; never loop N items inside one agent
 
 Observed directly as an anti-pattern on the first full-portfolio run: handing
-one `stock-data-prep` agent a list of all 23 tickers to loop over internally
+one `[old] stock-data-prep` agent a list of all 23 tickers to loop over internally
 serialized the entire fetch/score phase into one long sequential pass,
 throwing away all available parallelism.
 

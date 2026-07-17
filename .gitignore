@@ -17,5 +17,6 @@
 !tests/**
 !.claude/
 !.claude/**
+!pyproject.toml
 __pycache__/
 *.pyc*
