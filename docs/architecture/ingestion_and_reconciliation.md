@@ -229,7 +229,7 @@ fingerprint no longer matches; this runs at the end of every pipeline run
 (`app.py::run_pipeline`) and inside every `analytics.py` holdings read. The
 classify-portfolio skill's read-only connection cannot recompute itself, so
 `read_classification_data.py` checks the same fingerprint and raises an
-actionable `RuntimeError` naming `python src/app.py recompute-positions`
+actionable `RuntimeError` naming `uv run python src/app.py recompute-positions`
 instead of silently reading stale data. A freshly migrated or rebuilt
 database has empty `position_snapshots`, which is trivially stale, so the
 very first read anywhere triggers a full compute with no manual step.
@@ -296,13 +296,13 @@ this document has moved to the unified sources.
 To rebuild from scratch (a fresh database, or after a bulk data change):
 
 1. Import statements, the activities export, and emails in any order —
-   `python src/app.py pipeline` (or the individual `statements` / `import-activities`
+   `uv run python src/app.py pipeline` (or the individual `statements` / `import-activities`
    / `email` commands) runs both reconciliation passes automatically after
    each publish.
-2. `python src/app.py recompute-positions` — not required after step 1 (every
+2. `uv run python src/app.py recompute-positions` — not required after step 1 (every
    holdings read self-heals), but useful to force a rebuild and see the
    ticker count it produced.
-3. `python src/app.py reconcile-holdings --report <broker-holdings.csv>` —
+3. `uv run python src/app.py reconcile-holdings --report <broker-holdings.csv>` —
    compare against a broker holdings export. Exit code 0 means every ticker
    matched within tolerance; a nonzero exit prints a per-ticker mismatch
    table (quantity, CAD book value, market-currency unrealized P/L) plus any
@@ -318,5 +318,5 @@ To rebuild from scratch (a fresh database, or after a bulk data change):
   (`fx_stale`/`fx_unavailable`) on a non-CAD holding.
 - **`unrealized_mkt` mismatch** with quantity and book value both matching:
   most often price staleness — the database's last stored close predates the
-  CSV's intraday snapshot. Run `python src/app.py yfinance-sync` to refresh
+  CSV's intraday snapshot. Run `uv run python src/app.py yfinance-sync` to refresh
   prices before concluding it is a real bug.

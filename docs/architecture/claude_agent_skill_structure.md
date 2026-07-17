@@ -220,7 +220,7 @@ Use this skill for changes involving `src/email_extractor.py`, email output colu
 6. Run:
 
 ```powershell
-$env:PYTHONPATH='src'; python -m unittest tests.test_email_extractor tests.test_config
+uv run python -m unittest tests.test_email_extractor tests.test_config
 ```
 
 ## Completion Criteria
@@ -258,7 +258,7 @@ Use this skill for changes involving `src/statement_extractor.py`, PDF activity 
 5. Run:
 
 ```powershell
-$env:PYTHONPATH='src'; python -m unittest tests.test_statement_extractor tests.test_config
+uv run python -m unittest tests.test_statement_extractor tests.test_config
 ```
 
 ## Completion Criteria

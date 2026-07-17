@@ -95,6 +95,62 @@ class ParseTranscriptUsageTests(unittest.TestCase):
         self.assertIsNone(tracker.parse_transcript_usage(path))
 
 
+class ParseTranscriptSpanTests(unittest.TestCase):
+    def _write_transcript(self, lines):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False, encoding="utf-8"
+        )
+        self.addCleanup(Path(handle.name).unlink)
+        handle.write("\n".join(lines))
+        handle.close()
+        return handle.name
+
+    def test_computes_span_across_timestamps(self):
+        path = self._write_transcript(
+            [
+                _transcript_line(timestamp="2026-07-13T18:02:11.000Z"),
+                _transcript_line(timestamp="2026-07-13T18:10:00.000Z"),
+                _transcript_line(timestamp="2026-07-13T18:39:51.000Z"),
+            ]
+        )
+        self.assertEqual(tracker.parse_transcript_span(path), 2260)
+
+    def test_single_timestamp_returns_none(self):
+        path = self._write_transcript(
+            [_transcript_line(timestamp="2026-07-13T18:02:11.000Z")]
+        )
+        self.assertIsNone(tracker.parse_transcript_span(path))
+
+    def test_no_timestamps_returns_none(self):
+        path = self._write_transcript([_transcript_line(), _transcript_line()])
+        self.assertIsNone(tracker.parse_transcript_span(path))
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(tracker.parse_transcript_span("no-such-file.jsonl"))
+
+    def test_malformed_lines_are_skipped(self):
+        path = self._write_transcript(
+            [
+                "not json at all",
+                _transcript_line(timestamp="2026-07-13T18:00:00.000Z"),
+                _transcript_line(timestamp="2026-07-13T18:00:45.000Z"),
+            ]
+        )
+        self.assertEqual(tracker.parse_transcript_span(path), 45)
+
+
+class FormatDurationTests(unittest.TestCase):
+    def test_seconds_only(self):
+        self.assertEqual(tracker._format_duration(45), "45s")
+        self.assertEqual(tracker._format_duration(0), "0s")
+
+    def test_minutes_and_seconds(self):
+        self.assertEqual(tracker._format_duration(125), "2m05s")
+
+    def test_hours_minutes_seconds(self):
+        self.assertEqual(tracker._format_duration(3900), "1h05m00s")
+
+
 class FormatEventTests(unittest.TestCase):
     def test_session_start_block(self):
         entry = tracker.format_event(
@@ -119,6 +175,47 @@ class FormatEventTests(unittest.TestCase):
         )
         self.assertIn("| SESSION END |", entry)
         self.assertIn("reason=other", entry)
+
+    def test_session_end_without_transcript_logs_unknown_duration(self):
+        entry = tracker.format_event(
+            {"hook_event_name": "SessionEnd", "session_id": "a1b2c3d4", "reason": "other"}
+        )
+        self.assertIn("duration=unknown", entry)
+
+    def test_session_end_with_bad_transcript_path_logs_unknown_duration(self):
+        entry = tracker.format_event(
+            {
+                "hook_event_name": "SessionEnd",
+                "session_id": "a1b2c3d4",
+                "reason": "other",
+                "transcript_path": "no-such-transcript.jsonl",
+            }
+        )
+        self.assertIn("duration=unknown", entry)
+
+    def test_session_end_with_transcript_logs_duration(self):
+        transcript = tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False, encoding="utf-8"
+        )
+        self.addCleanup(Path(transcript.name).unlink)
+        transcript.write(
+            "\n".join(
+                [
+                    _transcript_line(timestamp="2026-07-13T18:02:11.000Z"),
+                    _transcript_line(timestamp="2026-07-13T18:39:51.000Z"),
+                ]
+            )
+        )
+        transcript.close()
+        entry = tracker.format_event(
+            {
+                "hook_event_name": "SessionEnd",
+                "session_id": "a1b2c3d4",
+                "reason": "other",
+                "transcript_path": transcript.name,
+            }
+        )
+        self.assertIn("duration=37m40s", entry)
 
     def test_skill_line(self):
         entry = tracker.format_event(

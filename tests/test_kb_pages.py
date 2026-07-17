@@ -173,5 +173,93 @@ class SlugifyTest(unittest.TestCase):
         self.assertEqual(kb_pages.slugify("***"), "untitled")
 
 
+FULL_STATUS_BODY = """# AAPL -- Apple Inc.
+
+## Status
+
+- Portfolio Status: active
+- Portfolio Role: Quality
+- Decision: Hold
+- Confidence: High
+- Time Horizon: Long-term
+- Last Updated: 2026-07-14
+
+## Decision History
+
+| Date | Action | Verdict | Note |
+|---|---|---|---|
+| 2026-05-01 | Buy | new | Rubric v1.0 score 4.10; initial add. |
+| 2026-07-14 | Hold | unchanged | Rubric v1.3 score 3.62; thesis intact. |
+
+## Company Overview
+"""
+
+EMPTY_HISTORY_BODY = """# NEW -- New Co.
+
+## Status
+
+- Portfolio Status: watchlist
+- Decision: Watchlist
+- Confidence: Low
+- Time Horizon: Medium-term
+- Last Updated: 2026-07-15
+
+## Decision History
+
+| Date | Action | Verdict | Note |
+|---|---|---|---|
+
+## Company Overview
+"""
+
+
+class ParseStatusBlockTest(unittest.TestCase):
+    def test_extracts_all_present_keys(self):
+        status = kb_pages.parse_status_block(FULL_STATUS_BODY)
+        self.assertEqual(status["portfolio_status"], "active")
+        self.assertEqual(status["portfolio_role"], "Quality")
+        self.assertEqual(status["decision"], "Hold")
+        self.assertEqual(status["confidence"], "High")
+        self.assertEqual(status["time_horizon"], "Long-term")
+        self.assertEqual(status["last_updated"], "2026-07-14")
+
+    def test_absent_keys_omitted(self):
+        status = kb_pages.parse_status_block(EMPTY_HISTORY_BODY)
+        self.assertNotIn("portfolio_role", status)
+        self.assertEqual(status["decision"], "Watchlist")
+
+    def test_stops_at_next_section(self):
+        body = "## Status\n\n- Decision: Hold\n\n## Company Overview\n\n- Decision: Should Not Count\n"
+        status = kb_pages.parse_status_block(body)
+        self.assertEqual(status["decision"], "Hold")
+
+    def test_no_status_section_returns_empty(self):
+        self.assertEqual(kb_pages.parse_status_block("# Title\n\nNo status here.\n"), {})
+
+
+class DecisionHistoryRowsTest(unittest.TestCase):
+    def test_all_rows_extracted_in_order(self):
+        rows = kb_pages.decision_history_rows(FULL_STATUS_BODY)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], {"date": "2026-05-01", "action": "Buy", "verdict": "new", "note": "Rubric v1.0 score 4.10; initial add."})
+        self.assertEqual(rows[1]["date"], "2026-07-14")
+
+    def test_header_and_separator_rows_skipped(self):
+        rows = kb_pages.decision_history_rows(FULL_STATUS_BODY)
+        self.assertTrue(all(kb_pages.DATE_PATTERN.match(r["date"]) for r in rows))
+
+    def test_empty_table_returns_no_rows(self):
+        self.assertEqual(kb_pages.decision_history_rows(EMPTY_HISTORY_BODY), [])
+
+    def test_last_decision_history_row_returns_most_recent(self):
+        row = kb_pages.last_decision_history_row(FULL_STATUS_BODY)
+        self.assertEqual(row["date"], "2026-07-14")
+        self.assertEqual(row["action"], "Hold")
+        self.assertEqual(row["verdict"], "unchanged")
+
+    def test_last_decision_history_row_none_when_empty(self):
+        self.assertIsNone(kb_pages.last_decision_history_row(EMPTY_HISTORY_BODY))
+
+
 if __name__ == "__main__":
     unittest.main()

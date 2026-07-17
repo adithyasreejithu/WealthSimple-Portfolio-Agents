@@ -18,8 +18,9 @@ forms no opinions and writes nothing to the wiki.
   judgment runs on Opus in `stock-analyst`. This model split (cheap steps,
   expensive judgment) is the reason the workflow is two agents rather than one.
 - `tools: ["Bash", "Read", "Write"]` — `Bash` runs the fetch and worksheet
-  scripts; `Read` opens the classification JSON and any existing thesis page;
-  `Write` is scoped by the guardrails to `exports/stock-recommendations/` only.
+  scripts; `Read` is used only for `kb-search` output (the agent no longer reads
+  the thesis page itself, see Workflow and Guardrails); `Write` is scoped by the
+  guardrails to `exports/stock-recommendations/` only.
 
 ## Skill Dependencies
 
@@ -32,25 +33,44 @@ skills:
 
 | Skill | Role |
 |---|---|
-| `kb-search` | Find an existing `stocks/TICKER.md` and its current decision. |
-| `fetch-stock-research-data` | Pull the 11 yfinance research groups into JSON. |
+| `kb-search` | Check whether `stocks/TICKER.md` exists (page content is not read here). |
+| `fetch-stock-research-data` | Pull the 12 yfinance research groups (incl. fund-only `funds`) into JSON. |
 | `evaluate-stock-decision` | Build the scoring worksheet (`scoring_worksheet.py`). |
 
 ## Workflow
 
-1. `kb-search` for the ticker; read the page if it exists (capture Status block +
-   Original Thesis).
-2. Read `exports/portfolio-classification/portfolio-classification.json` for
-   held/weight/role. Stop if the ticker has no verified provider symbol.
-3. Fetch research data to `exports/stock-recommendations/<TICKER>-<date>-research.json`.
-4. Build the worksheet to `exports/stock-recommendations/<TICKER>-<date>-worksheet.json`
-   with every `--source`.
-5. Report the worksheet path, data-sufficiency note, and next step (see Handoffs).
+1. `kb-search` for the ticker; check whether `stocks/TICKER.md` exists (existence
+   check only — the page itself is not read; see Guardrails).
+2. Fetch research data to `exports/stock-recommendations/<TICKER>-<date>-research.json`.
+   Stop if the ticker has no verified provider symbol.
+3. Build the worksheet to `exports/stock-recommendations/<TICKER>-<date>-worksheet.json`
+   with every `--source` (including the classification JSON) plus `--thesis-page
+   Knowledge-Base/stocks/<TICKER>.md` whenever step 1 found the page exists. The
+   worksheet auto-detects asset class (ETF vs stock), selects the matching
+   rubric track, deterministically derives `page_exists` and
+   `position.prior_decision` (last Decision History row + Status
+   confidence/time horizon) from `--thesis-page`, and prints a **Data-prep
+   summary** to stdout: asset class, position (held/weight/role), prior
+   decision, classification freshness, and per-group ok/empty/failed. **Stop**
+   and ask for a re-classification if the summary reports the classification
+   stale (>~7 days) or missing, rather than trusting stale holdings.
+4. Report — from the stdout summary, never by opening the JSONs or the thesis
+   page — the worksheet path, detected asset class, prior decision, and a
+   data-sufficiency note that distinguishes `groups_ok` / `groups_empty`
+   (structurally empty, normal for ETFs) / `groups_failed`, plus the next step
+   (see Handoffs).
 
 ## Guardrails
 
 - No scoring, no opinions, no proposed action — every worksheet slot is left
   empty for the analyst.
+- **Never Reads the JSON artifacts, and never Reads `stocks/TICKER.md`.** The
+  research JSON, worksheet, and classification JSON run to hundreds of KB, and
+  the scripts' stdout summaries carry everything the report needs.
+  `--thesis-page` gets the worksheet builder what it needs from the thesis page
+  without this agent opening it — reading it for Original Thesis prose is
+  `stock-analyst`'s job (at most once), not this agent's. Only `kb-search`
+  output is read.
 - Writes only under `exports/stock-recommendations/`; never in `Knowledge-Base/`.
 - No fabrication of symbols or values; failures are reported as-is.
 - No trades.

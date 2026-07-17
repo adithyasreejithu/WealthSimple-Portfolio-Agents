@@ -44,6 +44,10 @@ from yfinance_extractor import (  # noqa: E402
 MAX_RESEARCH_BATCH_SIZE = 200
 DEFAULT_HISTORY_DAYS = 400
 MAX_OPTION_EXPIRATIONS = 3
+# yfinance returns the full multi-year analyst rating history; only the recent
+# window carries decision value, and the full table bloats every downstream
+# artifact (worksheet, analyst context). See yfinance-research-contract.md.
+ANALYST_HISTORY_DAYS = 365
 
 # Field groups a research pull can request. Each maps to a fixed set of
 # yfinance attributes -- see references/yfinance-research-contract.md.
@@ -60,6 +64,7 @@ RESEARCH_GROUPS = frozenset(
         "institutional",
         "dividends",
         "history",
+        "funds",
     }
 )
 DEFAULT_GROUPS: tuple[str, ...] = (
@@ -74,6 +79,7 @@ DEFAULT_GROUPS: tuple[str, ...] = (
     "institutional",
     "dividends",
     "history",
+    "funds",
 )
 # Groups that read from `Ticker.get_info()`; fetched once per ticker.
 INFO_GROUPS = frozenset({"overview", "valuation", "dividends"})
@@ -199,13 +205,26 @@ def _fetch_earnings(client: Any, info: Mapping[str, Any]) -> tuple[dict[str, Any
     )
 
 
+def _trim_to_recent(frame: Any, days: int = ANALYST_HISTORY_DAYS) -> Any:
+    """Trim a date-indexed DataFrame to the trailing window; pass anything else through."""
+    try:
+        import pandas as pd
+
+        if not isinstance(frame, pd.DataFrame) or not isinstance(frame.index, pd.DatetimeIndex):
+            return frame
+        cutoff = pd.Timestamp.now(tz=frame.index.tz) - pd.Timedelta(days=days)
+        return frame[frame.index >= cutoff]
+    except Exception:  # Trimming is best-effort; never sink the fetch.
+        return frame
+
+
 def _fetch_analyst(client: Any, info: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
     return _safe_map(
         {
-            "recommendations": lambda: client.recommendations,
+            "recommendations": lambda: _trim_to_recent(client.recommendations),
             "recommendations_summary": lambda: client.recommendations_summary,
             "price_targets": lambda: client.analyst_price_targets,
-            "upgrades_downgrades": lambda: client.upgrades_downgrades,
+            "upgrades_downgrades": lambda: _trim_to_recent(client.upgrades_downgrades),
         }
     )
 
@@ -254,6 +273,24 @@ def _fetch_dividends(client: Any, info: Mapping[str, Any]) -> tuple[dict[str, An
     return data, errors
 
 
+def _fetch_funds(client: Any, info: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    """Fund-level data (ETFs / mutual funds). `get_funds_data()` raises for
+    equities, so this whole group errors cleanly at the top level for a stock --
+    which the emptiness rule in the worksheet then excludes from groups_ok."""
+    funds = client.get_funds_data()  # raises for non-funds -> clean errors["funds"]
+    return _safe_map(
+        {
+            "description": lambda: funds.description,
+            "fund_overview": lambda: funds.fund_overview,
+            "fund_operations": lambda: funds.fund_operations,
+            "asset_classes": lambda: funds.asset_classes,
+            "top_holdings": lambda: funds.top_holdings,
+            "sector_weightings": lambda: funds.sector_weightings,
+            "bond_ratings": lambda: funds.bond_ratings,
+        }
+    )
+
+
 GROUP_FETCHERS: dict[str, Callable[[Any, Mapping[str, Any]], tuple[dict[str, Any], dict[str, str]]]] = {
     "overview": _fetch_overview,
     "valuation": _fetch_valuation,
@@ -265,6 +302,7 @@ GROUP_FETCHERS: dict[str, Callable[[Any, Mapping[str, Any]], tuple[dict[str, Any
     "insider": _fetch_insider,
     "institutional": _fetch_institutional,
     "dividends": _fetch_dividends,
+    "funds": _fetch_funds,
 }
 
 

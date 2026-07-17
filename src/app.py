@@ -24,7 +24,7 @@ from config import (
     SOURCE_PREFIX,
 )
 from data_sorter import move_to_processed_folder, sort_data
-from database import get_shared_connection, initialize_database
+from database import close_connection, get_shared_connection, initialize_database
 from database_command import (
     get_email_checkpoint,
     reconcile_email_transactions,
@@ -239,6 +239,12 @@ def _run_portfolio_classification(db_path: Path | str) -> SourceResult:
     from classification_workflow import classify_portfolio, write_output
 
     try:
+        # DuckDB rejects a second connection to the same file when its
+        # configuration differs, and the workflow always opens its own
+        # read-only one. Release the pipeline's read-write connection first;
+        # ingestion is committed by this point, and upload_portfolio_
+        # classifications below reopens the shared connection on demand.
+        close_connection()
         payload = classify_portfolio(db_path)
         output_path = write_output(payload)
         rows = upload_portfolio_classifications(output_path, db_path)

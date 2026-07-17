@@ -70,21 +70,7 @@ def _update_status_block(body: str, action: str, confidence: str, horizon: str, 
 
 def _decision_history_dates(body: str) -> list[str]:
     """Dates from existing rubric-driven Decision History rows (Note ~ 'Rubric')."""
-    lines = body.splitlines()
-    in_section = False
-    dates: list[str] = []
-    for line in lines:
-        if line.strip().startswith("## Decision History"):
-            in_section = True
-            continue
-        if in_section:
-            if line.strip().startswith("## "):
-                break
-            if line.strip().startswith("|"):
-                cells = [c.strip() for c in line.strip().strip("|").split("|")]
-                if len(cells) >= 4 and kb_pages.DATE_PATTERN.match(cells[0]) and "Rubric" in cells[3]:
-                    dates.append(cells[0])
-    return dates
+    return [row["date"] for row in kb_pages.decision_history_rows(body) if "Rubric" in row["note"]]
 
 
 def _append_decision_history_row(body: str, row: str) -> str:
@@ -223,6 +209,7 @@ def ingest(artifact_path: Path, *, kb_root: Path | None = None) -> dict:
     ticker = str(artifact["ticker"]).upper()
     page_path = kb_root / "stocks" / f"{ticker}.md"
     page_exists = page_path.exists()
+    page_created = not page_exists
 
     proposed = artifact.get("proposed") or {}
     action = proposed.get("action")
@@ -255,15 +242,36 @@ def ingest(artifact_path: Path, *, kb_root: Path | None = None) -> dict:
 
     meta, body = kb_pages.parse_page_file(page_path)
 
-    # Idempotence guard: refuse an artifact older than the latest rubric row.
+    # Idempotence guard: refuse an artifact older than the latest rubric row, and
+    # refuse re-ingesting one dated the same as an existing rubric row (a same-day
+    # re-run would otherwise append a duplicate Decision History row).
     prior_dates = _decision_history_dates(body)
     if prior_dates and generated < max(prior_dates):
         raise IngestError(
             f"artifact generated {generated} is older than the latest rubric Decision "
             f"History row ({max(prior_dates)}); refusing to ingest a stale recommendation"
         )
+    if generated in prior_dates:
+        raise IngestError(
+            f"a rubric Decision History row for {generated} already exists on "
+            f"stocks/{ticker}.md; refusing to append a duplicate same-day recommendation"
+        )
 
-    # 3. Transcribe prose from narratives mechanically.
+    # 3a. On first creation only, seed Company Overview and Original Thesis from
+    # the artifact's narratives. Gated on real file creation in THIS run (never
+    # the artifact's self-reported page_exists), so Original Thesis is only ever
+    # written once and never overwritten on an update.
+    if page_created:
+        narratives = artifact.get("narratives") or {}
+        for key, section in (("company_overview", "Company Overview"), ("original_thesis", "Original Thesis")):
+            text = str(narratives.get(key) or "").strip()
+            if text:
+                try:
+                    body = kb_pages.replace_section(body, section, text)
+                except kb_pages.KBPageError:
+                    pass
+
+    # 3b. Transcribe prose from narratives mechanically.
     body = _transcribe_narratives(body, artifact)
 
     # 4. Update Status block (Decision/Confidence/Time Horizon/Last Updated only).

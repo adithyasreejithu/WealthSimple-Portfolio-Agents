@@ -12,9 +12,14 @@ sys.path.insert(0, str(ROOT / ".claude" / "skills" / "evaluate-stock-decision" /
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import kb_pages
+import rubric as rubric_mod
 import thesis_page
 import ingest_recommendation as ingest_mod
 import _decision_fixtures as fx
+
+# The Decision History note records the version of the rubric the ingest
+# validated against (the shipped one), not the artifact's.
+SHIPPED_RUBRIC_VERSION = rubric_mod.load_rubric().get("version")
 
 
 INDEX_STUB = (
@@ -50,7 +55,8 @@ def _artifact(base: Path, **overrides) -> dict:
             "yfinance": {"path": "research.json", "groups_ok": ["overview"] * 11, "groups_failed": {}},
             "classification": {"path": "classification.json"},
         },
-        "position": {"held": True, "weight_pct": 3.2, "portfolio_role": "Quality", "dividend_payer": True, "income_role": False},
+        "position": {"held": True, "weight_pct": 3.2, "portfolio_role": "Quality",
+                     "dividend_payer": True, "income_role": False, "is_etf": False, "page_exists": False},
         "gates": [{"id": gid, "result": "pass", "evidence": [{"source": f.split(":")[0], "field": f, "value": 1}]} for gid, f in gate_cite.items()],
         "dimensions": [{"id": did, "weight": 0.0, "score": 4, "rationale": "ok", "evidence": [{"source": f.split(":")[0], "field": f, "value": 1}]} for did, f in dim_cite.items()],
         "weighted_score": 4.0,
@@ -59,10 +65,12 @@ def _artifact(base: Path, **overrides) -> dict:
         "narratives": {
             "executive_summary": "Strong compounder; add on fit.",
             "analyst_view": "Rubric says Add; agree.",
-            "updated_thesis": "Unchanged, slightly stronger.",
+            "updated_thesis": "Services keep carrying earnings as hardware matures.\n\nUnchanged and slightly stronger versus the original.",
+            "company_overview": "Apple designs and sells consumer electronics and services.",
+            "original_thesis": "Bought for durable services-led margin expansion.",
             "bull_case": ["moat"], "bear_case": ["valuation"], "key_risks": ["china"],
             "open_questions": [], "monitoring": ["services"],
-            "section_updates": {"Valuation Analysis": "fwd P/E 28"},
+            "section_updates": {"Valuation Analysis": "- Forward P/E: 28 — rich\n- Score: 3/5 (fairly valued)"},
         },
         "facts_assumptions_opinions": {"facts": ["fcf 90b"], "assumptions": ["growth"], "opinions": ["add"]},
     }
@@ -124,7 +132,7 @@ class IngestTest(IngestFixture):
         ingest_mod.ingest(self._write_artifact())
         _, body = kb_pages.parse_page_file(self.kb_root / "stocks" / "AAPL.md")
         self.assertIn("| Add | unchanged |", body)
-        self.assertIn("Rubric v1.1 score 4.00", body)
+        self.assertIn(f"Rubric {SHIPPED_RUBRIC_VERSION} score 4.00", body)
 
     def test_logs_appended(self):
         self._create_page()
@@ -156,7 +164,10 @@ class IngestTest(IngestFixture):
         meta, body = kb_pages.parse_page_file(page)
         self.assertEqual(meta["status"], "active")
         self.assertIn("- Portfolio Role: Quality", body)
-        self.assertIn("fwd P/E 28", body)  # section_updates transcribed
+        self.assertIn("- Forward P/E: 28", body)  # point-form section_updates transcribed
+        # On creation, Company Overview and Original Thesis are seeded too.
+        self.assertIn("Apple designs and sells consumer electronics", body)
+        self.assertIn("durable services-led margin expansion", body)
 
     def test_invalid_artifact_refused(self):
         self._create_page()
@@ -183,6 +194,34 @@ class IngestTest(IngestFixture):
         ingest_mod.ingest(self._write_artifact())
         with patch.object(sys, "argv", ["thesis_page.py", "validate", "--path", str(self.kb_root / "stocks" / "AAPL.md")]):
             self.assertEqual(thesis_page.main(), 0)
+
+    def test_creation_seeds_company_overview_and_original_thesis(self):
+        # No _create_page(): ingest creates the page and seeds both sections.
+        ingest_mod.ingest(self._write_artifact())
+        _, body = kb_pages.parse_page_file(self.kb_root / "stocks" / "AAPL.md")
+        self.assertIn("Apple designs and sells consumer electronics", body)
+        self.assertIn("durable services-led margin expansion", body)
+
+    def test_update_does_not_touch_overview_or_original_thesis(self):
+        self._create_page()
+        page = self.kb_root / "stocks" / "AAPL.md"
+        text = page.read_text(encoding="utf-8")
+        text = text.replace("## Company Overview\n\n", "## Company Overview\n\nHand-written overview.\n")
+        text = text.replace("## Original Thesis\n\n", "## Original Thesis\n\nHand-written original thesis.\n")
+        page.write_text(text, encoding="utf-8")
+        ingest_mod.ingest(self._write_artifact())
+        after = page.read_text(encoding="utf-8")
+        # Page already existed -> ingest never overwrites these, even though the
+        # artifact carries company_overview / original_thesis.
+        self.assertIn("Hand-written overview.", after)
+        self.assertIn("Hand-written original thesis.", after)
+        self.assertNotIn("Apple designs and sells consumer electronics", after)
+
+    def test_same_date_duplicate_refused(self):
+        self._create_page()
+        ingest_mod.ingest(self._write_artifact(name="first.json", generated="2026-07-13"))
+        with self.assertRaises(ingest_mod.IngestError):
+            ingest_mod.ingest(self._write_artifact(name="second.json", generated="2026-07-13"))
 
 
 if __name__ == "__main__":

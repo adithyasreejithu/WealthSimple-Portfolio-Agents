@@ -105,7 +105,7 @@ Use this document when signing off, clearing context, or resuming work after a b
 - Yfinance historical output is returned as a dataframe with `Date`, `Ticker`, `Open`, `High`, `Low`, `Close`, `Adj Close`, and `Volume`.
 - A committed email branch triggers `src/market_data.py`. It derives each owned
   ticker's initial or incremental date window and upserts metadata and history.
-- Use `python src/app.py yfinance-sync` for retries or targeted updates and add
+- Use `uv run python src/app.py yfinance-sync` for retries or targeted updates and add
   `--full` to restart from first portfolio activity.
 - All active runtime files under `src/` now use the shared logger and include stage-level usage/error logging.
 - `src/` is intended to stay flat; there should be no Camelot subfolder or separate extractor runner file.
@@ -203,7 +203,7 @@ Use this document when signing off, clearing context, or resuming work after a b
   `Agent-Development` in commit `9e72293`.
 - Recorded the fixed prompt, script and skill boundaries, DB-first source priority,
   restricted yfinance modes, JSON contract, and acceptance criteria.
-- Verification: `python -m unittest discover -s tests` passes 109 tests.
+- Verification: `uv run python -m unittest discover -s tests` passes 109 tests.
 - Consolidated yfinance persistence around `src/market_data.py` and `yfinance-sync`;
   removed the duplicate history-sync command design.
 - Added partial publication for unknown email tickers, timestamp checkpoints,

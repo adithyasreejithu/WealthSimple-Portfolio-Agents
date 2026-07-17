@@ -30,8 +30,13 @@ Follow the `evaluate-stock-decision` skill (`SKILL.md` +
 
 1. **Read the worksheet** that `stock-data-prep` wrote under
    `exports/stock-recommendations/`. It already resolved the cited evidence,
-   computed the derived metrics, and set the position context. If a page exists,
-   also read the Original Thesis so you can state a `verdict_vs_previous`.
+   computed the derived metrics, and set the position context. The worksheet's
+   `position.prior_decision` already carries the last recorded date/action/
+   verdict/confidence -- use it directly for `verdict_vs_previous` reasoning; do
+   not scan the thesis page's Decision History table or Status block yourself.
+   If you need the Original Thesis prose itself for narrative continuity when
+   writing `updated_thesis`, `Read` the current `stocks/<TICKER>.md` once --
+   never an older dated artifact.
 2. **Score every gate and dimension.** Set each gate `result` to
    `pass`/`fail`/`unknown` against its `fail_when` text; set each dimension
    `score` to an integer 1-5 (per the `anchors`) or `"unknown"`. Give every
@@ -47,9 +52,33 @@ Follow the `evaluate-stock-decision` skill (`SKILL.md` +
    (e.g. `market_sentiment`'s `section` is `"Market Sentiment"`). A key that
    doesn't match a real thesis-page header is silently dropped at commit time
    otherwise. When multiple dimensions share a `section` (e.g. `financial_health`
-   and `growth` both target `"Financial Analysis"`), write one combined prose
-   block for that key.
-4. **Validate.** Run `validate_recommendation.py` and fix until it exits 0.
+   and `growth`, or the fund track's `fund_efficiency` and `fund_quality`, both
+   target `"Financial Analysis"`), write one combined block for that key.
+
+   **Format (the validator enforces it):** each dimension section is point form
+   -- `- Metric: value — interpretation` lines ending in a `- Score: X/5 (label)`
+   line (labeled per-dimension, `- Score (fund_efficiency): 4/5`, when a section
+   is shared). `updated_thesis` is prose of at least two paragraphs stating
+   stronger/weaker/unchanged/broken and why. When the page does not yet exist,
+   also write `company_overview` and `original_thesis`. The Options Activity
+   section must interpret the put/call OI and volume ratios, the IV term
+   structure and skew, and the max-OI strikes vs spot together.
+
+   **ETF track:** an ETF worksheet omits the equity-only gates and dimensions
+   (solvency, profitability_or_path, dividend_integrity, financial_health,
+   growth, earnings_catalysts, insider_activity) by design and includes
+   `fund_efficiency` + `fund_quality` instead. This is not missing data -- do not
+   report the omitted items as unknowns; score what the worksheet gives you.
+4. **Validate.** While filling in gates and dimensions, save your draft artifact
+   and iterate with `validate_recommendation.py --path <draft> --precompute-only`
+   -- it prints the exact `weighted_score`/`action`/`confidence`/
+   `default_time_horizon` your finished artifact must match, computed by the
+   same code the final validator uses. This replaces reverse-engineering
+   `rubric.py` by hand. **Copy the worksheet's `research_sources` block into
+   your draft verbatim, first thing** -- the precompute confidence number is
+   only correct once it's present. Once every gate/dimension and narrative is
+   filled in, run the full validate (`validate_recommendation.py --path
+   <draft>`, no flag) and fix until it exits 0.
 5. **Save** the artifact to `exports/stock-recommendations/<TICKER>-<date>.json`
    and report. `kb-intake` must be invoked separately to commit it to the
    thesis page -- see Handoffs.
@@ -64,6 +93,18 @@ Follow the `evaluate-stock-decision` skill (`SKILL.md` +
   `proposed.action` is the band-derived value; never hand-tune it. If you
   repeatedly disagree with the rubric, say so in the Analyst View so the owner
   can retune it via `author-decision-rubric` -- do not bend the score.
+- **Static reference material is already embedded in the worksheet** --
+  `fail_when` (per gate), `anchors` and `section` (per dimension) are copied in
+  by `scoring_worksheet.py`. Do not re-read `decision-rubric.yml`,
+  `decision-framework.yml`, or `recommendation-contract.md` for these fields;
+  they are only worth checking if you suspect the worksheet itself is stale.
+- **Never read the source code** of `scoring_worksheet.py`,
+  `validate_recommendation.py`, or `rubric.py`, and never run `python -c` to
+  import their internals to predict the verdict. Run `validate_recommendation.py
+  --path <your-draft> --precompute-only` instead (see Workflow step 4).
+- **Never read old dated artifacts** under `exports/stock-recommendations/`
+  (any `<TICKER>-<older-date>*.json`). Prior-decision context is in the current
+  worksheet's `position.prior_decision`.
 - **No fabrication.** Every score cites a real field in a supplied source.
   Missing data scores `unknown` and lowers confidence; it is never estimated.
 - **No trades.** Output is a recommendation and record only.

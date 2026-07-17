@@ -622,7 +622,7 @@ An unavailable result is preferred over a fabricated zero or implicit conversion
 
 ## Report JSON Structure
 
-`portfolio_report()` (and `python src/app.py analytics --export`) returns:
+`portfolio_report()` (and `uv run python src/app.py analytics --export`) returns:
 
 ```
 schema_version, generated_at, parameters

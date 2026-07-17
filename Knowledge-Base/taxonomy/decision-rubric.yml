@@ -1,4 +1,4 @@
-version: v1.1
+version: v1.3
 name: decision_rubric
 status: hand_curated
 framework: decision-framework.yml
@@ -32,6 +32,7 @@ sources:
       - institutional
       - dividends
       - history
+      - funds
   classification:
     skill: classify-portfolio
     groups:
@@ -47,8 +48,17 @@ sources:
       - return_30d
       - return_90d
       - return_365d
+      - upgrades_90d
+      - downgrades_90d
+      - net_revisions_365d
       - net_insider_shares
       - put_call_oi_ratio
+      - put_call_volume_ratio
+      - atm_iv_near
+      - atm_iv_far
+      - iv_skew
+      - max_oi_call_strike
+      - max_oi_put_strike
       - groups_ok_count
 
 # Hard disqualifiers. Any gate that FAILS forces the verdict to Avoid (not held)
@@ -58,7 +68,7 @@ sources:
 gates:
   - id: solvency
     description: Company is not in balance-sheet distress.
-    applies_when: always
+    applies_when: equity_only
     fail_when: >
       Free cash flow is negative AND debt-to-equity is above 2.0 (or unknown)
       AND the current ratio is below 1.0 -- i.e. burning cash with heavy
@@ -69,7 +79,7 @@ gates:
       - derived:current_ratio
   - id: profitability_or_path
     description: The business is profitable or credibly heading there.
-    applies_when: always
+    applies_when: equity_only
     fail_when: >
       Latest net income is negative AND free cash flow is negative AND revenue
       is shrinking year over year -- unprofitable, cash-burning, and
@@ -79,19 +89,28 @@ gates:
       - yfinance:data.valuation.freeCashflow
       - derived:revenue_growth_yoy
   - id: dividend_integrity
-    description: An income holding's dividend is actually covered.
-    applies_when: income_role
+    description: An income equity's dividend is actually covered.
+    # Income equities only: funds have no reported payout ratio (the metric this
+    # gate reads does not exist for a fund), so an ETF is excluded here and its
+    # distribution risk is judged by dividend_safety + fund_quality instead.
+    applies_when: [income_role, equity_only]
     fail_when: >
       Trailing payout ratio is above 1.0 (dividend exceeds earnings) -- the
       dividend is being funded from something other than profit and is at risk.
     evidence_fields:
       - yfinance:data.dividends.summary.payoutRatio
   - id: data_sufficiency
-    description: Enough of the research pull succeeded to judge the stock.
+    description: Enough of the research pull succeeded to judge the security.
     applies_when: always
+    # groups_ok_count counts only groups that returned usable (non-empty,
+    # non-errored) data -- ETFs return several structurally-empty equity groups
+    # (financials, earnings, analyst, insider, institutional) that do NOT count.
     fail_when: >
-      Fewer than 6 of the 11 yfinance research groups were fetched without
-      error -- too little evidence to reach a defensible verdict.
+      For an equity, fewer than 6 of the 11 equity-relevant yfinance groups (all
+      except `funds`) returned usable data. For a fund, fewer than 4 of the 7
+      fund-relevant groups (overview, valuation, options, news, dividends,
+      history, funds) returned usable data -- too little evidence either way to
+      reach a defensible verdict.
     evidence_fields:
       - derived:groups_ok_count
 
@@ -133,7 +152,7 @@ dimensions:
         target.
   - id: financial_health
     weight: 0.20
-    applies_when: always
+    applies_when: equity_only
     section: "Financial Analysis"
     evidence_fields:
       - yfinance:data.valuation.returnOnEquity
@@ -153,7 +172,7 @@ dimensions:
         current ratio below 0.8.
   - id: growth
     weight: 0.10
-    applies_when: always
+    applies_when: equity_only
     section: "Financial Analysis"
     evidence_fields:
       - derived:revenue_growth_yoy
@@ -165,12 +184,14 @@ dimensions:
       "1": Revenue flat or shrinking with margin compression.
   - id: earnings_catalysts
     weight: 0.05
-    applies_when: always
+    applies_when: equity_only
     section: "Earnings and Catalysts"
     evidence_fields:
       - yfinance:data.earnings.calendar
       - yfinance:data.earnings.earnings_dates
-      - yfinance:data.analyst.upgrades_downgrades
+      - derived:upgrades_90d
+      - derived:downgrades_90d
+      - derived:net_revisions_365d
     anchors:
       "5": >
         A near-term earnings date with a credible beat-and-raise setup:
@@ -191,26 +212,32 @@ dimensions:
       - yfinance:data.valuation.freeCashflow
       - yfinance:data.dividends.history
     anchors:
-      "5": Payout ratio below 60%, well covered by free cash flow, multi-year uninterrupted growth.
-      "3": Payout ratio roughly 60-80%, covered, stable dividend.
-      "1": Payout ratio above 90% or a recent cut, coverage in doubt.
+      # For a fund the payout ratio is not reported -- judge from distribution
+      # history stability and yield versus the fund's own multi-year average.
+      "5": "Payout ratio below 60%, well covered by free cash flow, multi-year uninterrupted growth (fund: steady/growing distributions)."
+      "3": "Payout ratio roughly 60-80%, covered, stable dividend (fund: distributions roughly stable)."
+      "1": "Payout ratio above 90% or a recent cut, coverage in doubt (fund: cut or erratic distributions)."
   - id: market_sentiment
     weight: 0.15
     applies_when: always
     section: "Market Sentiment"
     evidence_fields:
       - yfinance:data.analyst.recommendations_summary
-      - yfinance:data.analyst.upgrades_downgrades
+      - derived:upgrades_90d
+      - derived:downgrades_90d
+      - derived:net_revisions_365d
       - derived:return_90d
       - derived:return_365d
       - yfinance:data.news.headlines
     anchors:
-      "5": Net analyst upgrades in the last 90 days, buy-skewed ratings, and positive 90-day and 365-day price returns.
+      # Funds have no analyst coverage -- lean on the 90/365-day price trend and
+      # news for a fund, not on ratings.
+      "5": "Net analyst upgrades in the last 90 days, buy-skewed ratings, and positive 90-day and 365-day price returns (fund: strong positive price trend)."
       "3": Mixed or neutral ratings and roughly flat price trend.
-      "1": Net downgrades, sell-skewed ratings, and negative 90-day and 365-day returns.
+      "1": "Net downgrades, sell-skewed ratings, and negative 90-day and 365-day returns (fund: sustained negative price trend)."
   - id: insider_activity
     weight: 0.02
-    applies_when: always
+    applies_when: equity_only
     section: "Insider Activity"
     evidence_fields:
       - derived:net_insider_shares
@@ -226,11 +253,26 @@ dimensions:
     section: "Options Activity"
     evidence_fields:
       - derived:put_call_oi_ratio
+      - derived:put_call_volume_ratio
+      - derived:atm_iv_near
+      - derived:atm_iv_far
+      - derived:iv_skew
+      - derived:max_oi_call_strike
+      - derived:max_oi_put_strike
       - yfinance:data.options.expirations
     anchors:
-      "5": Call-skewed positioning, put/call open-interest ratio below 0.7.
-      "3": Balanced put/call open-interest ratio near 1.0.
-      "1": Put-skewed positioning, put/call open-interest ratio above 1.3.
+      "5": >
+        Call-skewed positioning (put/call open-interest and volume ratios below
+        0.7), flat-to-downward IV term structure (near-dated IV not elevated over
+        far-dated), little downside skew, and no heavy put open-interest wall
+        sitting just below spot.
+      "3": >
+        Balanced put/call ratios near 1.0, an ordinary upward IV term structure,
+        and modest skew -- no clear directional signal from positioning.
+      "1": >
+        Put-skewed positioning (put/call ratios above 1.3), steep downside IV
+        skew, a near-dated IV spike (event/crash premium), or a large put
+        open-interest wall at or above spot.
   - id: portfolio_fit
     weight: 0.15
     applies_when: always
@@ -247,6 +289,47 @@ dimensions:
       "1": >
         Duplicates an already-overweight group or would push the single-name
         position above 10% (the policy cap).
+  # Fund-only dimensions. These replace the equity_only company dimensions
+  # (financial_health + growth) for a fund, keeping the etf-track weights at 1.0.
+  - id: fund_efficiency
+    weight: 0.17
+    applies_when: etf_only
+    section: "Financial Analysis"
+    evidence_fields:
+      - classification:holdings.expense_ratio
+      - classification:holdings.aum
+      - classification:holdings.nav
+      - yfinance:data.funds.fund_operations
+    anchors:
+      "5": >
+        Cheap and liquid: expense ratio below 0.20% with AUM above $1B -- no
+        cost drag and negligible closure/liquidity risk.
+      "3": "Reasonable: expense ratio 0.20-0.60% with AUM roughly $100M-$1B."
+      "1": >
+        Expensive or fragile: expense ratio above 1.0%, or AUM below $50M
+        (closure and wide-spread liquidity risk).
+  - id: fund_quality
+    weight: 0.20
+    applies_when: etf_only
+    section: "Financial Analysis"
+    evidence_fields:
+      - classification:holdings.sector_weights
+      - classification:holdings.top_holdings
+      - yfinance:data.funds.top_holdings
+      - yfinance:data.funds.sector_weightings
+      - yfinance:data.dividends.history
+    anchors:
+      "5": >
+        Diversified as the mandate intends (top-10 holdings below ~35%, no
+        unintended single-sector concentration) with stable or growing
+        distributions.
+      "3": >
+        Moderate concentration, or concentration that matches the fund's stated
+        mandate (a single-sector or single-commodity fund by design);
+        distributions stable.
+      "1": >
+        Extreme concentration not explained by the mandate, or cut / erratic
+        distributions.
 
 scoring:
   scale: [1, 5]
@@ -277,14 +360,17 @@ verdict_bands:
 # High -> Medium -> Low; the first whose thresholds are all met wins. Any unknown
 # gate forces Low (both High and Medium require max_unknown_gates: 0).
 confidence_rules:
+  # min_groups_ok is per asset-class track: an equity is judged against the 11
+  # equity-relevant groups, a fund against the 7 fund-relevant ones (funds have
+  # 4-5 structurally-empty equity groups that never count).
   High:
     max_unknown_dimensions: 0
     max_unknown_gates: 0
-    min_groups_ok: 10
+    min_groups_ok: {equity: 10, etf: 6}
   Medium:
     max_unknown_dimensions: 2
     max_unknown_gates: 0
-    min_groups_ok: 8
+    min_groups_ok: {equity: 8, etf: 5}
   Low:
     default: true
 

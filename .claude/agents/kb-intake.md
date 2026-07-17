@@ -30,8 +30,14 @@ weaker, unchanged, or broken is a judgment call, not a fixed script.
 - **Recommendation ingestion.** "Commit the recommendation for TICKER",
   "ingest the stock-analyst recommendation", or when a
   `exports/stock-recommendations/<TICKER>-<date>.json` artifact exists and needs
-  to land on the thesis page. The judgment already happened in `stock-analyst`;
-  your job is to run the deterministic ingest and transcribe the narratives.
+  to land on the thesis page. The judgment already happened in `stock-analyst`
+  and `ingest_recommendation.py` transcribes the narratives mechanically; your
+  job is only to run the script and report its output. **Batch commits** (a
+  portfolio run hands you N artifacts) are one invocation of you, not N: loop
+  `ingest_recommendation.py` over the artifacts **one at a time** via Bash (the
+  index/log helpers are not concurrency-safe) and report per-ticker results.
+  Never `Read` the recommendation artifacts — the script output is your report
+  input.
 - **Status change.** "Mark TICKER as active/watchlist/closed/rejected",
   "we sold TICKER", "add TICKER to the watchlist".
 - **Portfolio sync.** "Sync the knowledge base with my portfolio", "refresh
@@ -49,9 +55,9 @@ weaker, unchanged, or broken is a judgment call, not a fixed script.
    pages, update existing ones following the immutability rules, change
    status, and commit `stock-analyst` recommendation artifacts with
    `ingest_recommendation.py` (rewrites Decision/Confidence/Time Horizon,
-   appends a Decision History row and logs; you then transcribe the artifact's
-   narratives, including the Analyst View, and never touch Original Thesis or
-   Portfolio Status).
+   appends a Decision History row and logs, and transcribes the artifact's
+   narratives — including the Analyst View — mechanically; it never touches
+   Original Thesis or Portfolio Status, and neither do you).
 4. **Portfolio data sync** via the `kb-sync-portfolio` skill.
 5. Every mutation ends with an `update-log.md` entry (the skills append
    this automatically on success) and, for thesis work, a

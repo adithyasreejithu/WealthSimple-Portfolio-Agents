@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-from config import DATABASE_PATH
+from config import DATABASE_PATH, YFINANCE_CANADIAN_SUFFIXES
 from database import get_shared_connection, initialize_database
 from database_command import ensure_tickers
 from yfinance_extractor import configure_yfinance_cache, fetch_security_info
@@ -158,6 +159,7 @@ def list_pending(db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
 
 
 def resolve_pending_interactively(db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    configure_yfinance_cache(_default_yfinance_cache_dir())
     pending = list_pending(db_path)
     results: list[dict[str, Any]] = []
     for item in pending:
@@ -168,8 +170,25 @@ def resolve_pending_interactively(db_path: Path | str = DATABASE_PATH) -> list[d
         print(f"Resolve {symbol} ({item['trade_count']} pending trade(s){source_note})")
         currency = input(f"Currency [CAD/USD]{f' [{detected}]' if detected else ''}: ").strip().upper() or detected
         canonical = input(f"Canonical symbol [{symbol}]: ").strip().upper() or symbol
-        default_yahoo = f"{canonical}.TO" if currency == "CAD" else canonical
-        yahoo = input(f"Yahoo symbol [{default_yahoo}]: ").strip().upper() or default_yahoo
+        is_canadian_suffixed = any(canonical.endswith(suffix) for suffix in YFINANCE_CANADIAN_SUFFIXES)
+        default_yahoo = canonical if is_canadian_suffixed else (
+            f"{canonical}.TO" if currency == "CAD" else canonical
+        )
+        match = None
+        while match is None:
+            yahoo = input(f"Yahoo symbol [{default_yahoo}]: ").strip().upper() or default_yahoo
+            if yahoo == "SKIP":
+                break
+            match = _verify_provider_symbol(yahoo, currency)
+            if match is None:
+                print(
+                    f"Could not verify {yahoo} as a {currency or 'tradeable'} security on Yahoo "
+                    f"Finance. Try again, or enter SKIP to leave {symbol} unresolved."
+                )
+        if match is None:
+            results.append({"source_symbol": symbol, "status": "skipped"})
+            continue
+        print(f"Matched: {match['company_name']} ({match['provider_symbol']}, {match['exchange']})")
         exchange = input("Exchange (for example TSX or NASDAQ): ").strip().upper()
         confirmation = input(
             f"Save {symbol} -> {canonical} ({currency}, {exchange or 'provider exchange'}, {yahoo})? [y/N]: "
@@ -183,6 +202,30 @@ def resolve_pending_interactively(db_path: Path | str = DATABASE_PATH) -> list[d
             db_path=db_path,
         ))
     return results
+
+
+def _default_yfinance_cache_dir() -> Path:
+    return Path(tempfile.gettempdir()) / "wealthsimple-yfinance-cache"
+
+
+def _verify_provider_symbol(yahoo_symbol: str, currency: str) -> dict[str, Any] | None:
+    """Confirm `yahoo_symbol` resolves to a real, currency-matching equity or
+    ETF on Yahoo Finance before it can be saved as a provider symbol mapping.
+
+    Interactive resolution previously accepted whatever text was typed
+    (including a rejected default like "no") as the literal Yahoo symbol,
+    silently mapping a source ticker to an unrelated real security.
+    """
+    stocks, etfs = fetch_security_info([{"symbol": yahoo_symbol, "currency": currency}])
+    frame = stocks if not stocks.empty else etfs
+    if frame.empty:
+        return None
+    row = frame.iloc[0]
+    return {
+        "provider_symbol": row["provider_symbol"],
+        "company_name": row["company_name"],
+        "exchange": row["exchange"],
+    }
 
 
 def list_mappings(db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
@@ -677,7 +720,7 @@ def validate_mappings(source_symbol: str | None = None,
     mappings = list_mappings(db_path)
     selected = [item for item in mappings
                 if not source_symbol or item["source_symbol"] == source_symbol.upper()]
-    configure_yfinance_cache(Path(__import__("tempfile").gettempdir()) / "wealthsimple-yfinance-cache")
+    configure_yfinance_cache(_default_yfinance_cache_dir())
     results = []
     for item in selected:
         stocks, etfs = fetch_security_info([item["provider_symbol"]])

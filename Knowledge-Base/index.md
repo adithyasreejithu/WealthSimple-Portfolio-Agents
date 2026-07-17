@@ -33,9 +33,19 @@ the `kb-discovery` agent searches it, the `kb-intake` agent writes to it.
 <!-- kb-index:begin -->
 | Page | Type | Tickers | Status | Updated | Summary |
 |---|---|---|---|---|---|
-| [Apple Inc. (AAPL) — Stock Page](stocks/AAPL.md) | stock-page | AAPL | active | 2026-07-13 | Research page for AAPL, created 2026-07-13. |
-| [Allocation Policy](portfolio/allocation-policy.md) | portfolio-page |  | final | 2026-07-11 | Narrative summary of the approved allocation policy; source of truth is ref/policy_v1_1.yaml. |
-| [Holdings](portfolio/holdings.md) | portfolio-page | AAPL, AMZN, BN, DGRO, DRAM, ENB, HIMS, INDA, L, MDA, META, NOW, NVDA, PLTR, PZA, RTX, SCHD, SMH, SPYM, T, WN, XEQT, XNDU, ZEB, ZEQT, ZGLD | generated | 2026-07-11 | Current holdings synced from the classification workflow (26 positions). |
-| [Portfolio Overview](portfolio/portfolio-overview.md) | portfolio-page |  | generated | 2026-07-11 | 26 holdings, 4 needing review, total market value 4,112.85. |
-| [Portfolio Risk Log](portfolio/risk-log.md) | portfolio-page |  | final | 2026-07-11 | Append-only register of portfolio-level risks being monitored. |
+| [iShares Core Dividend Growth ETF (DGRO) — Stock Page](stocks/DGRO.md) | stock-page | DGRO | active | 2026-07-16 | Research page for DGRO, created 2026-07-14. |
+| [iShares MSCI India ETF (INDA) — Stock Page](stocks/INDA.md) | stock-page | INDA | active | 2026-07-16 | Research page for INDA, created 2026-07-14. |
+| [IREN — Stock Page](stocks/IREN.md) | stock-page | IREN | active | 2026-07-16 | Research page for IREN, created 2026-07-16. |
+| [Schwab U.S. Dividend Equity ETF (SCHD) — Stock Page](stocks/SCHD.md) | stock-page | SCHD | active | 2026-07-16 | Research page for SCHD, created 2026-07-14. |
+| [VanEck Semiconductor ETF (SMH) — Stock Page](stocks/SMH.md) | stock-page | SMH | active | 2026-07-16 | Research page for SMH, created 2026-07-14. |
+| [Apple Inc. (AAPL) — Stock Page](stocks/AAPL.md) | stock-page | AAPL | active | 2026-07-14 | Research page for AAPL, created 2026-07-13. |
+| [Amazon.com, Inc. (AMZN) — Stock Page](stocks/AMZN.md) | stock-page | AMZN | active | 2026-07-14 | Research page for AMZN, created 2026-07-14. |
+| [Brookfield Corporation (BN) — Stock Page](stocks/BN.md) | stock-page | BN | active | 2026-07-14 | Research page for BN, created 2026-07-14. |
+| [Roundhill Memory ETF (DRAM) — Stock Page](stocks/DRAM.md) | stock-page | DRAM | active | 2026-07-14 | Research page for DRAM, created 2026-07-14. |
+| [Enbridge Inc. (ENB) — Stock Page](stocks/ENB.md) | stock-page | ENB | active | 2026-07-14 | Research page for ENB, created 2026-07-14. |
+| [Hims & Hers Health, Inc. (HIMS) — Stock Page](stocks/HIMS.md) | stock-page | HIMS | active | 2026-07-14 | Research page for HIMS, created 2026-07-14. |
+| [Loblaw Companies Limited (L) — Stock Page](stocks/L.md) | stock-page | L | active | 2026-07-14 | Research page for L, created 2026-07-14. |
+| [MDA Space Ltd. (MDA) — Stock Page](stocks/MDA.md) | stock-page | MDA | active | 2026-07-14 | Research page for MDA, created 2026-07-14. |
+| [Meta Platforms, Inc. (META) — Stock Page](stocks/META.md) | stock-page | META | active | 2026-07-14 | Research page for META, created 2026-07-14. |
+| [ServiceNow, Inc. (NOW) — Stock Page](stocks/NOW.md) | stock-page | NOW | active | 2026-07-14 | Research page for NOW, created 2026-07-14. |
 <!-- kb-index:end -->

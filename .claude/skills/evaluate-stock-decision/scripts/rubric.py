@@ -32,11 +32,29 @@ SCORE_MIN = 1
 SCORE_MAX = 5
 WEIGHT_SUM_TOLERANCE = 1e-6
 
-# applies_when values the rubric may use on gates/dimensions.
+# applies_when values the rubric may use on gates/dimensions. A gate/dimension
+# may carry a single value or a list of values (all conditions must hold, e.g.
+# `[income_role, equity_only]` for a gate that only applies to income equities).
 APPLIES_ALWAYS = "always"
 APPLIES_DIVIDEND_PAYER = "dividend_payer"
 APPLIES_INCOME_ROLE = "income_role"
-VALID_APPLIES_WHEN = (APPLIES_ALWAYS, APPLIES_DIVIDEND_PAYER, APPLIES_INCOME_ROLE)
+APPLIES_EQUITY_ONLY = "equity_only"
+APPLIES_ETF_ONLY = "etf_only"
+VALID_APPLIES_WHEN = (
+    APPLIES_ALWAYS,
+    APPLIES_DIVIDEND_PAYER,
+    APPLIES_INCOME_ROLE,
+    APPLIES_EQUITY_ONLY,
+    APPLIES_ETF_ONLY,
+)
+
+
+def _applies_conditions(entry: dict) -> list[str]:
+    """Normalize an entry's `applies_when` to a list of conditions (all must hold)."""
+    applies = entry.get("applies_when", APPLIES_ALWAYS)
+    if isinstance(applies, list):
+        return [str(item) for item in applies]
+    return [str(applies)]
 
 
 class RubricError(ValueError):
@@ -73,6 +91,18 @@ def _evidence_sources(entry: dict) -> list[str]:
         if isinstance(field, str) and ":" in field:
             sources.append(field.split(":", 1)[0])
     return sources
+
+
+def _validate_applies_when(entry: dict, label: str) -> list[str]:
+    """Validate an entry's applies_when (string or list). Return problems."""
+    problems: list[str] = []
+    conditions = _applies_conditions(entry)
+    for cond in conditions:
+        if cond not in VALID_APPLIES_WHEN:
+            problems.append(f"{label}: unknown applies_when '{cond}'")
+    if APPLIES_EQUITY_ONLY in conditions and APPLIES_ETF_ONLY in conditions:
+        problems.append(f"{label}: applies_when cannot require both equity_only and etf_only")
+    return problems
 
 
 def validate_rubric(rubric: dict, framework: dict | None = None) -> list[str]:
@@ -117,9 +147,7 @@ def validate_rubric(rubric: dict, framework: dict | None = None) -> list[str]:
         if gid in gate_ids:
             errors.append(f"duplicate gate id '{gid}'")
         gate_ids.add(gid)
-        applies = gate.get("applies_when", APPLIES_ALWAYS)
-        if applies not in VALID_APPLIES_WHEN:
-            errors.append(f"gate '{gid}': unknown applies_when '{applies}'")
+        errors.extend(_validate_applies_when(gate, f"gate '{gid}'"))
         if not str(gate.get("fail_when", "")).strip():
             errors.append(f"gate '{gid}': missing 'fail_when' criteria")
         for src in _evidence_sources(gate):
@@ -132,7 +160,6 @@ def validate_rubric(rubric: dict, framework: dict | None = None) -> list[str]:
         errors.append("'dimensions' must be a non-empty list")
         dimensions = []
     dim_ids: set[str] = set()
-    weight_total = 0.0
     for dim in dimensions:
         did = dim.get("id") if isinstance(dim, dict) else None
         if not did:
@@ -144,19 +171,31 @@ def validate_rubric(rubric: dict, framework: dict | None = None) -> list[str]:
         weight = dim.get("weight")
         if not isinstance(weight, (int, float)) or not (0 < weight <= 1):
             errors.append(f"dimension '{did}': weight must be a number in (0, 1]")
-        else:
-            weight_total += float(weight)
-        applies = dim.get("applies_when", APPLIES_ALWAYS)
-        if applies not in VALID_APPLIES_WHEN:
-            errors.append(f"dimension '{did}': unknown applies_when '{applies}'")
+        errors.extend(_validate_applies_when(dim, f"dimension '{did}'"))
         anchors = dim.get("anchors")
         if not isinstance(anchors, dict) or not {"1", "3", "5"}.issubset(anchors.keys()):
             errors.append(f"dimension '{did}': anchors must define at least '1', '3', and '5'")
         for src in _evidence_sources(dim):
             if src not in registered:
                 errors.append(f"dimension '{did}': evidence source '{src}' is not registered under 'sources'")
-    if dimensions and abs(weight_total - 1.0) > 1e-3:
-        errors.append(f"dimension weights must sum to 1.0, got {weight_total:.4f}")
+
+    # Weights must sum to 1.0 within each asset-class track: a single security is
+    # only ever scored on the dimensions applicable to its track, and the weighted
+    # average renormalizes over that subset. Both tracks are checked under the
+    # most-permissive conditionals (dividend_payer/income_role true) so that every
+    # dimension that could ever apply is counted once.
+    if dimensions and not any("must be a number in (0, 1]" in e for e in errors):
+        for track, is_etf in (("equity", False), ("etf", True)):
+            total = sum(
+                float(dim["weight"])
+                for dim in dimensions
+                if isinstance(dim, dict)
+                and isinstance(dim.get("weight"), (int, float))
+                and not isinstance(dim.get("weight"), bool)
+                and is_applicable(dim, dividend_payer=True, income_role=True, is_etf=is_etf)
+            )
+            if abs(total - 1.0) > 1e-3:
+                errors.append(f"{track}-track dimension weights must sum to 1.0, got {total:.4f}")
 
     # Verdict bands: cover the range, known actions, gate_fail present.
     bands = rubric.get("verdict_bands")
@@ -198,6 +237,15 @@ def validate_rubric(rubric: dict, framework: dict | None = None) -> list[str]:
             for level in conf:
                 if level not in confidence_levels:
                     errors.append(f"confidence_rules level '{level}' not in decision-framework confidence_levels")
+        for level in ("High", "Medium"):
+            rule = conf.get(level)
+            if not isinstance(rule, dict):
+                continue
+            threshold = rule.get("min_groups_ok", 0)
+            if isinstance(threshold, dict) and not {"equity", "etf"}.issubset(threshold.keys()):
+                errors.append(
+                    f"confidence_rules.{level}.min_groups_ok mapping must define both 'equity' and 'etf'"
+                )
 
     # Time horizon rules cross-check (optional section, but validate if present).
     horizon_rules = rubric.get("time_horizon_rules")
@@ -211,35 +259,49 @@ def validate_rubric(rubric: dict, framework: dict | None = None) -> list[str]:
 
 # --- Application helpers (shared math) -------------------------------------
 
-def is_applicable(entry: dict, *, dividend_payer: bool, income_role: bool) -> bool:
-    """Whether a gate/dimension applies given the position's context."""
-    applies = entry.get("applies_when", APPLIES_ALWAYS)
-    if applies == APPLIES_ALWAYS:
-        return True
-    if applies == APPLIES_DIVIDEND_PAYER:
-        return dividend_payer
-    if applies == APPLIES_INCOME_ROLE:
-        return income_role
+def is_applicable(entry: dict, *, dividend_payer: bool, income_role: bool, is_etf: bool = False) -> bool:
+    """Whether a gate/dimension applies given the position's context.
+
+    All conditions in a (possibly list-valued) `applies_when` must hold.
+    `equity_only` applies to non-funds, `etf_only` to funds.
+    """
+    for cond in _applies_conditions(entry):
+        if cond == APPLIES_ALWAYS:
+            continue
+        if cond == APPLIES_DIVIDEND_PAYER and not dividend_payer:
+            return False
+        if cond == APPLIES_INCOME_ROLE and not income_role:
+            return False
+        if cond == APPLIES_EQUITY_ONLY and is_etf:
+            return False
+        if cond == APPLIES_ETF_ONLY and not is_etf:
+            return False
     return True
 
 
-def applicable_dimensions(rubric: dict, *, dividend_payer: bool, income_role: bool) -> list[dict]:
+def applicable_dimensions(
+    rubric: dict, *, dividend_payer: bool, income_role: bool, is_etf: bool = False
+) -> list[dict]:
     return [
         dim
         for dim in rubric.get("dimensions", [])
-        if is_applicable(dim, dividend_payer=dividend_payer, income_role=income_role)
+        if is_applicable(dim, dividend_payer=dividend_payer, income_role=income_role, is_etf=is_etf)
     ]
 
 
-def applicable_gates(rubric: dict, *, dividend_payer: bool, income_role: bool) -> list[dict]:
+def applicable_gates(
+    rubric: dict, *, dividend_payer: bool, income_role: bool, is_etf: bool = False
+) -> list[dict]:
     return [
         gate
         for gate in rubric.get("gates", [])
-        if is_applicable(gate, dividend_payer=dividend_payer, income_role=income_role)
+        if is_applicable(gate, dividend_payer=dividend_payer, income_role=income_role, is_etf=is_etf)
     ]
 
 
-def weighted_score(scores: dict[str, object], rubric: dict, *, dividend_payer: bool, income_role: bool) -> float | None:
+def weighted_score(
+    scores: dict[str, object], rubric: dict, *, dividend_payer: bool, income_role: bool, is_etf: bool = False
+) -> float | None:
     """Weighted average over applicable, numerically-scored dimensions.
 
     `scores` maps dimension id -> 1..5 int or "unknown"/None. Unknown and
@@ -248,7 +310,9 @@ def weighted_score(scores: dict[str, object], rubric: dict, *, dividend_payer: b
     """
     numerator = 0.0
     weight_sum = 0.0
-    for dim in applicable_dimensions(rubric, dividend_payer=dividend_payer, income_role=income_role):
+    for dim in applicable_dimensions(
+        rubric, dividend_payer=dividend_payer, income_role=income_role, is_etf=is_etf
+    ):
         raw = scores.get(dim["id"])
         if not isinstance(raw, (int, float)) or isinstance(raw, bool):
             continue
@@ -274,8 +338,17 @@ def lookup_action(score: float | None, *, gate_failed: bool, held: bool, rubric:
     return sorted(bands[state], key=lambda b: b["min"])[0]["action"]
 
 
+def _min_groups_ok(rule: dict, *, is_etf: bool) -> int:
+    """Resolve a confidence rule's min_groups_ok, which may be an int (both tracks)
+    or a per-track mapping {equity: N, etf: N}."""
+    threshold = rule.get("min_groups_ok", 0)
+    if isinstance(threshold, dict):
+        return int(threshold.get("etf" if is_etf else "equity", 0))
+    return int(threshold)
+
+
 def evaluate_confidence(
-    *, unknown_dimensions: int, unknown_gates: int, groups_ok: int, rubric: dict
+    *, unknown_dimensions: int, unknown_gates: int, groups_ok: int, rubric: dict, is_etf: bool = False
 ) -> str:
     """Return the highest confidence level whose thresholds are all satisfied."""
     conf = rubric["confidence_rules"]
@@ -287,7 +360,7 @@ def evaluate_confidence(
             continue
         if unknown_gates > rule.get("max_unknown_gates", 0):
             continue
-        if groups_ok < rule.get("min_groups_ok", 0):
+        if groups_ok < _min_groups_ok(rule, is_etf=is_etf):
             continue
         return level
     return "Low"

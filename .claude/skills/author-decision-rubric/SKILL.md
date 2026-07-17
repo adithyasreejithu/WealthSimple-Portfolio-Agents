@@ -28,7 +28,12 @@ it; only this skill does, and only with the user in the loop.
    touches (gate `fail_when`, a dimension `weight`, an `anchors` cutoff, a
    `verdict_bands` entry, a `confidence_rules` threshold, or the `sources:`
    registry). If a weight changes, remember the dimension weights must still sum
-   to 1.0 -- adjust another weight to compensate.
+   to 1.0 **within each asset-class track**: the dimensions applicable to an
+   equity (`always` + `equity_only` + conditionals) sum to 1.0, and the
+   dimensions applicable to a fund (`always` + `etf_only` + conditionals) sum to
+   1.0 independently. Adding or reweighting an `etf_only` dimension means
+   rebalancing the fund track, an `equity_only` one the equity track -- adjust
+   the other weights in that track to compensate.
 2. **Edit `Knowledge-Base/taxonomy/decision-rubric.yml`** directly with `Edit`.
    Change only what the user asked for; keep the comments accurate.
 3. **Bump the version** whenever gates, weights, verdict bands, or sources

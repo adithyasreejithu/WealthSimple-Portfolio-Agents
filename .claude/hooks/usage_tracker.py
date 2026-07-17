@@ -96,6 +96,53 @@ def parse_transcript_usage(path: object) -> dict | None:
         return None
 
 
+def parse_transcript_span(path: object) -> int | None:
+    """Return elapsed seconds between the first and last timestamp in a
+    transcript JSONL file, or None if it can't be determined.
+
+    Used to derive main-session length on SessionEnd, the same best-effort
+    way parse_transcript_usage derives subagent duration.
+    """
+    try:
+        first_ts: datetime | None = None
+        last_ts: datetime | None = None
+        timestamp_count = 0
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                timestamp = _parse_timestamp(entry.get("timestamp"))
+                if timestamp is None:
+                    continue
+                timestamp_count += 1
+                if first_ts is None:
+                    first_ts = timestamp
+                last_ts = timestamp
+        if timestamp_count < 2 or first_ts is None or last_ts is None or last_ts < first_ts:
+            return None
+        return int((last_ts - first_ts).total_seconds())
+    except Exception:
+        return None
+
+
+def _format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
 def _format_tokens(usage: dict | None) -> str:
     if not usage:
         return "tokens=unknown"
@@ -119,7 +166,13 @@ def _format_session_start(payload: dict) -> str:
 
 def _format_session_end(payload: dict) -> str:
     reason = payload.get("reason") or payload.get("source") or "-"
-    return f"{_now()} | SESSION END | id={_short_id(payload.get('session_id'))} | reason={reason}\n"
+    fields = [f"id={_short_id(payload.get('session_id'))}", f"reason={reason}"]
+    transcript_path = payload.get("transcript_path")
+    span_seconds = parse_transcript_span(transcript_path) if transcript_path else None
+    fields.append(
+        f"duration={_format_duration(span_seconds)}" if span_seconds is not None else "duration=unknown"
+    )
+    return f"{_now()} | SESSION END | " + " | ".join(fields) + "\n"
 
 
 def _format_skill(payload: dict) -> str | None:

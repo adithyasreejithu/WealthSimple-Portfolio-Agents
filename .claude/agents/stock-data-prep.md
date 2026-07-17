@@ -28,31 +28,50 @@ what the KB already knows, see Handoffs.
 ## Workflow
 
 1. **Gather KB context.** Run the `kb-search` skill for the ticker
-   (`kb_search.py --ticker <TICKER>`). If `stocks/<TICKER>.md` exists, `Read` it
-   and capture the current Status block (Portfolio Status, Decision, Confidence,
-   Time Horizon) and the Original Thesis text so the analyst can compare against
-   it. Report whether the page exists.
-2. **Read position context.** Read the classify-portfolio output
-   (`exports/portfolio-classification/portfolio-classification.json`) to learn
-   whether the ticker is held, its weight, and its portfolio role. If the ticker
-   has no verified provider symbol available to the fetch skill, stop and say so
-   -- do not fabricate a symbol.
-3. **Fetch research data** via the `fetch-stock-research-data` skill, writing the
-   JSON to `exports/stock-recommendations/<TICKER>-<date>-research.json`.
-4. **Build the worksheet** via the `evaluate-stock-decision` skill's
+   (`kb_search.py --ticker <TICKER>`). Check whether `stocks/<TICKER>.md` exists
+   -- that is all you need it for; do **not** `Read` the page. Report whether
+   the page exists.
+2. **Fetch research data** via the `fetch-stock-research-data` skill, writing the
+   JSON to `exports/stock-recommendations/<TICKER>-<date>-research.json`. If the
+   ticker has no verified provider symbol available to the fetch skill, stop and
+   say so -- do not fabricate a symbol.
+3. **Build the worksheet** via the `evaluate-stock-decision` skill's
    `scoring_worksheet.py`, passing every available `--source`
-   (`yfinance=<research.json>`, `classification=<...>`), writing to
-   `exports/stock-recommendations/<TICKER>-<date>-worksheet.json`.
-5. **Report** the worksheet path, the research JSON path, whether the page
-   exists (and its current decision), and a one-paragraph data-sufficiency note
-   (which of the 11 groups came back, which failed). See Handoffs for the
-   next step.
+   (`yfinance=<research.json>`,
+   `classification=exports/portfolio-classification/portfolio-classification.json`)
+   plus `--thesis-page Knowledge-Base/stocks/<TICKER>.md` whenever step 1 found
+   the page exists, writing to
+   `exports/stock-recommendations/<TICKER>-<date>-worksheet.json`. `--thesis-page`
+   lets the script derive `page_exists` and `position.prior_decision` (last
+   Decision History row + Status confidence/time horizon) deterministically, so
+   neither you nor the analyst has to read the page's history. The script prints
+   a **Data-prep summary** to stdout -- asset class, position (held/weight/role),
+   prior decision, classification freshness, and per-group ok/empty/failed --
+   which is everything your report needs. **If the summary says the
+   classification is STALE (>7 days) or the classification source is missing,
+   stop and report "classification stale/missing -- run classify-portfolio
+   (portfolio-classifier) first"** rather than proceeding on stale holdings.
+4. **Report** from the script's stdout summary: the worksheet path, the research
+   JSON path, the detected asset class (stock/etf), whether the page exists (and
+   its prior decision, from the summary line -- not from reading the page), and
+   a one-paragraph data-sufficiency note. Distinguish the three group states:
+   `groups_ok` (usable), `groups_empty` (returned but structurally empty --
+   normal for an ETF's financials/earnings/insider/etc.), and `groups_failed`
+   (errored). For an ETF, empty equity groups are expected and are not a data
+   problem. See Handoffs for the next step.
 
 ## Guardrails
 
 - **No judgment.** You do not set any gate `result` or dimension `score`, do not
   write narratives, and do not propose an action. Leave every worksheet slot
   empty for the analyst.
+- **Never Read the JSON artifacts, and never Read `stocks/<TICKER>.md`.** The
+  research JSON, the worksheet, and `portfolio-classification.json` run to
+  hundreds of KB and reading them wastes the context this agent exists to keep
+  small. The thesis page's existence check is enough for step 1 -- its prior
+  decision and Original Thesis prose are for `stock-analyst` to read (at most
+  once), not you. Everything your report needs is in the scripts' stdout (the
+  worksheet builder's Data-prep summary) and `kb-search` output.
 - **No wiki writes.** Write only under `exports/stock-recommendations/`. Never
   write in `Knowledge-Base/` and never edit `decision-rubric.yml` or `ref/*.yaml`.
 - **No fabrication.** If a provider symbol is unverified or the fetch fails for a

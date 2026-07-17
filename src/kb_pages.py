@@ -271,6 +271,68 @@ def replace_section(body: str, header: str, content: str) -> str:
     return result
 
 
+STATUS_BLOCK_KEYS = {
+    "Portfolio Status": "portfolio_status",
+    "Portfolio Role": "portfolio_role",
+    "Decision": "decision",
+    "Confidence": "confidence",
+    "Time Horizon": "time_horizon",
+    "Last Updated": "last_updated",
+}
+
+
+def parse_status_block(body: str) -> dict:
+    """Extract the '## Status' section's '- Key: value' lines as a dict.
+
+    Keys whose line is absent from the page are omitted, not set to None.
+    """
+    result: dict[str, str] = {}
+    in_section = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## Status"):
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if stripped.startswith("## "):
+            break
+        for label, key in STATUS_BLOCK_KEYS.items():
+            prefix = f"- {label}:"
+            if stripped.startswith(prefix):
+                result[key] = stripped[len(prefix):].strip()
+    return result
+
+
+def decision_history_rows(body: str) -> list[dict]:
+    """Every '## Decision History' table row as {"date", "action", "verdict", "note"}.
+
+    Header/separator rows are skipped naturally -- their first cell never
+    matches DATE_PATTERN.
+    """
+    rows: list[dict] = []
+    in_section = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## Decision History"):
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if stripped.startswith("## "):
+            break
+        if stripped.startswith("|"):
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if len(cells) >= 4 and DATE_PATTERN.match(cells[0]):
+                rows.append({"date": cells[0], "action": cells[1], "verdict": cells[2], "note": cells[3]})
+    return rows
+
+
+def last_decision_history_row(body: str) -> dict | None:
+    rows = decision_history_rows(body)
+    return rows[-1] if rows else None
+
+
 def _sort_key(item: tuple[dict, str]) -> tuple[str, str]:
     meta, link = item
     updated = _date_text(meta.get("updated")) or "0000-00-00"

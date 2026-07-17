@@ -33,7 +33,7 @@ This zone contains the editable portfolio classification reference files used by
 The classifier in `src/portfolio_classifier.py` loads these YAML files directly. The app also exposes a sample command for quick inspection:
 
 ```bash
-python src/app.py portfolio-classify
+uv run python src/app.py portfolio-classify
 ```
 
 The repository still keeps the local portfolio database as the runtime source of holdings and transactions. These YAML files define policy and classification behavior only.

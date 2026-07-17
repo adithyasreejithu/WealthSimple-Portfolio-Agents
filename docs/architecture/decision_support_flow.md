@@ -51,9 +51,21 @@ Evidence fields are source-qualified (`"yfinance:data.valuation.forwardPE"`,
 `"derived:fcf_yield"`, `"classification:holdings.primary_group"`). Today the
 sources are:
 
-- `yfinance` — the fetch-stock-research-data pull (11 groups).
-- `classification` — the classify-portfolio holdings JSON (portfolio-fit).
-- `derived` — metrics computed deterministically by `scoring_worksheet.py`.
+- `yfinance` — the fetch-stock-research-data pull (12 groups, including the
+  fund-only `funds` group from `get_funds_data()`).
+- `classification` — the classify-portfolio holdings JSON (portfolio-fit, plus
+  `asset_class` and the `etf_details` fields expense_ratio/aum/nav/
+  sector_weights/top_holdings that the fund dimensions cite).
+- `derived` — metrics computed deterministically by `scoring_worksheet.py`,
+  including the options-positioning set (put/call OI and volume ratios, ATM IV
+  near/far, IV skew, max-OI strikes).
+
+**Asset-class awareness.** The rubric has two tracks. Company gates/dimensions
+(solvency, profitability, financial_health, growth, earnings_catalysts,
+insider_activity) are `equity_only`; `fund_efficiency` and `fund_quality` are
+`etf_only`. A fund is scored on the fund track, so structurally-absent company
+data is *excluded* (weights renormalize) rather than scored `unknown` — an ETF is
+no longer forced to Low confidence for lacking a balance sheet.
 
 **Adding a source** (a filings API, ingested documents, peer data) means adding
 an entry to `sources:` and any criteria that cite it — the recommendation
@@ -82,6 +94,31 @@ The recommendation carries both:
   changes the action. Persistent dissent is the signal to retune the rubric via
   the `author-decision-rubric` skill.
 
+## Deterministic prior-decision context and verdict precompute
+
+Two pieces of the workflow exist purely to stop the analyst from re-deriving
+information a script can hand it directly (see
+`docs/plans/stock-analyst-token-reduction.md` for the transcript analysis that
+motivated them):
+
+- **`position.prior_decision`** — `scoring_worksheet.py --thesis-page
+  <stocks/TICKER.md>` deterministically extracts the ticker's last recorded
+  `{date, action, verdict, confidence, time_horizon}` from the page's Decision
+  History table and Status block (`null` for a new page) and embeds it in the
+  worksheet. The analyst uses this directly for `proposed.verdict_vs_previous`
+  reasoning and never reads old dated artifacts under
+  `exports/stock-recommendations/` or scans the thesis page's history itself.
+- **`validate_recommendation.py --precompute-only`** — prints the deterministic
+  `weighted_score`/`action`/`confidence`/`default_time_horizon` for whatever
+  gates/dimensions are filled in so far (skipping citation resolution and
+  narrative checks), from the same `compute_verdict()` function the full
+  validator uses. The analyst iterates against this while scoring instead of
+  importing `rubric.py` internals by hand to predict what the validator will
+  accept.
+
+Both are advisory/context-only: the full `validate_recommendation.py` run (no
+flag) remains the actual gate before an artifact is saved.
+
 ## Multi-ticker / batch runs
 
 Evaluating several tickers in one request splits into a parallel half and a
@@ -92,20 +129,44 @@ sequential half:
   `exports/stock-recommendations/<TICKER>-<date>-*.json` -- a unique path per
   ticker. Fan these out concurrently across tickers; there is no shared
   mutable state for them to race on.
-- **Sequential only: the `kb-intake` wiki-commit step.** `kb-update-thesis`'s
-  helpers in `src/kb_pages.py` (`rebuild_index`, `rebuild_thesis_views`,
-  `rebuild_main_index`, `append_log_row`) each read a shared file in full,
-  compute new contents, and overwrite the whole file -- there is no lock or
-  version check. `stocks/index.md`, `theses/<status>/index.md`, the main
-  `index.md`, and `logs/*.md` are all touched by every ticker's commit. Two
-  tickers committed concurrently can each read the file before the other
-  writes back, so the second write silently clobbers the first ticker's row
-  instead of erroring. Commit tickers one at a time, in a loop, through
-  `kb-intake`.
+- **Sequential only: the wiki-commit step — and it is ONE `kb-intake`
+  invocation, not N.** `kb-update-thesis`'s helpers in `src/kb_pages.py`
+  (`rebuild_index`, `rebuild_thesis_views`, `rebuild_main_index`,
+  `append_log_row`) each read a shared file in full, compute new contents, and
+  overwrite the whole file -- there is no lock or version check. `stocks/index.md`,
+  `theses/<status>/index.md`, the main `index.md`, and `logs/*.md` are all
+  touched by every ticker's commit, so two concurrent commits silently clobber
+  each other's rows. But sequential does **not** mean one agent spawn per
+  ticker: `ingest_recommendation.py` is fully deterministic (no LLM call), so
+  spawning a fresh kb-intake agent per artifact just re-pays the agent's whole
+  context ~N times for a mechanical step (observed at ~1M+ tokens per spawn).
+  Invoke **one** `kb-intake` agent with the full artifact list; it loops
+  `ingest_recommendation.py` over them one at a time via Bash and reports the
+  per-ticker script output. It must not Read the artifacts -- the script output
+  is its report input.
 
 The pattern for N tickers: run `stock-data-prep` + `stock-analyst` for all N
-concurrently, wait for every recommendation artifact, then walk the
-artifacts through `kb-intake` one at a time.
+concurrently — **one agent invocation per ticker**, split into an ETF batch and a
+stock batch run at the same time — wait for every recommendation artifact, then
+hand the whole artifact list to **a single `kb-intake` invocation** that commits
+them sequentially.
+
+**Anti-pattern (observed on the first full-portfolio run):** handing a single
+`stock-data-prep` (or `stock-analyst`) agent a list of all N tickers to loop
+over. That serializes the entire fetch/score phase inside one agent context and
+throws away the parallelism this boundary exists to enable — the 23-holding run
+took one long sequential pass instead of N concurrent ones. Fan out N separate
+invocations; do not loop inside one. (The commit step is the deliberate
+exception: it is mechanical script execution, not analysis, so one looping
+agent is cheaper than N spawns and just as correct.)
+
+**Model tiering:** the equity-batch `stock-analyst` invocations run on the
+agent's default model (Opus) — that judgment is where the strongest model is
+worth it. The **ETF batch** scores fund-appropriate criteria (expense ratio,
+concentration, distributions), a materially simpler judgment: invoke those
+stock-analyst runs with a `model: sonnet` override (Agent tool `model`
+parameter). The validator recomputes all rubric arithmetic regardless of model,
+so the verdict math cannot drift with the model choice.
 
 ## Ownership
 
@@ -122,8 +183,14 @@ yet, `Technical Analysis` stays a manual thesis-page section), peer/sector-relat
 and historical valuation (needs a new multi-ticker source), and automatic status
 transitions on Buy/Sell (only user-confirmed trades change Portfolio Status).
 
-Headline-level news sentiment, options put/call skew, and insider transaction
-direction are scored today (`market_sentiment`, `options_activity`,
-`insider_activity` dimensions) from data `fetch-stock-research-data` already
-pulls -- but only at the coarse level available in the raw yfinance groups, not
-deeper NLP sentiment scoring or unusual-volume options detection.
+Headline-level news sentiment, insider transaction direction, and a fuller
+options-positioning read are scored today (`market_sentiment`,
+`options_activity`, `insider_activity` dimensions). `options_activity` now goes
+beyond a single put/call OI ratio: `scoring_worksheet.py` derives the put/call
+volume ratio, ATM IV term structure (near vs far expiry), IV skew, and the
+max-open-interest strikes from the fetched chains. Still deferred (data yfinance
+does not provide, no matter the code): implied-volatility history/percentile
+("is IV high *for this name*"), unusual-activity detection versus a volume
+baseline, option greeks, and intraday flow. Those need an options-history or
+flow source, not more computation on the end-of-day snapshot — see
+`docs/reference/yfinance_data_availability.md`.

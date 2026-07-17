@@ -12,6 +12,14 @@
 
 ## Backlog
 
+- Implement technical analysis for the stock decision-support system per the
+  proposed plan in `docs/plans/stock-decision-support-technical-analysis.md`
+  (awaiting approval): new `analyze-stock-technicals` skill computing
+  SMA/RSI/MACD/support-resistance/gaps/volume/relative-strength from the
+  already-fetched OHLCV history, generic-source fixes in
+  `scoring_worksheet.py`/`validate_recommendation.py`, and rubric v1.2 with a
+  scored `technical` dimension (0.08, funded from `market_sentiment`).
+
 - Add operational monitoring for partial email runs and failed Yahoo symbols.
 - Add a review command for email/statement rows that cannot be reconciled by ticker,
   direction, execution date, and quantity.

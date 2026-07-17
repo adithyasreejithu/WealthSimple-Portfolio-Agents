@@ -4,8 +4,23 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+
 import database
 import ticker_mapping
+import yfinance_extractor
+
+
+_EMPTY_STOCKS = pd.DataFrame(columns=yfinance_extractor.STOCK_INFO_COLUMNS)
+_EMPTY_ETFS = pd.DataFrame(columns=yfinance_extractor.ETF_INFO_COLUMNS)
+
+
+def _stock_match(provider_symbol: str, company_name: str = "MDA Space Ltd.", exchange: str = "Toronto") -> pd.DataFrame:
+    return pd.DataFrame([{
+        "ticker": provider_symbol, "provider_symbol": provider_symbol,
+        "company_name": company_name, "asset": "EQUITY", "exchange": exchange,
+        "currency": "CAD", "financial_currency": "CAD", "sector": "Industrials", "industry": "Aerospace & Defense",
+    }], columns=yfinance_extractor.STOCK_INFO_COLUMNS)
 
 
 class TickerMappingInteractionTest(unittest.TestCase):
@@ -18,6 +33,8 @@ class TickerMappingInteractionTest(unittest.TestCase):
         with (
             patch.object(ticker_mapping, "list_pending", return_value=pending),
             patch.object(ticker_mapping, "add_mapping") as add_mapping,
+            patch.object(ticker_mapping, "configure_yfinance_cache"),
+            patch.object(ticker_mapping, "fetch_security_info", return_value=(_stock_match("XNDU.TO"), _EMPTY_ETFS)),
             patch("builtins.input", side_effect=lambda *_: next(answers)),
         ):
             result = ticker_mapping.resolve_pending_interactively("portfolio.duckdb")
@@ -35,6 +52,8 @@ class TickerMappingInteractionTest(unittest.TestCase):
         with (
             patch.object(ticker_mapping, "list_pending", return_value=pending),
             patch.object(ticker_mapping, "add_mapping", return_value=expected) as add_mapping,
+            patch.object(ticker_mapping, "configure_yfinance_cache"),
+            patch.object(ticker_mapping, "fetch_security_info", return_value=(_stock_match("MDA.TO"), _EMPTY_ETFS)),
             patch("builtins.input", side_effect=lambda *_: next(answers)),
         ):
             result = ticker_mapping.resolve_pending_interactively("portfolio.duckdb")
@@ -45,6 +64,92 @@ class TickerMappingInteractionTest(unittest.TestCase):
             db_path="portfolio.duckdb",
         )
         self.assertEqual(result, [expected])
+
+    def test_interactive_pending_mapping_rejects_unverifiable_symbol_then_retries(self):
+        """A typed value (like "no", meant to reject a bad default) must not be
+        silently saved as the provider symbol -- it has to fail verification
+        and re-prompt, since this is exactly how MDA got mapped to "NO"."""
+        pending = [{
+            "source_symbol": "MDA", "detected_currency": "CAD",
+            "trade_count": 1, "first_seen": None, "last_seen": None,
+        }]
+        answers = iter(["", "", "NO", "", "TSX", "yes"])
+        expected = {"source_symbol": "MDA", "status": "verified"}
+        fetch_results = iter([
+            (_EMPTY_STOCKS, _EMPTY_ETFS),
+            (_stock_match("MDA.TO"), _EMPTY_ETFS),
+        ])
+        with (
+            patch.object(ticker_mapping, "list_pending", return_value=pending),
+            patch.object(ticker_mapping, "add_mapping", return_value=expected) as add_mapping,
+            patch.object(ticker_mapping, "configure_yfinance_cache"),
+            patch.object(ticker_mapping, "fetch_security_info", side_effect=lambda *_: next(fetch_results)),
+            patch("builtins.input", side_effect=lambda *_: next(answers)),
+        ):
+            result = ticker_mapping.resolve_pending_interactively("portfolio.duckdb")
+
+        add_mapping.assert_called_once_with(
+            "MDA", "MDA", "MDA.TO", "CAD", "TSX",
+            reason="resolved pending email ticker", created_by="interactive-cli",
+            db_path="portfolio.duckdb",
+        )
+        self.assertEqual(result, [expected])
+
+    def test_interactive_pending_mapping_skip_keyword_abandons_symbol(self):
+        pending = [{
+            "source_symbol": "MDA", "detected_currency": "CAD",
+            "trade_count": 1, "first_seen": None, "last_seen": None,
+        }]
+        answers = iter(["", "", "skip"])
+        with (
+            patch.object(ticker_mapping, "list_pending", return_value=pending),
+            patch.object(ticker_mapping, "add_mapping") as add_mapping,
+            patch.object(ticker_mapping, "configure_yfinance_cache"),
+            patch.object(ticker_mapping, "fetch_security_info") as fetch_security_info,
+            patch("builtins.input", side_effect=lambda *_: next(answers)),
+        ):
+            result = ticker_mapping.resolve_pending_interactively("portfolio.duckdb")
+
+        fetch_security_info.assert_not_called()
+        add_mapping.assert_not_called()
+        self.assertEqual(result, [{"source_symbol": "MDA", "status": "skipped"}])
+
+    def test_interactive_pending_mapping_does_not_double_suffix_canadian_canonical(self):
+        """Regression test: entering a canonical symbol that already carries the
+        .TO suffix must not produce a "SYMBOL.TO.TO" default, which is what
+        confused the user into typing "no" in the first place."""
+        pending = [{
+            "source_symbol": "MDA", "detected_currency": "CAD",
+            "trade_count": 1, "first_seen": None, "last_seen": None,
+        }]
+        prompts: list[str] = []
+        fixed_answers = {
+            "Currency [CAD/USD] [CAD]: ": "",
+            "Canonical symbol [MDA]: ": "MDA.TO",
+        }
+        remaining_answers = iter(["", "TSX", "yes"])
+
+        def _record_and_answer(prompt: str) -> str:
+            prompts.append(prompt)
+            if prompt in fixed_answers:
+                return fixed_answers[prompt]
+            return next(remaining_answers)
+        expected = {"source_symbol": "MDA", "status": "verified"}
+        with (
+            patch.object(ticker_mapping, "list_pending", return_value=pending),
+            patch.object(ticker_mapping, "add_mapping", return_value=expected) as add_mapping,
+            patch.object(ticker_mapping, "configure_yfinance_cache"),
+            patch.object(ticker_mapping, "fetch_security_info", return_value=(_stock_match("MDA.TO"), _EMPTY_ETFS)),
+            patch("builtins.input", side_effect=_record_and_answer),
+        ):
+            ticker_mapping.resolve_pending_interactively("portfolio.duckdb")
+
+        self.assertIn("Yahoo symbol [MDA.TO]: ", prompts)
+        add_mapping.assert_called_once_with(
+            "MDA", "MDA.TO", "MDA.TO", "CAD", "TSX",
+            reason="resolved pending email ticker", created_by="interactive-cli",
+            db_path="portfolio.duckdb",
+        )
 
 
 class ListPendingTest(unittest.TestCase):

@@ -115,14 +115,14 @@ is handled by a separate, decoupled pipeline stage, not by the agent:
   output deliberately never exposes internal DB primary keys), and fully
   replaces the contents of the `portfolio_classifications` table (delete
   then re-insert, in one transaction) every run.
-- `python src/app.py classification-sync` is the CLI entry point for this
+- `uv run python src/app.py classification-sync` is the CLI entry point for this
   step, following the same "extract, then separately sync" split already
   used for market data (`src/yfinance_extractor.py` fetches;
   `src/market_data.py` + `src/database_command.py` persist).
 
 This keeps the "read-only agent" guarantee intact — `classification-sync` is
 a distinct, explicitly-invoked pipeline command, never run implicitly as
-part of "Classify my portfolio." (`python src/app.py pipeline`, a separate,
+part of "Classify my portfolio." (`uv run python src/app.py pipeline`, a separate,
 human-invoked ingestion command unrelated to the agent, does run classify +
 sync automatically as its final step for a full run — see `docs/reference/cli.md`
 — but that is orthogonal to this guarantee: the agent itself still never

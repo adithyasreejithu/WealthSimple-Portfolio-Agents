@@ -33,7 +33,11 @@ Hard disqualifiers. Any gate that **fails** forces Avoid (not held) / Sell
 (held) regardless of score. Each gate:
 
 - `id` -- stable identifier.
-- `applies_when` -- `always`, `dividend_payer`, or `income_role`.
+- `applies_when` -- `always`, `dividend_payer`, `income_role`, `equity_only`, or
+  `etf_only`; or a **list** of these (all must hold, e.g. `[income_role,
+  equity_only]`). `equity_only` applies to non-funds, `etf_only` to funds --
+  this is how the rubric excludes company gates (solvency, profitability) for an
+  ETF instead of leaving them `unknown`.
 - `fail_when` -- prose the analyst evaluates against the cited evidence. Write it
   as a clear boolean condition ("negative FCF AND debt/equity > 2 AND current
   ratio < 1").
@@ -46,12 +50,19 @@ at Low. Tune a gate by editing `fail_when` thresholds, not by removing the
 
 ## `dimensions`
 
-Weighted 1-5 scores. **Weights must sum to 1.0.** Each dimension:
+Weighted 1-5 scores. **Weights must sum to 1.0 within each asset-class track**
+-- the dimensions an equity is scored on (`always` + `equity_only` +
+conditionals) sum to 1.0, and the dimensions a fund is scored on (`always` +
+`etf_only` + conditionals) sum to 1.0 independently. `check_rubric.py` enforces
+both. Each dimension:
 
 - `weight` -- its share of the weighted average. If you raise one, lower another
-  so the total stays 1.0 (`check_rubric.py` enforces this).
-- `applies_when` -- `always`, or `dividend_payer` for dividend_safety. A
-  non-applicable dimension is dropped and its weight redistributed pro-rata.
+  **in the same track** so that track still totals 1.0. An `etf_only` dimension
+  (e.g. `fund_efficiency`, `fund_quality`) affects only the fund track; an
+  `equity_only` one (e.g. `financial_health`, `growth`) only the equity track.
+- `applies_when` -- `always`, `dividend_payer`, `equity_only`, `etf_only`, or a
+  list. A non-applicable dimension is dropped and its weight redistributed
+  pro-rata across the rest of that security's applicable dimensions.
 - `anchors` -- the 1 / 3 / 5 descriptions the analyst scores against. Make them
   concrete and evaluable from the fetched data (name the metric and the cutoff).
   Editing an anchor cutoff (e.g. "FCF yield above 6%" -> "above 5%") is the main
@@ -76,6 +87,12 @@ Checked High -> Medium -> Low; first whose thresholds all pass wins.
 `max_unknown_dimensions`, `max_unknown_gates`, `min_groups_ok` gate each level.
 Both High and Medium require `max_unknown_gates: 0`, so any unknown gate forces
 Low. Loosen confidence by raising the `max_unknown_*` allowances.
+
+`min_groups_ok` may be a single integer (applies to both tracks) or a per-track
+mapping `{equity: N, etf: N}` -- funds have 4-5 structurally-empty equity groups
+(financials, earnings, analyst, insider, institutional) that never count, so the
+fund threshold is lower than the equity one. Only groups that returned usable
+(non-empty, non-errored) data count toward `groups_ok`.
 
 ## `time_horizon_rules`
 

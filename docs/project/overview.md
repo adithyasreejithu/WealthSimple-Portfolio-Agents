@@ -18,7 +18,7 @@ The project deliberately does not log into Wealthsimple or scrape it directly â€
 
 ### 1. The data pipeline (`src/`)
 
-This is plain Python, run from the command line via `python src/app.py <command>`. It has three jobs:
+This is plain Python, run from the command line via `uv run python src/app.py <command>`. It has three jobs:
 
 **Ingest** â€” three independent extractors turn raw source material into normalized transaction rows:
 - `email_extractor.py` connects to Gmail over IMAP and parses Wealthsimple/Interac emails.
@@ -47,7 +47,7 @@ The rules themselves live in `Knowledge-Base/` as version-controlled YAML: appro
 
 ## What you can actually do with it
 
-Run `python src/app.py --help` for the full list; the main things:
+Run `uv run python src/app.py --help` for the full list; the main things:
 
 | Command | What it does |
 |---|---|
@@ -67,7 +67,7 @@ Run `python src/app.py --help` for the full list; the main things:
 Every `src/` module has a matching `tests/test_*.py` file using Python's built-in `unittest`. Run the whole suite with:
 
 ```bash
-python -m unittest discover -s tests
+uv run python -m unittest discover -s tests
 ```
 
 External calls (Yahoo Finance, email, database) are mocked in tests, so the suite runs offline and deterministically.

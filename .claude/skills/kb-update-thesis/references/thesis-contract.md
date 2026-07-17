@@ -72,8 +72,25 @@ Deterministic parts only:
   score X.XX; <exec summary> |` (append-only, like every other Decision History
   row).
 - Appends one `decision-log` and one `update-log` row.
+- **On first creation only**, seeds `## Company Overview` and `## Original
+  Thesis` from the artifact's `narratives.company_overview` /
+  `narratives.original_thesis`. This is gated on the page actually being created
+  in this run, never on the artifact's self-reported `page_exists`, so Original
+  Thesis is written exactly once and never overwritten on a later update.
 - Idempotence guard: refuses an artifact whose `generated` date is older than the
-  latest rubric-driven Decision History row already on the page.
+  latest rubric-driven Decision History row already on the page, **and** refuses
+  one dated the same as an existing rubric row (a same-day re-run would otherwise
+  append a duplicate Decision History row).
+
+## `backfill_page_sections.py` (one-time)
+
+Fills blank `## Company Overview` / `## Original Thesis` on pages that predate the
+creation-time seeding above. For each `stocks/TICKER.md` with an empty Company
+Overview, it splices `overview.longBusinessSummary` from the matching
+`exports/stock-recommendations/TICKER-<date>-research.json`, and seeds Original
+Thesis from the page's own Updated Thesis **only when Original Thesis is still
+empty** (never overwrites) and substantive enough; thin pages are reported for
+manual attention. Idempotent, deterministic, one `update-log` row per page.
 
 The prose sections (Updated Thesis, analysis `section_updates`, **Analyst View**,
 Bull/Bear, Key Risks, Open Questions, Monitoring, Sources) are transcribed from

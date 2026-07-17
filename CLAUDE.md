@@ -58,16 +58,36 @@ without changing the recommendation contract. The analyst emits a validated
 artifact under `exports/stock-recommendations/`; `kb-intake` commits it to
 `stocks/TICKER.md` (Decision/Confidence/Time Horizon + a Decision History row,
 never Portfolio Status). The LLM never predicts markets — it applies the
-owner's written rubric and cites everything. See
+owner's written rubric and cites everything. The rubric is **two-track**:
+`equity_only` company gates/dimensions vs `etf_only` fund dimensions, so a fund
+is scored on fund-appropriate criteria (expense ratio, concentration) instead of
+being penalized for lacking a balance sheet. For a **portfolio-wide run**, fan
+out one `stock-data-prep`/`stock-analyst` invocation **per ticker** in parallel
+(ETF and stock batches concurrently) — invoke the **ETF batch's analysts with a
+`model: sonnet` override** (fund-track judgment is simpler; the validator
+recomputes the math regardless). Never loop N tickers inside one agent — with
+one exception: the commit step is **a single `kb-intake` invocation** that loops
+the deterministic `ingest_recommendation.py` over all artifacts sequentially
+(the wiki helpers are not concurrency-safe, and per-ticker agent spawns just
+re-pay the agent context N times). Agents never Read the research/worksheet
+JSONs — the scripts print the summaries they need. See
 `docs/architecture/decision_support_flow.md`.
 
 ## Build, Test, and Development Commands
 
-Use a Python virtual environment and install dependencies from `requirements.txt`.
+This project uses [`uv`](https://docs.astral.sh/uv/) for dependency and Python version management.
 
-- `python -m unittest discover -s tests` runs the full test suite.
-- `python -m unittest tests.test_app` runs one test module.
-- `python src/app.py --help` shows the CLI entry points for the pipeline.
+**First time setup:**
+```powershell
+uv sync
+```
+
+**Running commands:**
+- `uv run python -m unittest discover -s tests` runs the full test suite.
+- `uv run python -m unittest tests.test_app` runs one test module.
+- `uv run python src/app.py --help` shows the CLI entry points for the pipeline.
+
+See `docs/reference/cli.md` for the complete CLI reference.
 
 ## Coding Style & Naming Conventions
 

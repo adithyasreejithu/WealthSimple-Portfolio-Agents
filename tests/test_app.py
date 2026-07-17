@@ -7,6 +7,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+import duckdb
 import pandas as pd
 
 import app
@@ -175,6 +176,35 @@ class AppPipelineTest(unittest.TestCase):
 
         self.assertEqual(result, app.SourceResult("classification", Path("fake-output.json"), "succeeded", 5))
         upload.assert_called_once_with(Path("fake-output.json"), db_path)
+
+    def test_run_portfolio_classification_releases_shared_connection_for_read_only_workflow(self):
+        """A full pipeline run holds a read-write shared connection, but the
+        classification workflow opens its own read-only one. DuckDB rejects the
+        second connection unless the first is released first.
+        """
+        db_path = self.data_dir / "db.duckdb"
+        database.initialize_database(db_path)
+        # Reproduce the pipeline state at the point classification runs: the
+        # shared read-write connection is still open from ingestion.
+        database.get_shared_connection(db_path)
+
+        fake_module = types.ModuleType("classification_workflow")
+
+        def _classify(path):
+            # What read_classification_data actually does.
+            connection = duckdb.connect(str(Path(path).resolve()), read_only=True)
+            connection.close()
+            return {"holdings": []}
+
+        fake_module.classify_portfolio = _classify
+        fake_module.write_output = lambda payload: Path("fake-output.json")
+        with (
+            patch.dict("sys.modules", {"classification_workflow": fake_module}),
+            patch.object(app, "upload_portfolio_classifications", return_value=0),
+        ):
+            result = app._run_portfolio_classification(db_path)
+
+        self.assertEqual(result.status, "succeeded")
 
     def test_run_portfolio_classification_failure_is_non_fatal(self):
         fake_module = types.ModuleType("classification_workflow")

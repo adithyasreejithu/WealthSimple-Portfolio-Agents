@@ -1,23 +1,37 @@
 # CLI Command Guide
 
 `src/app.py` is the canonical entry point for user-facing commands. Run commands
-from the repository root with the active virtual environment.
+from the repository root using `uv run`:
 
 ```powershell
-python src/app.py --help
+uv run python src/app.py --help
 ```
 
+**Note:** This project uses [`uv`](https://docs.astral.sh/uv/) for dependency and Python version management.
+The first time you run a command, `uv` will sync dependencies. See "Setup" below.
+
 Commands return exit code `0` on success and a nonzero code for invalid arguments
-or operational failures. Use `python src/app.py <command> --help` for the parser's
+or operational failures. Use `uv run python src/app.py <command> --help` for the parser's
 complete option details.
+
+## Setup
+
+If this is your first time running commands:
+
+```powershell
+uv sync
+```
+
+This installs all dependencies and locks them in `uv.lock`. On subsequent runs, `uv` reuses
+the locked environment automatically when you run `uv run` commands.
 
 ## Pipeline
 
 Run every source through the staged pipeline:
 
 ```powershell
-python src/app.py pipeline
-python src/app.py pipeline --source statements --data-folder Data --database Data/PRD_WealthSimple.duckdb
+uv run python src/app.py pipeline
+uv run python src/app.py pipeline --source statements --data-folder Data --database Data/PRD_WealthSimple.duckdb
 ```
 
 Options:
@@ -27,7 +41,7 @@ Options:
 - `--database PATH` selects the DuckDB database; default: `DB_PATH` or the
   configured production database.
 
-The legacy form `python src/app.py --source all` remains supported.
+The legacy form `uv run python src/app.py --source all` remains supported.
 
 A full (`--source all`, the default) run also classifies current holdings and
 persists the result as its final step — the same work `portfolio-classify` +
@@ -44,11 +58,11 @@ export/statements/email`) never trigger it.
 ## Analytics
 
 ```powershell
-python src/app.py analytics
-python src/app.py analytics --database Data/PRD_WealthSimple.duckdb --export
-python src/app.py analytics --date-from 2025-01-01 --date-to 2025-12-31 --dividend-source email
-python src/app.py analytics --benchmark VFV.TO
-python src/app.py analytics --no-benchmark --export --export-folder exports/analytics
+uv run python src/app.py analytics
+uv run python src/app.py analytics --database Data/PRD_WealthSimple.duckdb --export
+uv run python src/app.py analytics --date-from 2025-01-01 --date-to 2025-12-31 --dividend-source email
+uv run python src/app.py analytics --benchmark VFV.TO
+uv run python src/app.py analytics --no-benchmark --export --export-folder exports/analytics
 ```
 
 Only current, positive-quantity holdings drive holdings, allocation, and
@@ -81,8 +95,8 @@ reported.
 ## Statement Extraction
 
 ```powershell
-python src/app.py statements --folder Data
-python src/app.py statements --include-glossary --export --export-folder exports
+uv run python src/app.py statements --folder Data
+uv run python src/app.py statements --include-glossary --export --export-folder exports
 ```
 
 - `--folder PATH` selects the PDF folder; default: repository `Data/`.
@@ -93,8 +107,8 @@ python src/app.py statements --include-glossary --export --export-folder exports
 ## Email Extraction
 
 ```powershell
-python src/app.py email
-python src/app.py email --date-from 2025-01-01 --export --export-folder exports
+uv run python src/app.py email
+uv run python src/app.py email --date-from 2025-01-01 --export --export-folder exports
 ```
 
 - `--date-from DATE` sets the earliest email date; default: configured `START_DATE`.
@@ -104,11 +118,11 @@ python src/app.py email --date-from 2025-01-01 --export --export-folder exports
 Email access still requires the credentials and mailbox configuration expected by
 `src/email_extractor.py`.
 
-`python src/app.py email` is extractor-only. To persist new messages, update live
+`uv run python src/app.py email` is extractor-only. To persist new messages, update live
 positions, reconcile statement trades, and refresh prices, run:
 
 ```powershell
-python src/app.py pipeline --source email
+uv run python src/app.py pipeline --source email
 ```
 
 The database pipeline is incremental and deduplicates messages by message ID. Known
@@ -118,8 +132,8 @@ trades continue to publish; a pending run exits nonzero and prints the required 
 ## YFinance
 
 ```powershell
-python src/app.py yfinance --tickers AAPL VFV.TO
-python src/app.py yfinance --tickers AAPL --include-history --start-date 2025-01-01
+uv run python src/app.py yfinance --tickers AAPL VFV.TO
+uv run python src/app.py yfinance --tickers AAPL --include-history --start-date 2025-01-01
 ```
 
 - `--tickers SYMBOL [SYMBOL ...]` is required.
@@ -136,9 +150,9 @@ The default full pipeline automatically synchronizes owned ticker metadata and
 history after all ingestion sources succeed. Retry or target that operation with:
 
 ```powershell
-python src/app.py yfinance-sync
-python src/app.py yfinance-sync --database Data/PRD_WealthSimple.duckdb --tickers AAPL VFV.TO
-python src/app.py yfinance-sync --full
+uv run python src/app.py yfinance-sync
+uv run python src/app.py yfinance-sync --database Data/PRD_WealthSimple.duckdb --tickers AAPL VFV.TO
+uv run python src/app.py yfinance-sync --full
 ```
 
 - `--database PATH` selects the DuckDB database.
@@ -156,12 +170,12 @@ python src/app.py yfinance-sync --full
 ## Ticker Mappings
 
 ```powershell
-python src/app.py ticker-map list
-python src/app.py ticker-map pending
-python src/app.py ticker-map resolve-pending
-python src/app.py ticker-map validate --source-symbol AAPL
-python src/app.py ticker-map import-csv mappings.csv
-python src/app.py ticker-map merge --old-symbol SPLG --new-symbol SPYM --currency USD --dry-run
+uv run python src/app.py ticker-map list
+uv run python src/app.py ticker-map pending
+uv run python src/app.py ticker-map resolve-pending
+uv run python src/app.py ticker-map validate --source-symbol AAPL
+uv run python src/app.py ticker-map import-csv mappings.csv
+uv run python src/app.py ticker-map merge --old-symbol SPLG --new-symbol SPYM --currency USD --dry-run
 ```
 
 Available actions are `add`, `update`, `list`, `pending`, `resolve-pending`,
@@ -171,7 +185,14 @@ symbols that quarantined an activity export entirely (`staged_records.resolution
 = 'unresolved'` on a `status = 'quarantined'` export file). Each row's `sources`
 column shows whether it came from `email`, `export`, or both.
 `resolve-pending` asks for the mapping interactively for every symbol `pending`
-reports; scheduled pipelines never prompt.
+reports; scheduled pipelines never prompt. For each symbol it prompts for
+currency, canonical symbol, and Yahoo (provider) symbol — the Yahoo symbol is
+verified against Yahoo Finance before it can be saved: if it doesn't resolve to
+a real, currency-matching equity or ETF, the prompt reprints with an error and
+asks again, so a rejected suggestion (e.g. typing "no") can never be saved as a
+literal provider symbol. On a successful match it prints `Matched: <company
+name> (<symbol>, <exchange>)` before asking for confirmation. Type `SKIP` at
+the Yahoo symbol prompt to abandon that symbol without saving a mapping.
 Saving a mapping activates matching pending rows without refetching email, but
 does not by itself re-publish a quarantined export — see `resolve-tickers` below
 for the one-command version that also retries ingestion.
@@ -189,8 +210,8 @@ symbol match and has no notion of renames. `merge` consolidates the two
 identities into one:
 
 ```powershell
-python src/app.py ticker-map merge --old-symbol SPLG --new-symbol SPYM --currency USD --dry-run
-python src/app.py ticker-map merge --old-symbol SPLG --new-symbol SPYM --currency USD --yes
+uv run python src/app.py ticker-map merge --old-symbol SPLG --new-symbol SPYM --currency USD --dry-run
+uv run python src/app.py ticker-map merge --old-symbol SPLG --new-symbol SPYM --currency USD --yes
 ```
 
 - The **older** (lower/first-created) `ticker_id` always survives, permanently —
@@ -224,13 +245,13 @@ When a source is quarantined or published with pending tickers, the log names
 the blocking symbol(s) and points here:
 
 ```powershell
-python src/app.py resolve-tickers
+uv run python src/app.py resolve-tickers
 ```
 
 This is the one-shot recovery command: it lists every pending symbol (email and
 export), prompts for each mapping interactively (same prompts as `ticker-map
 resolve-pending`), and — if at least one mapping was saved — automatically
-re-runs `python src/app.py pipeline --source all` so any file quarantined only
+re-runs `uv run python src/app.py pipeline --source all` so any file quarantined only
 because of that symbol is retried and published in the same run. Example
 output:
 
@@ -254,10 +275,10 @@ nonzero if resolution or the retry fails.
 ## Portfolio Classification
 
 ```powershell
-python src/app.py portfolio-classify
-python src/app.py portfolio-classify --output exports/portfolio-classification/latest.json --pretty
-python src/app.py classification-sync
-python src/app.py classification-sync --input exports/portfolio-classification/latest.json
+uv run python src/app.py portfolio-classify
+uv run python src/app.py portfolio-classify --output exports/portfolio-classification/latest.json --pretty
+uv run python src/app.py classification-sync
+uv run python src/app.py classification-sync --input exports/portfolio-classification/latest.json
 ```
 
 `portfolio-classify` runs the read-only, deterministic classification workflow
@@ -290,8 +311,8 @@ design and the `classify-portfolio` skill for the underlying scripts.
 Import the newest matching export from `Data/`:
 
 ```powershell
-python src/app.py import-activities
-python src/app.py import-activities --source-file Data/activities-export.csv --database Data/PRD_WealthSimple.duckdb
+uv run python src/app.py import-activities
+uv run python src/app.py import-activities --source-file Data/activities-export.csv --database Data/PRD_WealthSimple.duckdb
 ```
 
 - `--source-file PATH` selects a CSV; otherwise the latest export is used.
@@ -304,8 +325,8 @@ python src/app.py import-activities --source-file Data/activities-export.csv --d
 ## Recompute Positions
 
 ```powershell
-python src/app.py recompute-positions
-python src/app.py recompute-positions --database Data/PRD_WealthSimple.duckdb
+uv run python src/app.py recompute-positions
+uv run python src/app.py recompute-positions --database Data/PRD_WealthSimple.duckdb
 ```
 
 Rebuilds `position_ledger` and `position_snapshots` — the average-cost
@@ -325,8 +346,8 @@ reconstructed from the three source tables and how average cost is computed.
 ## Reconcile Holdings
 
 ```powershell
-python src/app.py reconcile-holdings --report ref/holdings-report-2026-07-07.csv
-python src/app.py reconcile-holdings --report holdings.csv --database Data/PRD_WealthSimple.duckdb
+uv run python src/app.py reconcile-holdings --report ref/holdings-report-2026-07-07.csv
+uv run python src/app.py reconcile-holdings --report holdings.csv --database Data/PRD_WealthSimple.duckdb
 ```
 
 Compares computed holdings (`analytics.get_holdings`) against a Wealthsimple
@@ -348,11 +369,11 @@ change. This is the tool the holdings/P&L root-cause investigation
 Existing direct commands remain available for scripts and local workflows:
 
 ```powershell
-python src/statement_extractor.py --help
-python src/email_extractor.py --help
-python src/yfinance_extractor.py --help
-python src/data_sorter.py --help
-python src/ticker_mapping.py --help
+uv run python src/statement_extractor.py --help
+uv run python src/email_extractor.py --help
+uv run python src/yfinance_extractor.py --help
+uv run python src/data_sorter.py --help
+uv run python src/ticker_mapping.py --help
 ```
 
-New user documentation and automation should prefer `python src/app.py ...`.
+New user documentation and automation should prefer `uv run python src/app.py ...`.

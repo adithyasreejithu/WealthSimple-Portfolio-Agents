@@ -16,7 +16,7 @@ payload on stdin; the script appends one entry to `logs/AgentSkillUsage.txt`.
 | Hook event | Log entry |
 |---|---|
 | `SessionStart` | A `=== SESSION START ===` separator block with the session id, source (`startup` / `resume` / `clear` / `compact`), and model — this is the visual break between run sessions. |
-| `SessionEnd` | A `SESSION END` line with the session id and reason. |
+| `SessionEnd` | A `SESSION END` line with the session id, reason, and total session duration. |
 | `PostToolUse` (matcher `Skill`) | A `SKILL` line with the skill name and its arguments (truncated to 120 chars). If the skill ran inside a subagent, `agent=<type>` is appended. |
 | `SubagentStart` | An `AGENT+` line with the agent type and short agent id. |
 | `SubagentStop` | An `AGENT-` line with the agent type, short agent id, token usage, and duration. |
@@ -33,7 +33,7 @@ Pipe-delimited `key=value` fields, matching the `SystemLogs.txt` convention:
 2026-07-13 18:03:10 | AGENT+ | type=stock-data-prep | id=f9e8a7b6
 2026-07-13 18:05:32 | AGENT- | type=stock-data-prep | id=f9e8a7b6 | tokens=28737 (in=1200 out=3500 cache_read=24037 cache_write=0) | duration=142s
 2026-07-13 18:06:01 | SKILL  | name=evaluate-stock-decision | args=AAPL | agent=stock-analyst
-2026-07-13 18:40:00 | SESSION END | id=a1b2c3d4 | reason=other
+2026-07-13 18:40:00 | SESSION END | id=a1b2c3d4 | reason=other | duration=37m49s
 ```
 
 ## Token usage: how it works and its caveat
@@ -53,6 +53,16 @@ never blocks tool use and always exits 0.
 Skills carry no token figure at all: a skill runs inside the calling
 conversation, not as a separate context, so its cost is not attributable.
 A skill invoked by a subagent is covered by that subagent's `AGENT-` total.
+
+## Session length
+
+Every hook payload includes `transcript_path` — the main session's own
+transcript JSONL. On `SessionEnd`, the tracker reads that file's first and
+last message timestamps the same way `SubagentStop` derives subagent
+duration, and reports the span as `duration=`. No state is persisted between
+`SessionStart` and `SessionEnd` to compute this. If the transcript is
+missing, unreadable, or has fewer than two timestamped entries, the entry
+logs `duration=unknown` instead of failing.
 
 ## Operational notes
 
@@ -77,5 +87,5 @@ degradation on malformed input, per-event line formatting, and the
 stdin-to-logfile flow. Run with:
 
 ```
-python -m unittest tests.test_usage_tracker
+uv run python -m unittest tests.test_usage_tracker
 ```

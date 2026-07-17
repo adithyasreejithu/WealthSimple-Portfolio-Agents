@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,14 @@ VALID_GATE_RESULTS = ("pass", "fail", "unknown")
 UNKNOWN = "unknown"
 
 REQUIRED_NARRATIVES = ("executive_summary", "analyst_view", "updated_thesis", "bull_case", "bear_case", "key_risks")
+
+# Hard ceilings at ~2x the prose guidance in SKILL.md, so a runaway narrative
+# fails fast instead of silently costing output tokens. Guidance: <= 6 bullets
+# per section, updated_thesis 2-3 paragraphs, analyst_view <= ~300 words,
+# executive_summary <= ~120 words.
+MAX_SECTION_BULLETS = 12
+MAX_UPDATED_THESIS_PARAGRAPHS = 6
+MAX_NARRATIVE_WORDS = {"executive_summary": 240, "analyst_view": 600}
 
 
 class ValidationError(ValueError):
@@ -87,13 +96,13 @@ def _resolve_citation(source: str, field: str, ticker: str, sources: dict[str, A
             derived_cache["item"] = item
             derived_cache["metrics"] = ws.compute_derived_metrics(item)
         value = derived_cache["metrics"].get(path)
-        return value is not None, value
+        return ws._has_data(value), value
     if source not in sources:
         return False, None
     if source == "yfinance":
         item = ws._find_research_item(sources["yfinance"], ticker)
         value = ws._resolve_path(item, path) if item else None
-        return value is not None, value
+        return ws._has_data(value), value
     if source == "classification":
         holding = ws._find_holding(sources["classification"], ticker)
         key = path.split(".", 1)[1] if "." in path else path
@@ -102,8 +111,68 @@ def _resolve_citation(source: str, field: str, ticker: str, sources: dict[str, A
             value = holding.get(key)
             if value is None and isinstance(holding.get("fields"), dict):
                 value = holding["fields"].get(key)
-        return value is not None, value
+        return ws._has_data(value), value
     return False, None
+
+
+def compute_verdict(artifact: dict, rubric: dict, framework: dict) -> dict:
+    """Deterministic verdict math only -- no citation resolution, no narrative
+    checks, no re-reading of research_sources files. Needs only
+    artifact['position'], artifact['gates'] (id + result), artifact['dimensions']
+    (id + score), and artifact['research_sources'][*]['groups_ok'] (carried over
+    verbatim from the worksheet).
+
+    Used by both validate_recommendation() (full check, below) and the
+    --precompute-only CLI mode (fast iteration while the analyst is still
+    filling in gates/dimensions, before any evidence or narrative exists).
+    """
+    ticker = str(artifact.get("ticker", "")).upper()
+    position = artifact.get("position") or {}
+    held = bool(position.get("held"))
+    dividend_payer = bool(position.get("dividend_payer"))
+    income_role = bool(position.get("income_role"))
+    is_etf = bool(position.get("is_etf"))
+
+    expected_gates = {g["id"]: g for g in rubric_mod.applicable_gates(rubric, dividend_payer=dividend_payer, income_role=income_role, is_etf=is_etf)}
+    seen_gates = {}
+    for entry in artifact.get("gates") or []:
+        seen_gates[entry.get("id")] = entry
+    missing_gates = [gid for gid in expected_gates if gid not in seen_gates]
+    gate_failed = any((seen_gates.get(gid) or {}).get("result") == "fail" for gid in expected_gates)
+    unknown_gates = sum(1 for gid in expected_gates if (seen_gates.get(gid) or {}).get("result") == UNKNOWN)
+
+    expected_dims = {d["id"]: d for d in rubric_mod.applicable_dimensions(rubric, dividend_payer=dividend_payer, income_role=income_role, is_etf=is_etf)}
+    seen_dims = {}
+    scores: dict[str, Any] = {}
+    for entry in artifact.get("dimensions") or []:
+        did = entry.get("id")
+        seen_dims[did] = entry
+        score = entry.get("score")
+        if score == UNKNOWN:
+            scores[did] = UNKNOWN
+        elif isinstance(score, int) and not isinstance(score, bool) and rubric_mod.SCORE_MIN <= score <= rubric_mod.SCORE_MAX:
+            scores[did] = score
+    missing_dimensions = [did for did in expected_dims if did not in seen_dims]
+    unknown_dims = sum(1 for did in expected_dims if scores.get(did) == UNKNOWN)
+
+    recomputed_score = rubric_mod.weighted_score(scores, rubric, dividend_payer=dividend_payer, income_role=income_role, is_etf=is_etf)
+    expected_action = rubric_mod.lookup_action(recomputed_score, gate_failed=gate_failed, held=held, rubric=rubric)
+    groups_ok = _groups_ok(artifact, {})
+    expected_conf = rubric_mod.evaluate_confidence(unknown_dimensions=unknown_dims, unknown_gates=unknown_gates, groups_ok=groups_ok, rubric=rubric, is_etf=is_etf)
+    horizon = rubric_mod.default_time_horizon(position.get("portfolio_role"), rubric)
+
+    return {
+        "weighted_score": recomputed_score,
+        "action": expected_action,
+        "confidence": expected_conf,
+        "default_time_horizon": horizon,
+        "gate_failed": gate_failed,
+        "unknown_gates": unknown_gates,
+        "unknown_dimensions": unknown_dims,
+        "groups_ok": groups_ok,
+        "missing_gates": missing_gates,
+        "missing_dimensions": missing_dimensions,
+    }
 
 
 def validate_recommendation(artifact: dict, rubric: dict, framework: dict, sources: dict[str, Any]) -> list[str]:
@@ -119,15 +188,17 @@ def validate_recommendation(artifact: dict, rubric: dict, framework: dict, sourc
     held = bool(position.get("held"))
     dividend_payer = bool(position.get("dividend_payer"))
     income_role = bool(position.get("income_role"))
+    is_etf = bool(position.get("is_etf"))
 
     actions = set(framework.get("actions") or [])
     confidences = set(framework.get("confidence_levels") or [])
     horizons = set(framework.get("time_horizons") or [])
 
     derived_cache: dict = {}
+    verdict = compute_verdict(artifact, rubric, framework)
 
     # --- gates ---
-    expected_gates = {g["id"]: g for g in rubric_mod.applicable_gates(rubric, dividend_payer=dividend_payer, income_role=income_role)}
+    expected_gates = {g["id"]: g for g in rubric_mod.applicable_gates(rubric, dividend_payer=dividend_payer, income_role=income_role, is_etf=is_etf)}
     seen_gates = {}
     for entry in artifact.get("gates") or []:
         gid = entry.get("id")
@@ -141,25 +212,19 @@ def validate_recommendation(artifact: dict, rubric: dict, framework: dict, sourc
             ok, _ = _resolve_citation(cite.get("source"), cite.get("field", ""), ticker, sources, derived_cache)
             if not ok and sources:
                 errors.append(f"gate '{gid}': citation '{cite.get('field')}' does not resolve to a value in source '{cite.get('source')}'")
-    for gid in expected_gates:
-        if gid not in seen_gates:
-            errors.append(f"missing required gate '{gid}'")
-
-    gate_failed = any((seen_gates.get(gid) or {}).get("result") == "fail" for gid in expected_gates)
-    unknown_gates = sum(1 for gid in expected_gates if (seen_gates.get(gid) or {}).get("result") == UNKNOWN)
+    for gid in verdict["missing_gates"]:
+        errors.append(f"missing required gate '{gid}'")
 
     # --- dimensions ---
-    expected_dims = {d["id"]: d for d in rubric_mod.applicable_dimensions(rubric, dividend_payer=dividend_payer, income_role=income_role)}
+    expected_dims = {d["id"]: d for d in rubric_mod.applicable_dimensions(rubric, dividend_payer=dividend_payer, income_role=income_role, is_etf=is_etf)}
     seen_dims = {}
-    scores: dict[str, Any] = {}
     for entry in artifact.get("dimensions") or []:
         did = entry.get("id")
         seen_dims[did] = entry
         score = entry.get("score")
         if score == UNKNOWN:
-            scores[did] = UNKNOWN
+            pass
         elif isinstance(score, int) and not isinstance(score, bool) and rubric_mod.SCORE_MIN <= score <= rubric_mod.SCORE_MAX:
-            scores[did] = score
             if not _nonempty(entry.get("evidence")):
                 errors.append(f"dimension '{did}': a numeric score needs at least one evidence citation")
         else:
@@ -168,14 +233,11 @@ def validate_recommendation(artifact: dict, rubric: dict, framework: dict, sourc
             ok, _ = _resolve_citation(cite.get("source"), cite.get("field", ""), ticker, sources, derived_cache)
             if not ok and sources:
                 errors.append(f"dimension '{did}': citation '{cite.get('field')}' does not resolve to a value in source '{cite.get('source')}'")
-    for did in expected_dims:
-        if did not in seen_dims:
-            errors.append(f"missing required dimension '{did}'")
-
-    unknown_dims = sum(1 for did in expected_dims if scores.get(did) == UNKNOWN)
+    for did in verdict["missing_dimensions"]:
+        errors.append(f"missing required dimension '{did}'")
 
     # --- recomputed math ---
-    recomputed_score = rubric_mod.weighted_score(scores, rubric, dividend_payer=dividend_payer, income_role=income_role)
+    recomputed_score = verdict["weighted_score"]
     stated_score = artifact.get("weighted_score")
     if recomputed_score is None:
         if stated_score is not None:
@@ -184,16 +246,15 @@ def validate_recommendation(artifact: dict, rubric: dict, framework: dict, sourc
         errors.append(f"weighted_score {stated_score} does not match recomputed {round(recomputed_score, 4)}")
 
     proposed = artifact.get("proposed") or {}
-    expected_action = rubric_mod.lookup_action(recomputed_score, gate_failed=gate_failed, held=held, rubric=rubric)
+    expected_action = verdict["action"]
     if proposed.get("action") != expected_action:
-        errors.append(f"proposed action '{proposed.get('action')}' does not match rubric verdict '{expected_action}' (score={recomputed_score}, gate_failed={gate_failed}, held={held})")
+        errors.append(f"proposed action '{proposed.get('action')}' does not match rubric verdict '{expected_action}' (score={recomputed_score}, gate_failed={verdict['gate_failed']}, held={held})")
     if actions and proposed.get("action") not in actions:
         errors.append(f"proposed action '{proposed.get('action')}' not in decision-framework actions")
 
-    groups_ok = _groups_ok(artifact, derived_cache)
-    expected_conf = rubric_mod.evaluate_confidence(unknown_dimensions=unknown_dims, unknown_gates=unknown_gates, groups_ok=groups_ok, rubric=rubric)
+    expected_conf = verdict["confidence"]
     if proposed.get("confidence") != expected_conf:
-        errors.append(f"proposed confidence '{proposed.get('confidence')}' does not match rubric confidence '{expected_conf}' (unknown_dims={unknown_dims}, unknown_gates={unknown_gates}, groups_ok={groups_ok})")
+        errors.append(f"proposed confidence '{proposed.get('confidence')}' does not match rubric confidence '{expected_conf}' (unknown_dims={verdict['unknown_dimensions']}, unknown_gates={verdict['unknown_gates']}, groups_ok={verdict['groups_ok']})")
     if confidences and proposed.get("confidence") not in confidences:
         errors.append(f"proposed confidence '{proposed.get('confidence')}' not in decision-framework confidence_levels")
     if horizons and proposed.get("time_horizon") not in horizons:
@@ -204,8 +265,28 @@ def validate_recommendation(artifact: dict, rubric: dict, framework: dict, sourc
     for key in REQUIRED_NARRATIVES:
         if not _nonempty(narratives.get(key)):
             errors.append(f"narratives.{key} must be present and non-empty")
-    if not isinstance(narratives.get("section_updates"), dict) or not narratives.get("section_updates"):
+    section_updates = narratives.get("section_updates")
+    if not isinstance(section_updates, dict) or not section_updates:
         errors.append("narratives.section_updates must be a non-empty mapping of thesis section -> prose")
+    else:
+        for name, prose in section_updates.items():
+            errors.extend(_check_section_format(name, prose))
+
+    # Company Overview and Original Thesis are only carried on a first-time page;
+    # both are required when the page does not yet exist so ingest can seed them.
+    if not position.get("page_exists"):
+        for key in ("company_overview", "original_thesis"):
+            if not _nonempty(narratives.get(key)):
+                errors.append(f"narratives.{key} must be present when the page does not yet exist (page_exists is false)")
+
+    if _nonempty(narratives.get("updated_thesis")) and _paragraph_count(narratives.get("updated_thesis")) < 2:
+        errors.append("narratives.updated_thesis must be at least two paragraphs (blank-line separated)")
+    if _paragraph_count(narratives.get("updated_thesis")) > MAX_UPDATED_THESIS_PARAGRAPHS:
+        errors.append(f"narratives.updated_thesis exceeds {MAX_UPDATED_THESIS_PARAGRAPHS} paragraphs (guidance is 2-3)")
+    for key, ceiling in MAX_NARRATIVE_WORDS.items():
+        value = narratives.get(key)
+        if isinstance(value, str) and len(value.split()) > ceiling:
+            errors.append(f"narratives.{key} exceeds {ceiling} words (guidance is ~{ceiling // 2})")
 
     fao = artifact.get("facts_assumptions_opinions") or {}
     for key in ("facts", "assumptions", "opinions"):
@@ -213,6 +294,38 @@ def validate_recommendation(artifact: dict, rubric: dict, framework: dict, sourc
             errors.append(f"facts_assumptions_opinions.{key} must be a list")
 
     return errors
+
+
+# A dimension section must be point form ending in a score line. The score line
+# may be labeled per-dimension when several dimensions share one section
+# (e.g. "- Score (financial_health): 4/5"), and may be "unknown".
+_SCORE_LINE = re.compile(r"^- Score(?: \([a-z_]+\))?: (?:[1-5]/5|unknown)\b", re.IGNORECASE)
+
+
+def _check_section_format(name: str, prose: Any) -> list[str]:
+    if not isinstance(prose, str) or not prose.strip():
+        return [f"narratives.section_updates['{name}'] must be non-empty text"]
+    lines = [ln.strip() for ln in prose.strip().splitlines() if ln.strip()]
+    if not any(ln.startswith("- ") for ln in lines):
+        return [f"narratives.section_updates['{name}'] must be point form (lines starting with '- ')"]
+    if not any(_SCORE_LINE.match(ln) for ln in lines):
+        return [
+            f"narratives.section_updates['{name}'] must end with a '- Score: X/5' line "
+            "(labeled '- Score (dim): X/5' when the section is shared, 'unknown' allowed)"
+        ]
+    bullets = len([ln for ln in lines if ln.startswith("- ")])
+    if bullets > MAX_SECTION_BULLETS:
+        return [
+            f"narratives.section_updates['{name}'] has {bullets} bullets, over the "
+            f"{MAX_SECTION_BULLETS} ceiling (guidance is <= 6 per dimension)"
+        ]
+    return []
+
+
+def _paragraph_count(text: Any) -> int:
+    if not isinstance(text, str):
+        return 0
+    return len([p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()])
 
 
 def _groups_ok(artifact: dict, derived_cache: dict) -> int:
@@ -225,10 +338,36 @@ def _groups_ok(artifact: dict, derived_cache: dict) -> int:
     return 0
 
 
+def _format_precompute(verdict: dict) -> str:
+    score = verdict["weighted_score"]
+    score_text = "null" if score is None else round(score, 4)
+    lines = [
+        "Precompute (math only -- citations/narratives NOT checked):",
+        f"  weighted_score: {score_text} | action: {verdict['action']} | confidence: {verdict['confidence']}",
+        f"  default_time_horizon: {verdict['default_time_horizon']}",
+        (
+            f"  gate_failed: {verdict['gate_failed']} | unknown_gates: {verdict['unknown_gates']} | "
+            f"unknown_dimensions: {verdict['unknown_dimensions']} | groups_ok: {verdict['groups_ok']}"
+        ),
+        f"  still unaddressed -- gates: {verdict['missing_gates']} | dimensions: {verdict['missing_dimensions']}",
+    ]
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate a completed stock-recommendation artifact.")
     parser.add_argument("--path", type=Path, required=True)
     parser.add_argument("--rubric", type=Path, default=None)
+    parser.add_argument(
+        "--precompute-only",
+        action="store_true",
+        help=(
+            "Print the deterministic weighted_score/action/confidence/default_time_horizon "
+            "for the gates/dimensions filled in so far, without resolving citations or "
+            "checking narratives. Use while still scoring, to avoid reverse-engineering "
+            "rubric.py by hand; run the full validate (no flag) once the artifact is complete."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -240,6 +379,10 @@ def main(argv: list[str] | None = None) -> int:
             for err in rubric_errors:
                 print(f"rubric error: {err}", file=sys.stderr)
             return 1
+        if args.precompute_only:
+            verdict = compute_verdict(artifact, rubric, framework)
+            print(_format_precompute(verdict))
+            return 0
         sources = _load_sources(artifact, args.path.resolve().parent)
         errors = validate_recommendation(artifact, rubric, framework, sources)
     except (ValidationError, rubric_mod.RubricError) as exc:
