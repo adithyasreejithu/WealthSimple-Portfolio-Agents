@@ -309,6 +309,7 @@ def calculate_concentration(weights_by_ticker: dict[str, dict]) -> dict:
             "top_5": None,
             "top_10": None,
             "hhi": None,
+            "effective_holdings": None,
             "max_single_name_weight": None,
             "max_single_name_ticker": None,
         }
@@ -316,12 +317,15 @@ def calculate_concentration(weights_by_ticker: dict[str, dict]) -> dict:
         (_safe_float(row.get("weight")) for row in weights_by_ticker.values()), reverse=True
     )
     top_ticker, top_row = max(weights_by_ticker.items(), key=lambda item: _safe_float(item[1].get("weight")))
+    hhi = sum(w * w for w in sorted_weights)
     return {
         "available": True,
         "top_1": sum(sorted_weights[:1]),
         "top_5": sum(sorted_weights[:5]),
         "top_10": sum(sorted_weights[:10]),
-        "hhi": sum(w * w for w in sorted_weights),
+        "hhi": hhi,
+        # 1/HHI: the portfolio behaves like this many equal-sized holdings.
+        "effective_holdings": (1 / hhi) if hhi > 0 else None,
         "max_single_name_weight": _safe_float(top_row.get("weight")),
         "max_single_name_ticker": top_ticker,
     }

@@ -31,6 +31,10 @@ from system_logger import get_logger
 logger = get_logger(__name__)
 
 FINGERPRINT_COMPONENT = "position_engine"
+# Bump whenever the engine's math changes: the fingerprint otherwise hashes
+# only source-table state, so stored snapshots would keep serving numbers
+# computed by the old code.
+_ENGINE_VERSION = "2"
 _FX_MAX_LAG_DAYS = 5
 _Q4 = Decimal("0.0001")
 _Q8 = Decimal("0.00000001")
@@ -70,7 +74,7 @@ class _TickerState:
 def compute_fingerprint(connection: Any) -> str:
     """Hash the state of every source table the position engine reads."""
     row = connection.execute(FINGERPRINT_SQL).fetchone()
-    return hashlib.sha256(json.dumps(row, default=str).encode("utf-8")).hexdigest()
+    return hashlib.sha256(json.dumps([_ENGINE_VERSION, row], default=str).encode("utf-8")).hexdigest()
 
 
 def _stored_fingerprint(connection: Any) -> str | None:
@@ -203,7 +207,7 @@ def _load_events(connection: Any) -> list[tuple]:
     return connection.execute(
         """
         SELECT v.ticker_id, t.currency, v.event_date, v.event_type, v.source,
-               v.source_id, v.quantity, v.amount_cad, v.fx_rate
+               v.source_id, v.quantity, v.amount_cad, v.amount_currency, v.fx_rate
         FROM v_trade_events v
         JOIN tickers t ON t.ticker_id = v.ticker_id
         ORDER BY v.ticker_id, v.event_date, v.source_priority, v.source_id
@@ -296,7 +300,7 @@ def recompute_positions(connection: Any = None, db_path: str | Path = DATABASE_P
         states: dict[int, _TickerState] = {}
         for (
             ticker_id, currency, event_date, event_type, source, source_id,
-            raw_quantity, raw_amount_cad, raw_fx_rate,
+            raw_quantity, raw_amount_cad, raw_amount_currency, raw_fx_rate,
         ) in events:
             state = states.setdefault(ticker_id, _TickerState())
             quantity = Decimal(str(raw_quantity))
@@ -305,6 +309,16 @@ def recompute_positions(connection: Any = None, db_path: str | Path = DATABASE_P
             fx_rate, fx_flag = _resolve_fx(currency, event_fx_rate, event_date, fx_series, latest_txn_fx)
             if fx_flag:
                 state.flags.add(fx_flag)
+            # The view's amount column is only truly CAD when amount_currency
+            # says so; activities rows carry the raw transaction-currency cash
+            # amount, so convert before it enters book value or realized gain.
+            if amount_cad is not None and raw_amount_currency and raw_amount_currency != "CAD":
+                amount_fx, amount_flag = _resolve_fx(
+                    str(raw_amount_currency), event_fx_rate, event_date, fx_series, latest_txn_fx
+                )
+                amount_cad *= amount_fx
+                if amount_flag:
+                    state.flags.add(amount_flag)
 
             cost_cad = proceeds_cad = None
             if event_type == "BUY":

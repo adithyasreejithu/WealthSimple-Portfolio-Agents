@@ -20,10 +20,11 @@ from config import (
     SINGLE_NAME_MAX_WEIGHT,
     STALE_PRICE_MAX_AGE_DAYS,
     SUSPICIOUS_UNREALIZED_GAIN_THRESHOLD,
+    TREND_BENCHMARKS,
     WEALTHSIMPLE_FX_FEE_RATE,
 )
 from database import get_shared_connection
-from position_engine import ensure_positions_fresh, latest_fx_rate
+from position_engine import _build_fx_series, _resolve_fx, ensure_positions_fresh, latest_fx_rate
 from portfolio_metrics import (
     calculate_adjusted_daily_returns,
     calculate_adjusted_sharpe_ratio,
@@ -274,6 +275,175 @@ def get_position(ticker_id: int, db_path: str = DATABASE_PATH) -> Holding:
     )
 
 
+def _load_json_column(value: Any, default: Any) -> Any:
+    """Parse a DuckDB JSON column (returned as a string) into a Python value.
+
+    Classification columns are stored as JSON text; NULL/empty columns fall
+    back to the supplied default so callers always see a concrete structure.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# Nested keys inside the `fields` JSON that the classifier stores as
+# JSON-encoded strings (double-encoded), so a single json.loads on the column
+# leaves them as text. Parse them so callers get real structures.
+_CLASSIFICATION_NESTED_JSON_FIELDS = ("sector_weights", "top_holdings")
+
+
+def _normalize_classification_fields(fields: Any) -> dict[str, Any]:
+    parsed = _load_json_column(fields, {})
+    if not isinstance(parsed, dict):
+        return {}
+    for key in _CLASSIFICATION_NESTED_JSON_FIELDS:
+        if isinstance(parsed.get(key), str):
+            parsed[key] = _load_json_column(parsed[key], None)
+    return parsed
+
+
+def get_classification_details(db_path: str = DATABASE_PATH) -> dict[str, Any]:
+    """Return per-holding portfolio classification records joined with ticker identity.
+
+    Reads the `portfolio_classifications` table the classifier writes (one row
+    per ticker) and joins `tickers` for symbol/name/type. JSON columns are
+    parsed into real structures. This is the only read path that exposes
+    per-holding classification detail (group, confidence, reasoning, evidence,
+    review flag, enriched fields) -- allocation reporting elsewhere only uses
+    the aggregate `primary_group`/geography.
+    """
+    connection = get_shared_connection(db_path)
+    rows = connection.execute(
+        """
+        SELECT
+            c.ticker_id,
+            t.ticker_symbol,
+            t.security_name,
+            t.security_type,
+            c.primary_group,
+            c.secondary_tags,
+            c.confidence,
+            c.reasoning,
+            c.evidence_used,
+            c.missing_data,
+            c.review_needed,
+            c.fields,
+            c.field_provenance,
+            c.generated_at
+        FROM portfolio_classifications c
+        JOIN tickers t ON t.ticker_id = c.ticker_id
+        ORDER BY t.ticker_symbol
+        """
+    ).fetchall()
+
+    classifications: list[dict[str, Any]] = []
+    review_count = 0
+    latest_generated: datetime | None = None
+    for row in rows:
+        (
+            ticker_id, symbol, name, security_type, primary_group,
+            secondary_tags, confidence, reasoning, evidence_used, missing_data,
+            review_needed, fields, field_provenance, generated_at,
+        ) = row
+        review_flag = bool(review_needed)
+        if review_flag:
+            review_count += 1
+        if isinstance(generated_at, datetime) and (latest_generated is None or generated_at > latest_generated):
+            latest_generated = generated_at
+        classifications.append(
+            {
+                "ticker_id": int(ticker_id),
+                "ticker_symbol": symbol,
+                "security_name": name,
+                "security_type": security_type,
+                "primary_group": primary_group,
+                "secondary_tags": _load_json_column(secondary_tags, []),
+                "confidence": confidence,
+                "reasoning": reasoning,
+                "evidence_used": _load_json_column(evidence_used, []),
+                "missing_data": _load_json_column(missing_data, []),
+                "review_needed": review_flag,
+                "fields": _normalize_classification_fields(fields),
+                "field_provenance": _load_json_column(field_provenance, {}),
+                "generated_at": generated_at,
+            }
+        )
+
+    return {
+        "generated_at": latest_generated,
+        "count": len(classifications),
+        "review_count": review_count,
+        "classifications": classifications,
+    }
+
+
+def get_price_history(
+    symbol: str,
+    db_path: str = DATABASE_PATH,
+    *,
+    date_from: date | None = None,
+) -> dict[str, Any] | None:
+    """Return a single ticker's daily close series from `historical_records`.
+
+    Symbol resolution is case-insensitive against `tickers.ticker_symbol`;
+    an unknown symbol returns ``None`` so callers can surface a 404. Points
+    are ordered oldest-first for direct charting. Open/high/low are omitted --
+    the dashboard's line and compare views only need close/adjusted_close.
+    """
+    connection = get_shared_connection(db_path)
+    ticker_row = connection.execute(
+        """
+        SELECT ticker_id, ticker_symbol, security_name, currency
+        FROM tickers
+        WHERE UPPER(ticker_symbol) = UPPER(?)
+        ORDER BY ticker_id
+        LIMIT 1
+        """,
+        [symbol],
+    ).fetchone()
+    if ticker_row is None:
+        return None
+    ticker_id, ticker_symbol, security_name, currency = ticker_row
+
+    params: list[Any] = [ticker_id]
+    clause = ""
+    if date_from is not None:
+        clause = "AND record_date >= ?"
+        params.append(date_from)
+    price_rows = connection.execute(
+        f"""
+        SELECT record_date, close, adjusted_close, volume
+        FROM historical_records
+        WHERE ticker_id = ? {clause}
+        ORDER BY record_date
+        """,
+        params,
+    ).fetchall()
+
+    points = [
+        {
+            "date": _date(record_date).isoformat(),
+            "close": float(close),
+            "adjusted_close": float(adjusted_close),
+            "volume": int(volume),
+        }
+        for record_date, close, adjusted_close, volume in price_rows
+    ]
+    return {
+        "ticker_id": int(ticker_id),
+        "ticker_symbol": ticker_symbol,
+        "security_name": security_name,
+        "currency": currency,
+        "count": len(points),
+        "points": points,
+    }
+
+
 def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[str, Any]]:
     """Build a chronological valuation series (securities + cash) as one set-based query.
 
@@ -412,6 +582,78 @@ def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[s
             }
         )
     return results
+
+
+def get_trend_overlay_series(
+    db_path: str = DATABASE_PATH,
+    historical_values: list[dict[str, Any]] | None = None,
+    *,
+    flow_source: str = "activities",
+) -> dict[str, Any]:
+    """Overlay series for the dashboard trend chart, aligned to the valuation date grid.
+
+    Returns cumulative net deposits (contributions minus withdrawals on or
+    before each date) plus raw CAD closes for each configured benchmark in
+    ``config.TREND_BENCHMARKS`` (forward-filled; ``None`` before the first
+    stored close). Benchmark closes are intentionally NOT normalized to the
+    portfolio's start -- anchoring to the first visible point is presentation
+    math that must re-run when the dashboard's visible range changes, so it
+    lives in the frontend.
+    """
+    if historical_values is None:
+        historical_values = get_historical_portfolio_values(db_path)
+    if not historical_values:
+        return {
+            "available": False,
+            "reason": "No historical valuation series.",
+            "benchmarks": {},
+            "points": [],
+        }
+    connection = get_shared_connection(db_path)
+    dates = [_date(row["date"]) for row in historical_values]
+
+    flows = get_external_flow_series(db_path, source=flow_source)
+    flow_index = 0
+    cumulative = Decimal("0")
+
+    benchmark_closes: dict[str, list[tuple[date, Decimal]]] = {}
+    benchmark_meta: dict[str, dict[str, Any]] = {}
+    for key, symbol in TREND_BENCHMARKS.items():
+        rows = connection.execute(
+            """
+            SELECT h.record_date, h.close
+            FROM historical_records h
+            JOIN tickers t ON t.ticker_id = h.ticker_id
+            WHERE UPPER(t.ticker_symbol) = UPPER(?)
+            ORDER BY h.record_date
+            """,
+            [symbol],
+        ).fetchall()
+        benchmark_closes[key] = [(_date(row[0]), _decimal(row[1])) for row in rows]
+        benchmark_meta[key] = {
+            "symbol": symbol,
+            "available": bool(rows),
+            **({} if rows else {"reason": f"No stored price history for {symbol}."}),
+        }
+
+    close_index: dict[str, int] = {key: 0 for key in TREND_BENCHMARKS}
+    last_close: dict[str, Decimal | None] = {key: None for key in TREND_BENCHMARKS}
+    points: list[dict[str, Any]] = []
+    for value_date in dates:
+        while flow_index < len(flows) and _date(flows[flow_index]["date"]) <= value_date:
+            cumulative += _decimal(flows[flow_index]["amount"])
+            flow_index += 1
+        bench_point: dict[str, Decimal | None] = {}
+        for key in TREND_BENCHMARKS:
+            closes = benchmark_closes[key]
+            while close_index[key] < len(closes) and closes[close_index[key]][0] <= value_date:
+                last_close[key] = closes[close_index[key]][1]
+                close_index[key] += 1
+            bench_point[key] = last_close[key]
+        points.append(
+            {"date": value_date, "net_deposits_cum": cumulative, "benchmarks": bench_point}
+        )
+    return {"available": True, "benchmarks": benchmark_meta, "points": points}
 
 
 def _date_filters(
@@ -686,19 +928,38 @@ def get_realized_gain_summary(
     clause, params = _date_filters(None, date_to, "v.event_date")
     rows = connection.execute(
         f"""
-        SELECT v.event_date, v.event_type, v.ticker_id, v.quantity, v.amount_cad, t.ticker_symbol
+        SELECT v.event_date, v.event_type, v.ticker_id, v.quantity, v.amount_cad,
+               v.amount_currency, v.fx_rate, t.ticker_symbol
         FROM v_trade_events v JOIN tickers t ON t.ticker_id = v.ticker_id
         WHERE v.event_type IN ('BUY', 'SELL', 'SPLIT') {clause}
         ORDER BY v.event_date, v.source_priority, v.source_id
         """, params,
     ).fetchall()
+    fx_series = _build_fx_series(connection)
+    latest_txn_fx_row = connection.execute(
+        "SELECT fx_rate FROM transactions WHERE fx_rate IS NOT NULL AND fx_rate > 0 "
+        "ORDER BY transaction_date DESC LIMIT 1"
+    ).fetchone()
+    latest_txn_fx = _decimal(latest_txn_fx_row[0]) if latest_txn_fx_row else None
     state: dict[int, tuple[Decimal, Decimal]] = {}
     gains: dict[str, Decimal] = {}
-    for event_date, kind, ticker_id, quantity, amount_cad, symbol in rows:
+    for event_date, kind, ticker_id, quantity, amount_cad, amount_currency, fx_rate, symbol in rows:
         held, cost = state.get(int(ticker_id), (Decimal("0"), Decimal("0")))
         qty = _decimal(quantity)
+        # The view's amount column is only truly CAD when amount_currency says
+        # so; activities rows carry the raw transaction-currency cash amount.
+        amount = _decimal(amount_cad)
+        if amount_cad is not None and amount_currency and str(amount_currency) != "CAD":
+            rate, _flag = _resolve_fx(
+                str(amount_currency),
+                _decimal(fx_rate) if fx_rate is not None else None,
+                _date(event_date),
+                fx_series,
+                latest_txn_fx,
+            )
+            amount *= rate
         if kind == "BUY":
-            state[int(ticker_id)] = (held + qty, cost + _decimal(amount_cad))
+            state[int(ticker_id)] = (held + qty, cost + amount)
             continue
         if kind == "SPLIT":
             state[int(ticker_id)] = (held + qty, cost)
@@ -706,7 +967,7 @@ def get_realized_gain_summary(
         sold = min(qty, held)
         allocated_cost = (cost / held) * sold if held > 0 else Decimal("0")
         if date_from is None or _date(event_date) >= date_from:
-            gains[str(symbol)] = gains.get(str(symbol), Decimal("0")) + _decimal(amount_cad) - allocated_cost
+            gains[str(symbol)] = gains.get(str(symbol), Decimal("0")) + amount - allocated_cost
         state[int(ticker_id)] = (held - sold, cost - allocated_cost)
     return {
         "source": "v_trade_events",
@@ -852,6 +1113,29 @@ def get_sector_allocation(db_path: str, holdings: list[Holding]) -> dict[str, An
     return {"by_sector": _weights_from_totals(totals), "missing_sector_tickers": missing_sector_tickers}
 
 
+# yfinance funds_data uses snake_case sector keys while stock_details stores the
+# Title Case names; both must land on one canonical label or look-through
+# exposure double-counts a sector under two spellings.
+_ETF_SECTOR_LABELS = {
+    "realestate": "Real Estate",
+    "real_estate": "Real Estate",
+    "basic_materials": "Basic Materials",
+    "consumer_cyclical": "Consumer Cyclical",
+    "consumer_defensive": "Consumer Defensive",
+    "financial_services": "Financial Services",
+    "communication_services": "Communication Services",
+    "technology": "Technology",
+    "healthcare": "Healthcare",
+    "utilities": "Utilities",
+    "industrials": "Industrials",
+    "energy": "Energy",
+}
+
+
+def _canonical_sector(key: str) -> str:
+    return _ETF_SECTOR_LABELS.get(key, key.replace("_", " ").title())
+
+
 def _get_etf_sector_weights(db_path: str, ticker_ids: list[int]) -> dict[int, dict[str, float]]:
     if not ticker_ids:
         return {}
@@ -870,7 +1154,11 @@ def _get_etf_sector_weights(db_path: str, ticker_ids: list[int]) -> dict[int, di
         except (TypeError, ValueError):
             continue
         if isinstance(parsed, dict) and parsed:
-            result[int(ticker_id)] = {str(key): float(value) for key, value in parsed.items()}
+            canonical: dict[str, float] = {}
+            for key, value in parsed.items():
+                label = _canonical_sector(str(key))
+                canonical[label] = canonical.get(label, 0.0) + float(value)
+            result[int(ticker_id)] = canonical
     return result
 
 
@@ -908,7 +1196,8 @@ def get_look_through_sector_exposure(db_path: str, holdings: list[Holding]) -> d
             if not sector:
                 continue
             covered_value += holding.market_value
-            exposure[sector] = exposure.get(sector, 0.0) + float(holding.market_value)
+            label = _canonical_sector(sector)
+            exposure[label] = exposure.get(label, 0.0) + float(holding.market_value)
     coverage_percent = float(covered_value / total_value)
     if coverage_percent <= 0:
         return {
@@ -1405,6 +1694,8 @@ def portfolio_report(
     look_through = get_look_through_sector_exposure(db_path, holding_objs)
     currency_exposure = get_currency_exposure(holding_objs)
     weights_by_ticker = calculate_position_weights(holdings)
+    for row in holdings:
+        row["weight"] = weights_by_ticker.get(row["ticker_symbol"], {}).get("weight", 0.0)
     concentration = calculate_concentration(weights_by_ticker)
 
     if group_allocation.get("group_unavailable_reason"):
@@ -1421,15 +1712,37 @@ def portfolio_report(
     if not concentration["available"]:
         _mark_unavailable("allocation.concentration", concentration["reason"])
 
-    single_name_breach = (
-        concentration["max_single_name_weight"] > float(SINGLE_NAME_MAX_WEIGHT)
-        if concentration["available"]
-        else None
+    # The single-name cap targets idiosyncratic single-company risk, so
+    # diversified broad-market funds (ETFs classified as Core) are exempt:
+    # XEQT at 26% is the market, not a concentrated bet.
+    classifications_by_id = group_allocation.get("classifications", {})
+    exempt_tickers = sorted(
+        h.ticker_symbol
+        for h in holding_objs
+        if h.security_type == "etf"
+        and (classifications_by_id.get(h.ticker_id) or {}).get("primary_group") == "Core"
     )
+    exempt_set = set(exempt_tickers)
+    single_name_breach = None
+    max_flagged_weight: float | None = None
+    max_flagged_ticker: str | None = None
+    if concentration["available"]:
+        flagged = {s: info for s, info in weights_by_ticker.items() if s not in exempt_set}
+        if flagged:
+            max_flagged_ticker, flagged_row = max(
+                flagged.items(), key=lambda item: item[1]["weight"]
+            )
+            max_flagged_weight = float(flagged_row["weight"])
+            single_name_breach = max_flagged_weight > float(SINGLE_NAME_MAX_WEIGHT)
+        else:
+            single_name_breach = False
     concentration_with_limit = {
         **concentration,
         "single_name_limit": float(SINGLE_NAME_MAX_WEIGHT),
         "single_name_limit_breached": single_name_breach,
+        "max_flagged_name_weight": max_flagged_weight,
+        "max_flagged_name_ticker": max_flagged_ticker,
+        "exempt_tickers": exempt_tickers,
     }
     allocation = {
         "by_ticker": weights_by_ticker,
@@ -1501,8 +1814,18 @@ def portfolio_report(
             "Benchmark comparison disabled." if not benchmark_symbol else "No historical valuation series to compare.",
         )
 
+    trend_overlays = get_trend_overlay_series(
+        db_path, historical_values, flow_source=cash_flow_source
+    )
+    if not trend_overlays["available"]:
+        _mark_unavailable("performance.trend_overlays", trend_overlays["reason"])
+    for overlay_key, meta in trend_overlays["benchmarks"].items():
+        if not meta["available"]:
+            _mark_unavailable(f"performance.trend_overlays.{overlay_key}", meta["reason"])
+
     performance = {
         "historical_values": historical_values,
+        "trend_overlays": trend_overlays,
         "adjusted_returns": {
             "total_return": total_return,
             "volatility": volatility,

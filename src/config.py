@@ -33,6 +33,12 @@ DEFAULT_RISK_FREE_RATE = 0.0
 STALE_PRICE_MAX_AGE_DAYS = 7
 SUSPICIOUS_UNREALIZED_GAIN_THRESHOLD = 0.95
 DEFAULT_BENCHMARK_SYMBOL = "XEQT.TO"
+# Benchmarks persisted to `historical_records` by `market_data.ensure_benchmark_history`
+# (db ticker symbol -> yfinance symbol). VFV (CAD-listed, unhedged) stands in
+# for the S&P 500 so the overlay stays in the portfolio's currency.
+BENCHMARK_TICKERS = {"XEQT": "XEQT.TO", "VFV": "VFV.TO"}
+# Overlay key served in the report's performance.trend_overlays -> db ticker symbol.
+TREND_BENCHMARKS = {"XEQT": "XEQT", "SP500": "VFV"}
 SINGLE_NAME_MAX_WEIGHT = Decimal("0.10")
 ANALYTICS_EXPORT_FOLDER = EXPORT_FOLDER / "analytics"
 ANALYTICS_EXPORT_FILENAME = "portfolio-analytics.json"

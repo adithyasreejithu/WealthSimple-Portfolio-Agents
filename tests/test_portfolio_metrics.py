@@ -166,6 +166,7 @@ class ConcentrationTest(unittest.TestCase):
     def test_unavailable_when_no_holdings(self):
         result = calculate_concentration({})
         self.assertFalse(result["available"])
+        self.assertIsNone(result["effective_holdings"])
 
     def test_top_n_and_hhi(self):
         weights = {
@@ -179,6 +180,7 @@ class ConcentrationTest(unittest.TestCase):
         self.assertAlmostEqual(result["hhi"], 0.25 + 0.09 + 0.04)
         self.assertEqual(result["max_single_name_ticker"], "A")
         self.assertAlmostEqual(result["max_single_name_weight"], 0.5)
+        self.assertAlmostEqual(result["effective_holdings"], 1 / 0.38)
 
 
 class BenchmarkStatsTest(unittest.TestCase):

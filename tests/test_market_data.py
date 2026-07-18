@@ -40,6 +40,7 @@ class MarketDataSyncTest(unittest.TestCase):
         with (
             patch.object(market_data, "initialize_database"),
             patch.object(market_data, "ensure_fx_history", return_value=0),
+            patch.object(market_data, "ensure_benchmark_history", return_value=0),
             patch.object(market_data, "get_market_targets", return_value=[self.target]),
             patch.object(market_data, "get_shared_connection", return_value=connection),
             patch.object(market_data, "upload_security_metadata") as metadata_upload,
@@ -260,6 +261,125 @@ class FxHistorySyncTest(unittest.TestCase):
         self.assertEqual(rows, 1)
         second_fetcher.assert_called_once_with(
             [market_data.FX_PAIR_SYMBOL], date(2025, 1, 3), date(2025, 1, 6)
+        )
+
+
+class BenchmarkHistorySyncTest(unittest.TestCase):
+    """Exercise `ensure_benchmark_history` against a real database (not mocks)."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        import database
+
+        self.database = database
+        database.close_connection()
+        self.temp_dir = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
+        self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
+        database.initialize_database(self.db_path)
+        self.connection = database.get_shared_connection(self.db_path)
+
+    def _frame(self, symbol, dates_and_closes):
+        return pd.DataFrame(
+            [
+                {
+                    "Date": day, "Ticker": symbol,
+                    "Open": close, "High": close, "Low": close,
+                    "Close": close, "Adj Close": close, "Volume": 0,
+                }
+                for day, close in dates_and_closes
+            ]
+        )
+
+    def _seed_owned_transaction(self, transaction_date=date(2025, 1, 2)):
+        ticker_id = self.connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        self.connection.execute(
+            "INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit) "
+            "VALUES (?, 'BUY', ?, 1, 100)",
+            [transaction_date, ticker_id],
+        )
+        return ticker_id
+
+    def _fetcher(self, dates_and_closes):
+        def fetch(symbols, start, end):
+            return self._frame(symbols[0], dates_and_closes)
+
+        return Mock(side_effect=fetch)
+
+    def test_no_owned_activity_skips_fetch(self):
+        history_fetcher = Mock(return_value=pd.DataFrame())
+        rows = market_data.ensure_benchmark_history(self.db_path, history_fetcher=history_fetcher)
+        self.assertEqual(rows, 0)
+        history_fetcher.assert_not_called()
+
+    def test_creates_benchmark_tickers_and_backfills_from_earliest_owned_date(self):
+        self._seed_owned_transaction()
+        history_fetcher = self._fetcher([("2025-01-02", 30.0), ("2025-01-03", 30.5)])
+
+        rows = market_data.ensure_benchmark_history(
+            self.db_path, as_of=date(2025, 1, 10), history_fetcher=history_fetcher
+        )
+
+        self.assertEqual(rows, 2 * len(market_data.BENCHMARK_TICKERS))
+        fetched_symbols = {call.args[0][0] for call in history_fetcher.call_args_list}
+        self.assertEqual(fetched_symbols, set(market_data.BENCHMARK_TICKERS.values()))
+        for call in history_fetcher.call_args_list:
+            self.assertEqual(call.args[1], date(2025, 1, 2))
+            self.assertEqual(call.args[2], date(2025, 1, 11))
+        row = self.connection.execute(
+            "SELECT exchange, security_type FROM tickers WHERE ticker_symbol = 'VFV'"
+        ).fetchone()
+        self.assertEqual(row, ("BENCHMARK", "benchmark"))
+
+    def test_reuses_existing_ticker_row_for_owned_benchmark(self):
+        self._seed_owned_transaction()
+        existing_id = self.connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('XEQT', 'TSX', 'CAD', 'iShares Core Equity ETF', 'etf') RETURNING ticker_id"""
+        ).fetchone()[0]
+        history_fetcher = self._fetcher([("2025-01-02", 30.0)])
+
+        market_data.ensure_benchmark_history(
+            self.db_path, as_of=date(2025, 1, 10), history_fetcher=history_fetcher
+        )
+
+        count = self.connection.execute(
+            "SELECT COUNT(*) FROM tickers WHERE UPPER(ticker_symbol) = 'XEQT'"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+        stored = self.connection.execute(
+            "SELECT COUNT(*) FROM historical_records WHERE ticker_id = ?", [existing_id]
+        ).fetchone()[0]
+        self.assertEqual(stored, 1)
+
+    def test_backfills_missing_head_range_for_owned_ticker(self):
+        self._seed_owned_transaction(date(2025, 1, 2))
+        existing_id = self.connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('XEQT', 'TSX', 'CAD', 'iShares Core Equity ETF', 'etf') RETURNING ticker_id"""
+        ).fetchone()[0]
+        # Owned-ticker sync started at first ownership, well after the
+        # portfolio's earliest transaction.
+        self.connection.execute(
+            "INSERT INTO historical_records VALUES (?, ?, 30, 30, 30, 30, 30, 0)",
+            [existing_id, date(2025, 3, 1)],
+        )
+        history_fetcher = self._fetcher([("2025-01-02", 29.0)])
+
+        market_data.ensure_benchmark_history(
+            self.db_path, as_of=date(2025, 3, 5), history_fetcher=history_fetcher
+        )
+
+        xeqt_calls = [c for c in history_fetcher.call_args_list if c.args[0] == ["XEQT.TO"]]
+        self.assertEqual(
+            [(c.args[1], c.args[2]) for c in xeqt_calls],
+            [(date(2025, 1, 2), date(2025, 3, 1)), (date(2025, 3, 2), date(2025, 3, 6))],
         )
 
 

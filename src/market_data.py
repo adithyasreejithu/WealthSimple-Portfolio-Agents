@@ -9,7 +9,7 @@ from typing import Callable, Iterable
 
 import pandas as pd
 
-from config import DATABASE_PATH, FX_PAIR_SYMBOL
+from config import BENCHMARK_TICKERS, DATABASE_PATH, FX_PAIR_SYMBOL
 from database import get_shared_connection, initialize_database
 from database_command import upload_security_history, upload_security_metadata
 from system_logger import get_logger
@@ -198,6 +198,105 @@ def ensure_fx_history(
     return rows
 
 
+def _ensure_benchmark_ticker(db_path: Path | str, symbol: str, name: str) -> int:
+    """Return the ticker_id for a benchmark symbol, creating a synthetic row if needed.
+
+    Looks up by symbol across any exchange first so an already-owned ticker
+    (e.g. XEQT) is reused rather than duplicated -- `analytics.get_price_history`
+    resolves symbols with a bare symbol match, so a second row for the same
+    symbol would shadow the first. Only creates a row (mirroring the FX-pair
+    pattern) when the symbol is absent entirely.
+    """
+    connection = get_shared_connection(db_path)
+    row = connection.execute(
+        "SELECT ticker_id FROM tickers WHERE UPPER(ticker_symbol) = UPPER(?) ORDER BY ticker_id LIMIT 1",
+        [symbol],
+    ).fetchone()
+    if row:
+        return int(row[0])
+    return int(
+        connection.execute(
+            """
+            INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+            VALUES (?, 'BENCHMARK', 'CAD', ?, 'benchmark')
+            RETURNING ticker_id
+            """,
+            [symbol.upper(), name],
+        ).fetchone()[0]
+    )
+
+
+def ensure_benchmark_history(
+    db_path: Path | str = DATABASE_PATH,
+    *,
+    as_of: date | None = None,
+    history_fetcher: HistoryFetcher = _fetch_security_history_strict,
+) -> int:
+    """Fetch and store daily closes for the configured benchmark tickers.
+
+    Guarantees full portfolio-window coverage: backfills each benchmark from
+    the earliest transaction of any kind (including a missing head range when
+    the ticker is owned but its history only starts at first ownership), then
+    fetches forward incrementally. Returns the number of rows written.
+    """
+    today = as_of or date.today()
+    connection = get_shared_connection(db_path)
+
+    earliest_row = connection.execute(
+        """
+        SELECT MIN(d) FROM (
+            SELECT MIN(transaction_date) AS d FROM transactions
+            UNION ALL
+            SELECT MIN(transaction_date) FROM email_transactions
+            UNION ALL
+            SELECT MIN(transaction_date) FROM activities
+        )
+        """
+    ).fetchone()
+    if not earliest_row or earliest_row[0] is None:
+        return 0
+    earliest_owned_date = earliest_row[0]
+
+    total_rows = 0
+    for symbol, provider_symbol in BENCHMARK_TICKERS.items():
+        ticker_id = _ensure_benchmark_ticker(db_path, symbol, f"{symbol} (benchmark)")
+        bounds = connection.execute(
+            "SELECT MIN(record_date), MAX(record_date) FROM historical_records WHERE ticker_id = ?",
+            [ticker_id],
+        ).fetchone()
+        stored_min, stored_max = (bounds or (None, None))
+
+        ranges: list[tuple[date, date]] = []
+        if stored_min is None:
+            ranges.append((earliest_owned_date, today + timedelta(days=1)))
+        else:
+            if earliest_owned_date < stored_min:
+                ranges.append((earliest_owned_date, stored_min))
+            if stored_max + timedelta(days=1) <= today:
+                ranges.append((stored_max + timedelta(days=1), today + timedelta(days=1)))
+
+        for start, end in ranges:
+            history = history_fetcher([provider_symbol], start, end)
+            if history.empty:
+                continue
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                rows = upload_security_history(
+                    history, {provider_symbol.upper(): ticker_id}, db_path
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                logger.exception(
+                    "Benchmark history synchronization database write failed | symbol=%s", symbol
+                )
+                raise
+            total_rows += rows
+    if total_rows:
+        logger.info("Benchmark history synchronization complete | rows=%d", total_rows)
+    return total_rows
+
+
 def sync_market_data(
     db_path: Path | str = DATABASE_PATH,
     symbols: Iterable[str] | None = None,
@@ -217,6 +316,12 @@ def sync_market_data(
         # portfolio holding; a transient fetch failure here should not abort
         # syncing the tickers the user actually owns.
         logger.exception("FX history synchronization failed; continuing with ticker sync")
+    try:
+        ensure_benchmark_history(db_path, as_of=today, history_fetcher=history_fetcher)
+    except Exception:
+        # Benchmarks only feed the dashboard's trend overlays; same failure
+        # isolation as the FX pair.
+        logger.exception("Benchmark history synchronization failed; continuing with ticker sync")
     targets = get_market_targets(db_path, symbols)
     if not targets:
         return MarketSyncResult(0, 0, 0)

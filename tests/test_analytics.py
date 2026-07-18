@@ -10,9 +10,11 @@ from analytics import (
     build_data_quality,
     get_benchmark_returns,
     get_cash_summary,
+    get_classification_details,
     get_currency_exposure,
     get_dividend_history,
     get_excluded_positions,
+    get_price_history,
     get_expense_ratios,
     get_external_flow_series,
     get_group_allocation,
@@ -25,6 +27,7 @@ from analytics import (
     get_fx_fee_summary,
     get_realized_gain_summary,
     get_sector_allocation,
+    get_trend_overlay_series,
     get_turnover_and_holding_period,
     load_allocation_targets,
     portfolio_report,
@@ -404,6 +407,121 @@ class AnalyticsTest(unittest.TestCase):
 
         self.assertEqual(result["total_realized_gain"], Decimal("20"))
 
+    def test_realized_gain_converts_usd_activity_amounts(self):
+        # Activities rows carry net_cash_amount in transaction_currency; both
+        # the BUY cost basis and SELL proceeds must be FX-converted to CAD.
+        connection = database.get_shared_connection(self.db_path)
+        fx_id = connection.execute(
+            "INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type) "
+            "VALUES ('USDCAD=X', 'FX', 'CAD', 'USD/CAD', 'fx_rate') RETURNING ticker_id"
+        ).fetchone()[0]
+        for record_date, close in ((date(2025, 1, 2), 1.35), (date(2025, 6, 2), 1.40)):
+            connection.execute(
+                "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [fx_id, record_date, close, close, close, close, close, 0],
+            )
+        ticker_id = self._ticker(symbol="NVDA", name="NVIDIA Corp.")
+        import_id = connection.execute(
+            "INSERT INTO activity_imports (source_file, file_hash, status) "
+            "VALUES ('f', 'h-usd', 'succeeded') RETURNING import_id"
+        ).fetchone()[0]
+        connection.executemany(
+            """
+            INSERT INTO activities (
+                transaction_date, account_id, account_type, activity_type, activity_subtype,
+                activity_code, direction, ticker_id, transaction_currency, quantity, net_cash_amount,
+                row_fingerprint, duplicate_ordinal, first_seen_import_id, last_seen_import_id
+            ) VALUES (?, 'A1', 'TFSA', 'Trade', ?, ?, 'LONG', ?, 'USD', ?, ?, ?, 1, ?, ?)
+            """,
+            [
+                (date(2025, 1, 2), "BUY", "BUY", ticker_id, Decimal("10"), Decimal("-1000"), "fp-b", import_id, import_id),
+                (date(2025, 6, 2), "SELL", "SELL", ticker_id, Decimal("-10"), Decimal("1200"), "fp-s", import_id, import_id),
+            ],
+        )
+
+        result = get_realized_gain_summary(self.db_path)
+
+        # proceeds 1200 USD * 1.40 minus cost 1000 USD * 1.35
+        self.assertEqual(result["total_realized_gain"], Decimal("330"))
+
+    def test_report_holdings_carry_portfolio_weight(self):
+        connection = database.get_shared_connection(self.db_path)
+        a = self._ticker()
+        b = self._ticker(symbol="MSFT", name="Microsoft Corp.")
+        connection.executemany(
+            """
+            INSERT INTO transactions (
+                transaction_date, transaction_type, ticker_id, quantity,
+                execution_date, debit, credit, fx_rate
+            ) VALUES (?, 'BUY', ?, ?, ?, ?, NULL, NULL)
+            """,
+            [
+                (date(2025, 1, 2), a, Decimal("1"), date(2025, 1, 2), Decimal("300")),
+                (date(2025, 1, 2), b, Decimal("1"), date(2025, 1, 2), Decimal("100")),
+            ],
+        )
+        for tid, close in ((a, 300.0), (b, 100.0)):
+            connection.execute(
+                "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [tid, date(2025, 1, 2), close, close, close, close, close, 1],
+            )
+
+        report = portfolio_report(self.db_path, benchmark_symbol=None)
+
+        weights = {row["ticker_symbol"]: row["weight"] for row in report["holdings"]}
+        self.assertAlmostEqual(weights["AAPL"], 0.75)
+        self.assertAlmostEqual(weights["MSFT"], 0.25)
+        self.assertAlmostEqual(sum(weights.values()), 1.0)
+
+    def test_trend_overlay_series_cumulates_deposits_and_forward_fills_benchmarks(self):
+        connection = database.get_shared_connection(self.db_path)
+        # Benchmark closes: only VFV (the SP500 overlay), starting mid-grid so
+        # the first point has a leading null; the second close forward-fills.
+        vfv_id = connection.execute(
+            "INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type) "
+            "VALUES ('VFV', 'BENCHMARK', 'CAD', 'VFV (benchmark)', 'benchmark') RETURNING ticker_id"
+        ).fetchone()[0]
+        for record_date, close in ((date(2025, 1, 3), 140.0), (date(2025, 1, 4), 141.0)):
+            connection.execute(
+                "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [vfv_id, record_date, close, close, close, close, close, 0],
+            )
+        # External flows: contribution then withdrawal.
+        import_id = connection.execute(
+            "INSERT INTO activity_imports (source_file, file_hash, status) "
+            "VALUES ('f', 'h-flows', 'succeeded') RETURNING import_id"
+        ).fetchone()[0]
+        connection.executemany(
+            """
+            INSERT INTO activities (
+                transaction_date, account_id, account_type, activity_type, activity_subtype,
+                activity_code, direction, transaction_currency, net_cash_amount,
+                row_fingerprint, duplicate_ordinal, first_seen_import_id, last_seen_import_id
+            ) VALUES (?, 'A1', 'TFSA', 'Deposit', NULL, 'CONT', NULL, 'CAD', ?, ?, 1, ?, ?)
+            """,
+            [
+                (date(2025, 1, 2), Decimal("500"), "fp-c1", import_id, import_id),
+                (date(2025, 1, 4), Decimal("-200"), "fp-c2", import_id, import_id),
+            ],
+        )
+        historical_values = [
+            {"date": date(2025, 1, 2), "portfolio_value": Decimal("500")},
+            {"date": date(2025, 1, 3), "portfolio_value": Decimal("510")},
+            {"date": date(2025, 1, 5), "portfolio_value": Decimal("310")},
+        ]
+
+        result = get_trend_overlay_series(self.db_path, historical_values)
+
+        self.assertTrue(result["available"])
+        self.assertTrue(result["benchmarks"]["SP500"]["available"])
+        self.assertFalse(result["benchmarks"]["XEQT"]["available"])
+        deposits = [p["net_deposits_cum"] for p in result["points"]]
+        self.assertEqual(deposits, [Decimal("500"), Decimal("500"), Decimal("300")])
+        sp500 = [p["benchmarks"]["SP500"] for p in result["points"]]
+        self.assertIsNone(sp500[0])
+        self.assertEqual(sp500[1], Decimal("140"))
+        self.assertEqual(sp500[2], Decimal("141"))
+
     def test_external_flow_series_aggregates_same_day_contributions(self):
         connection = database.get_shared_connection(self.db_path)
         connection.executemany(
@@ -550,6 +668,69 @@ class AnalyticsAllocationTest(unittest.TestCase):
         self.assertAlmostEqual(result["weights"]["Technology"], 0.6)
         self.assertAlmostEqual(result["weights"]["Financials"], 0.4)
 
+    def test_single_name_cap_exempts_core_etfs(self):
+        etf_id = self._ticker(symbol="XEQT", exchange="TSX", currency="CAD", security_type="etf")
+        stock_id = self._ticker(symbol="AAPL")
+        self._buy(etf_id, 95, 9500)
+        self._buy(stock_id, 5, 500)
+        self._price(etf_id, 100)
+        self._price(stock_id, 100)
+        self._classify(etf_id, "Core")
+        self._classify(stock_id, "Growth")
+
+        report = portfolio_report(self.db_path, benchmark_symbol=None)
+        concentration = report["allocation"]["concentration"]
+
+        self.assertEqual(concentration["exempt_tickers"], ["XEQT"])
+        self.assertFalse(concentration["single_name_limit_breached"])
+        self.assertEqual(concentration["max_flagged_name_ticker"], "AAPL")
+        # Whole-portfolio descriptive figures are unaffected by the exemption.
+        self.assertEqual(concentration["max_single_name_ticker"], "XEQT")
+
+    def test_single_name_cap_still_flags_large_stock(self):
+        etf_id = self._ticker(symbol="XEQT", exchange="TSX", currency="CAD", security_type="etf")
+        stock_id = self._ticker(symbol="AAPL")
+        self._buy(etf_id, 80, 8000)
+        self._buy(stock_id, 20, 2000)
+        self._price(etf_id, 100)
+        self._price(stock_id, 100)
+        self._classify(etf_id, "Core")
+        self._classify(stock_id, "Growth")
+
+        report = portfolio_report(self.db_path, benchmark_symbol=None)
+        concentration = report["allocation"]["concentration"]
+
+        self.assertTrue(concentration["single_name_limit_breached"])
+        self.assertEqual(concentration["max_flagged_name_ticker"], "AAPL")
+        self.assertAlmostEqual(concentration["max_flagged_name_weight"], 0.2)
+
+    def test_look_through_merges_snake_case_etf_sector_labels(self):
+        # yfinance ETF sector keys are snake_case while stock sectors are
+        # Title Case; both must land on one canonical label or a sector shows
+        # up twice in the look-through split.
+        etf_id = self._ticker(symbol="XEQT", exchange="TSX", security_type="etf")
+        stock_id = self._ticker(symbol="MSFT", name="Microsoft Corp.")
+        self._buy(etf_id, 10, 1000)
+        self._buy(stock_id, 10, 1000)
+        self._price(etf_id, 100)
+        self._price(stock_id, 100)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO etf_details (ticker_id, sector_weights) VALUES (?, ?)",
+            [etf_id, json.dumps({"technology": 0.4, "financial_services": 0.6})],
+        )
+        connection.execute(
+            "INSERT INTO stock_details (ticker_id, sector) VALUES (?, 'Technology')", [stock_id]
+        )
+        holdings = get_holdings(self.db_path)
+
+        result = get_look_through_sector_exposure(self.db_path, holdings)
+
+        self.assertAlmostEqual(result["weights"]["Technology"], 0.7)
+        self.assertAlmostEqual(result["weights"]["Financial Services"], 0.3)
+        self.assertNotIn("technology", result["weights"])
+        self.assertNotIn("financial_services", result["weights"])
+
     def test_look_through_sector_exposure_unavailable_without_any_data(self):
         ticker_id = self._ticker()
         self._buy(ticker_id, 10, 1000)
@@ -672,6 +853,97 @@ class AnalyticsAllocationTest(unittest.TestCase):
         targets = load_allocation_targets()
         self.assertIsNotNone(targets)
         self.assertEqual(targets["Core"]["target_percent"], 60)
+
+    def _insert_classification(self, ticker_id, *, primary_group="Quality", review_needed=False):
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            """
+            INSERT INTO portfolio_classifications (
+                ticker_id, primary_group, secondary_tags, confidence, reasoning,
+                evidence_used, missing_data, review_needed, fields, field_provenance,
+                enrichment, generated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ticker_id,
+                primary_group,
+                json.dumps(["Equity", "Technology"]),
+                "high",
+                "Manual override.",
+                json.dumps(["manual_override:AAPL"]),
+                json.dumps([]),
+                review_needed,
+                json.dumps(
+                    {
+                        "sector": "Technology",
+                        "expense_ratio": None,
+                        # The classifier double-encodes these nested values as
+                        # JSON strings inside the fields JSON.
+                        "sector_weights": json.dumps({"technology": 0.5, "energy": 0.1}),
+                    }
+                ),
+                json.dumps({"sector": "database"}),
+                json.dumps({"mode": "equity"}),
+                date(2026, 7, 17),
+            ],
+        )
+
+    def test_get_classification_details_parses_json_and_joins_ticker(self):
+        ticker_id = self._ticker()
+        self._insert_classification(ticker_id, review_needed=True)
+
+        result = get_classification_details(self.db_path)
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["review_count"], 1)
+        row = result["classifications"][0]
+        self.assertEqual(row["ticker_symbol"], "AAPL")
+        self.assertEqual(row["security_type"], "stock")
+        self.assertEqual(row["primary_group"], "Quality")
+        # JSON text columns come back as real Python structures.
+        self.assertEqual(row["secondary_tags"], ["Equity", "Technology"])
+        self.assertEqual(row["fields"]["sector"], "Technology")
+        # Nested double-encoded JSON is parsed into a real object.
+        self.assertEqual(row["fields"]["sector_weights"], {"technology": 0.5, "energy": 0.1})
+        self.assertTrue(row["review_needed"])
+
+    def test_get_classification_details_empty_table(self):
+        result = get_classification_details(self.db_path)
+        self.assertEqual(result, {"generated_at": None, "count": 0, "review_count": 0, "classifications": []})
+
+    def test_get_price_history_orders_and_filters_by_date(self):
+        ticker_id = self._ticker()
+        connection = database.get_shared_connection(self.db_path)
+        connection.executemany(
+            "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                [ticker_id, date(2025, 1, 3), 90.0, 95.0, 88.0, 92.0, 91.5, 100],
+                [ticker_id, date(2025, 1, 2), 100.0, 105.0, 99.0, 101.0, 100.5, 200],
+                [ticker_id, date(2025, 1, 4), 92.0, 96.0, 90.0, 95.0, 94.5, 300],
+            ],
+        )
+
+        result = get_price_history("AAPL", self.db_path)
+
+        self.assertEqual(result["ticker_symbol"], "AAPL")
+        self.assertEqual(result["count"], 3)
+        # Ordered oldest-first for direct charting.
+        self.assertEqual([p["date"] for p in result["points"]], ["2025-01-02", "2025-01-03", "2025-01-04"])
+        self.assertEqual(result["points"][0]["close"], 101.0)
+        self.assertEqual(result["points"][0]["adjusted_close"], 100.5)
+
+        filtered = get_price_history("AAPL", self.db_path, date_from=date(2025, 1, 3))
+        self.assertEqual([p["date"] for p in filtered["points"]], ["2025-01-03", "2025-01-04"])
+
+    def test_get_price_history_symbol_is_case_insensitive(self):
+        self._ticker(symbol="AAPL")
+        result = get_price_history("aapl", self.db_path)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["ticker_symbol"], "AAPL")
+
+    def test_get_price_history_unknown_symbol_returns_none(self):
+        self.assertIsNone(get_price_history("NOPE", self.db_path))
 
 
 if __name__ == "__main__":

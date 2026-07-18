@@ -161,6 +161,11 @@ uv run python src/app.py yfinance-sync --full
 - `--full` backfills again from each selected ticker's first portfolio activity.
 - History starts at the earliest owned date on the first run and continues
   incrementally after the latest stored date on later runs.
+- Each run also persists daily closes for the configured FX pair and the
+  dashboard benchmark tickers (`config.BENCHMARK_TICKERS`, currently XEQT and
+  VFV as the S&P 500 proxy), backfilled to the earliest transaction date so
+  the dashboard's trend-chart overlays cover the full portfolio window. A
+  benchmark fetch failure is isolated and never aborts the owned-ticker sync.
 - Synchronization refreshes stock/ETF detail records and historical prices only.
   It does not alter existing ticker identity fields, Yahoo mappings, or symbol history.
 - Missing ticker identities must first be created through ingestion or the

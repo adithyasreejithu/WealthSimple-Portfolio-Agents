@@ -302,6 +302,80 @@ class PositionEngineTest(unittest.TestCase):
         self.assertEqual(quantity, Decimal("2.00000000"))
         self.assertNotIn("split_without_quantity", flags or ())
 
+    def _fx_ticker(self):
+        from config import FX_PAIR_SYMBOL
+
+        return int(
+            self.connection.execute(
+                """
+                INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+                VALUES (?, 'FX', 'CAD', 'USD/CAD', 'fx_rate') RETURNING ticker_id
+                """,
+                [FX_PAIR_SYMBOL],
+            ).fetchone()[0]
+        )
+
+    def _usd_activity_trade(self, ticker_id, transaction_date, subtype, quantity, net_cash_amount, fingerprint):
+        import_id = int(
+            self.connection.execute(
+                "INSERT INTO activity_imports (source_file, file_hash, status) "
+                f"VALUES ('f', 'h-{fingerprint}', 'succeeded') RETURNING import_id"
+            ).fetchone()[0]
+        )
+        self.connection.execute(
+            """
+            INSERT INTO activities (
+                transaction_date, account_id, account_type, activity_type, activity_subtype,
+                activity_code, direction, ticker_id, transaction_currency, quantity, net_cash_amount,
+                row_fingerprint, duplicate_ordinal, first_seen_import_id, last_seen_import_id
+            ) VALUES (?, 'A1', 'TFSA', 'Trade', ?, ?, 'LONG', ?, 'USD', ?, ?, ?, 1, ?, ?)
+            """,
+            [
+                transaction_date, subtype, subtype, ticker_id, quantity, net_cash_amount,
+                fingerprint, import_id, import_id,
+            ],
+        )
+
+    def test_usd_activities_trade_converts_amounts_to_cad(self):
+        # Activities rows carry net_cash_amount in transaction_currency, not
+        # CAD; both cost basis (BUY) and realized gain (SELL) must be
+        # FX-converted using the stored USDCAD=X series.
+        fx_id = self._fx_ticker()
+        for record_date, close in ((date(2025, 1, 2), Decimal("1.35")), (date(2025, 6, 2), Decimal("1.40"))):
+            self.connection.execute(
+                """
+                INSERT INTO historical_records (ticker_id, record_date, open, high, low, close, adjusted_close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                [fx_id, record_date, close, close, close, close, close],
+            )
+        ticker_id = self._ticker("NVDA", currency="USD")
+        self._usd_activity_trade(ticker_id, date(2025, 1, 2), "BUY", Decimal("10"), Decimal("-1000"), "fp-b")
+        self._usd_activity_trade(ticker_id, date(2025, 6, 2), "SELL", Decimal("-10"), Decimal("1200"), "fp-s")
+
+        position_engine.recompute_positions(self.connection)
+        quantity, book_cad, _book_mkt, realized_cad, _provisional, flags = self._snapshot(ticker_id)
+
+        self.assertEqual(quantity, Decimal("0.00000000"))
+        self.assertEqual(book_cad, Decimal("0.0000"))
+        # cost = 1000 USD * 1.35; proceeds = 1200 USD * 1.40; gain = 1680 - 1350
+        self.assertEqual(realized_cad, Decimal("330.0000"))
+        self.assertIsNone(flags)
+
+    def test_engine_version_change_invalidates_snapshots(self):
+        ticker_id = self._ticker("AAPL", currency="USD")
+        self._buy(ticker_id, date(2025, 1, 1), Decimal("1"), Decimal("100"))
+
+        position_engine.recompute_positions(self.connection)
+        self.assertFalse(position_engine.is_stale(self.connection))
+
+        original = position_engine._ENGINE_VERSION
+        position_engine._ENGINE_VERSION = original + "-test"
+        try:
+            self.assertTrue(position_engine.is_stale(self.connection))
+        finally:
+            position_engine._ENGINE_VERSION = original
+
     def test_ensure_positions_fresh_recomputes_only_when_stale(self):
         ticker_id = self._ticker("AAPL", currency="USD")
         self._buy(ticker_id, date(2025, 1, 1), Decimal("1"), Decimal("100"))
