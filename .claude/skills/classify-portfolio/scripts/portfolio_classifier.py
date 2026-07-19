@@ -86,16 +86,6 @@ def _is_truthy(value: Any) -> bool:
     return _normalize_lower(value) in {"1", "true", "yes", "y", "on"}
 
 
-def _normalize_keywords(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
-        return [str(item) for item in value if _normalize_text(item)]
-    return [_normalize_text(value)]
-
-
 def _unique_tags(tags: Sequence[str]) -> tuple[str, ...]:
     seen: set[str] = set()
     ordered: list[str] = []
@@ -108,16 +98,6 @@ def _unique_tags(tags: Sequence[str]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
-def _parse_float(value: Any) -> float | None:
-    text = _normalize_text(value)
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
 def _record_value(record: Mapping[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in record and record[key] not in (None, ""):
@@ -127,6 +107,15 @@ def _record_value(record: Mapping[str, Any], *keys: str) -> Any:
 
 def _record_text(record: Mapping[str, Any], *keys: str) -> str:
     return _normalize_text(_record_value(record, *keys))
+
+
+def _user_thesis_text(record: Mapping[str, Any]) -> str:
+    return _record_text(record, "user_thesis", "reason_for_buying", "notes", "intended_role")
+
+
+def _keyword_hit(text: str, keywords: Sequence[str]) -> bool:
+    lowered = text.lower()
+    return any(keyword.lower() in lowered for keyword in keywords if _normalize_text(keyword))
 
 
 def _missing_required_fields(record: Mapping[str, Any], required_fields: Mapping[str, Any]) -> list[str]:
@@ -155,118 +144,9 @@ def _manual_override(bundle: PortfolioGroupingBundle, ticker: str) -> dict[str, 
     return None
 
 
-def _sector_bias(bundle: PortfolioGroupingBundle, sector: str) -> list[str]:
-    sectors = bundle.security_reference.get("sectors", {})
-    entry = sectors.get(sector, {}) if isinstance(sectors, dict) else {}
-    return [str(group) for group in entry.get("default_group_bias", [])]
-
-
-def _etf_bias(bundle: PortfolioGroupingBundle, etf_category: str) -> str | None:
-    categories = bundle.security_reference.get("etf_categories", {})
-    entry = categories.get(etf_category, {}) if isinstance(categories, dict) else {}
-    bias = entry.get("primary_group_bias")
-    return str(bias) if bias else None
-
-
-def _keyword_hit(text: str, keywords: Sequence[str]) -> bool:
-    lowered = text.lower()
-    return any(keyword.lower() in lowered for keyword in keywords if _normalize_text(keyword))
-
-
-def _classify_by_etf(
-    bundle: PortfolioGroupingBundle,
-    record: Mapping[str, Any],
-    evidence: list[str],
-    tags: list[str],
-) -> tuple[str | None, str]:
-    etf_category = _record_text(record, "etf_category")
-    asset_class = _normalize_lower(_record_value(record, "asset_class", "asset"))
-    etf_bias = _etf_bias(bundle, etf_category)
-
-    if asset_class == "commodity_etf":
-        evidence.append("asset_class:commodity_etf")
-        tags.extend(["ETF", "Gold", "Hedge"])
-        return "Alternatives", "commodity_etf"
-    if asset_class == "cash":
-        evidence.append("asset_class:cash")
-        return "Cash", "cash"
-
-    if asset_class != "etf":
-        return None, ""
-
-    if etf_category:
-        evidence.append(f"etf_category:{etf_category}")
-
-    core_categories = {"global_equity", "total_market", "broad_us_equity", "broad_international_equity"}
-    income_categories = {"dividend_growth", "high_dividend", "canadian_dividend", "covered_banking_income"}
-    growth_categories = {"semiconductor", "artificial_intelligence", "thematic_growth", "country_specific_emerging_markets"}
-    alternative_categories = {"gold"}
-
-    if etf_category in core_categories:
-        tags.append("ETF")
-        return "Core", "core etf category"
-    if etf_category in income_categories:
-        tags.append("ETF")
-        return "Income", "income etf category"
-    if etf_category in growth_categories:
-        tags.append("ETF")
-        return "Growth", "growth etf category"
-    if etf_category in alternative_categories:
-        tags.append("ETF")
-        return "Alternatives", "alternative etf category"
-
-    if etf_bias:
-        tags.append("ETF")
-        return etf_bias, "etf category bias"
-
-    return None, ""
-
-
-def _quality_signals(record: Mapping[str, Any], bundle: PortfolioGroupingBundle, ticker: str) -> bool:
-    sector = _record_text(record, "sector")
-    industry = _record_text(record, "industry")
-    name = _record_text(record, "company_name", "security_name", "name")
-    examples = bundle.policy.get("groups", {}).get("Quality", {}).get("examples", [])
-    if ticker in {str(example).upper() for example in examples}:
-        return True
-    if any(term in industry.lower() for term in ("bank", "asset management", "telecom", "defense", "aerospace")):
-        return True
-    if sector in {"Financial Services", "Communication Services", "Industrials", "Consumer Defensive", "Healthcare", "Technology"}:
-        return True
-    if any(term in name.lower() for term in ("bank", "telecom", "defense", "microsoft", "apple", "alphabet", "meta", "berkshire")):
-        return True
-    return False
-
-
-def _growth_signals(record: Mapping[str, Any], ticker: str) -> bool:
-    sector = _record_text(record, "sector")
-    industry = _record_text(record, "industry")
-    name = _record_text(record, "company_name", "security_name", "name")
-    user_thesis = _record_text(record, "user_thesis", "reason_for_buying", "notes", "intended_role")
-    if _keyword_hit(user_thesis, ("growth", "ai", "semiconductor", "thematic", "satellite", "speculative")):
-        return True
-    if sector == "Technology" and any(term in industry.lower() for term in ("semiconductor", "software", "information technology")):
-        return True
-    if sector in {"Technology", "Healthcare"} and any(term in name.lower() for term in ("ai", "semiconductor", "chip", "software")):
-        return True
-    if ticker in {"NVDA", "PLTR", "SMH", "DRAM", "AXTI", "HIMS", "NBIS", "INDA"}:
-        return True
-    return False
-
-
-def _income_signals(record: Mapping[str, Any]) -> bool:
-    user_thesis = _record_text(record, "user_thesis", "reason_for_buying", "notes", "intended_role")
-    dividend_yield = _parse_float(_record_value(record, "dividend_yield", "yield"))
-    if _keyword_hit(user_thesis, ("income", "yield", "cash flow", "dividend income", "high yield")):
-        return True
-    if dividend_yield is not None and dividend_yield >= 0.04:
-        # High yield alone is not enough for blue-chip equities, but it is a
-        # useful supporting signal for explicit income-first holdings.
-        return True
-    return False
-
-
 def _alternatives_signals(record: Mapping[str, Any]) -> bool:
+    """Supporting signal for the Gold/Hedge secondary tags only -- primary
+    group assignment comes from decision_rules, not this helper."""
     asset_class = _normalize_lower(_record_value(record, "asset_class", "asset"))
     sector = _record_text(record, "sector")
     industry = _record_text(record, "industry")
@@ -318,7 +198,7 @@ def _secondary_tags(record: Mapping[str, Any], override_tags: Sequence[str] | No
     if etf_category:
         tags.extend(_ETF_CATEGORY_TAGS.get(etf_category, (etf_category.replace("_", " ").title(),)))
 
-    user_thesis = _record_text(record, "user_thesis", "reason_for_buying", "notes", "intended_role")
+    user_thesis = _user_thesis_text(record)
     if _keyword_hit(user_thesis, ("ai",)):
         tags.append("AI")
     if _keyword_hit(user_thesis, ("semiconductor",)):
@@ -336,18 +216,6 @@ def _secondary_tags(record: Mapping[str, Any], override_tags: Sequence[str] | No
     return _unique_tags(tags)
 
 
-def _confidence_from_source(source: str, missing_data: Sequence[str], review_needed: bool) -> str:
-    if source == "manual_override":
-        return "high"
-    if source in {"etf_rule", "role_rule"}:
-        return "high" if not missing_data else "medium"
-    if source in {"sector_bias", "quality_bias", "growth_bias"}:
-        return "medium"
-    if review_needed or missing_data:
-        return "low"
-    return "medium"
-
-
 def _review_flag(record: Mapping[str, Any], override: Mapping[str, Any] | None, primary_group: str) -> bool:
     if primary_group == "Needs Review":
         return True
@@ -359,6 +227,100 @@ def _review_flag(record: Mapping[str, Any], override: Mapping[str, Any] | None, 
     )
 
 
+# --- Rule interpreter for classification_rules_v1_1.yaml -------------------
+#
+# The reference YAML documents a rule engine (`rule_priority` -> ordered
+# `decision_rules` tiers, each tier an ordered list of `when`/
+# `assign_primary_group`/`confidence` rules). This interpreter reads that
+# YAML directly instead of re-encoding the same decisions as hardcoded
+# Python, so editing the YAML actually changes classifier behavior.
+
+def _condition_matches(condition: Mapping[str, Any], record: Mapping[str, Any]) -> bool:
+    for key, expected in condition.items():
+        if key == "asset_class":
+            actual = _normalize_lower(_record_value(record, "asset_class", "asset"))
+            if actual != _normalize_lower(expected):
+                return False
+        elif key == "asset_class_any":
+            actual = _normalize_lower(_record_value(record, "asset_class", "asset"))
+            if actual not in {_normalize_lower(item) for item in expected}:
+                return False
+        elif key == "etf_category_any":
+            actual = _normalize_lower(_record_text(record, "etf_category"))
+            if actual not in {_normalize_lower(item) for item in expected}:
+                return False
+        elif key == "sector_any":
+            actual = _record_text(record, "sector")
+            if actual not in {str(item) for item in expected}:
+                return False
+        elif key == "user_thesis_contains_any":
+            if not _keyword_hit(_user_thesis_text(record), expected):
+                return False
+        else:
+            raise ValueError(f"Unsupported rule condition in classification_rules_v1_1.yaml: {key}")
+    return True
+
+
+def _evaluate_rule_tier(
+    tier: Mapping[str, Any], record: Mapping[str, Any]
+) -> tuple[str, str, str, str] | None:
+    """Return (primary_group, rule_id, confidence, reasoning) for the first
+    matching rule in a `decision_rules` tier, in YAML declaration order."""
+    for rule in tier.get("rules", []):
+        if _condition_matches(rule.get("when", {}), record):
+            rule_id = str(rule.get("id", "unnamed_rule"))
+            return (
+                str(rule["assign_primary_group"]),
+                rule_id,
+                str(rule.get("confidence", "medium")),
+                f"Matched rule {rule_id}.",
+            )
+    return None
+
+
+def _evaluate_sector_bias_tier(
+    tier: Mapping[str, Any], record: Mapping[str, Any]
+) -> tuple[str, str, str, str] | None:
+    """`sector_industry_bias_rules` entries are a default preference order,
+    not a `when`/`assign_primary_group` rule -- pick the first group in the
+    matching sector's `default_group_bias` list."""
+    sector = _record_text(record, "sector")
+    if not sector:
+        return None
+    for bias in tier.get("rules", []):
+        if _normalize_text(bias.get("sector")) == sector:
+            groups = [str(group) for group in bias.get("default_group_bias", [])]
+            if groups:
+                bias_id = str(bias.get("id", f"sector_bias:{sector}"))
+                return (groups[0], bias_id, "low", f"Default sector bias for {sector}.")
+    return None
+
+
+def _run_rule_engine(bundle: PortfolioGroupingBundle, record: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    """Walk `rule_priority` tiers in order; return the first match, or a
+    Needs Review fallback if nothing matches."""
+    decision_rules = bundle.rules.get("decision_rules", {})
+    for tier_name in bundle.rules.get("rule_priority", []):
+        if tier_name in {"manual_overrides", "fallback_needs_review"}:
+            continue
+        tier = decision_rules.get(tier_name, {})
+        if tier_name == "sector_industry_bias_rules":
+            match = _evaluate_sector_bias_tier(tier, record)
+        else:
+            match = _evaluate_rule_tier(tier, record)
+        if match:
+            primary_group, rule_id, confidence, reasoning = match
+            return primary_group, f"{tier_name}:{rule_id}", confidence, reasoning
+
+    fallback = bundle.rules.get("fallback", {})
+    return (
+        str(fallback.get("group", "Needs Review")),
+        "fallback_needs_review",
+        str(fallback.get("confidence", "low")),
+        "Insufficient evidence or conflicting signals.",
+    )
+
+
 def classify_holding(record: Mapping[str, Any], bundle: PortfolioGroupingBundle | None = None) -> ClassificationResult:
     bundle = bundle or load_portfolio_grouping_bundle()
     ticker = _normalize_upper(_record_value(record, "ticker", "symbol"))
@@ -367,14 +329,13 @@ def classify_holding(record: Mapping[str, Any], bundle: PortfolioGroupingBundle 
     missing_data = _missing_required_fields(record, bundle.required_fields)
     override = _manual_override(bundle, ticker) if ticker else None
 
-    evidence: list[str] = []
     if override:
         primary_group = str(override.get("primary_group", "Needs Review"))
         tags = list(_secondary_tags(record, override.get("secondary_tags")))
-        evidence.append(f"manual_override:{ticker}")
+        evidence = [f"manual_override:{ticker}"]
         reasoning = str(override.get("rationale", "Manual override applied."))
         review_needed = _review_flag(record, override, primary_group)
-        confidence = _confidence_from_source("manual_override", missing_data, review_needed)
+        confidence = "high"
         if primary_group not in bundle.approved_groups:
             primary_group = "Needs Review"
             review_needed = True
@@ -391,84 +352,52 @@ def classify_holding(record: Mapping[str, Any], bundle: PortfolioGroupingBundle 
             review_needed=review_needed,
         )
 
-    tags = list(_secondary_tags(record))
-    source = "fallback"
-    primary_group: str | None = None
-    reasoning = ""
+    # required_fields_v1_1.yaml: missing asset_class or sector_or_etf_category
+    # with no override goes straight to Needs Review, without consulting the
+    # rule tiers (a rule could otherwise match on user_thesis alone even when
+    # the record lacks the metadata those tiers are meant to require).
+    if "asset_class" in missing_data or "sector_or_etf_category" in missing_data:
+        tags = list(_secondary_tags(record))
+        return ClassificationResult(
+            ticker=ticker,
+            company_name=company_name,
+            primary_group="Needs Review",
+            secondary_tags=tags,
+            confidence="low",
+            reasoning="Missing required classification metadata.",
+            evidence_used=("missing_required_metadata",),
+            missing_data=tuple(missing_data),
+            review_needed=True,
+        )
 
-    asset_class = _normalize_lower(_record_value(record, "asset_class", "asset"))
-    if asset_class in {"etf", "commodity_etf", "cash"}:
-        primary_group, reason = _classify_by_etf(bundle, record, evidence, tags)
-        if primary_group:
-            source = "etf_rule"
-            reasoning = reason
-
-    if not primary_group:
-        user_thesis = _record_text(record, "user_thesis", "reason_for_buying", "notes", "intended_role")
-        sector = _record_text(record, "sector")
-        if _income_signals(record):
-            primary_group = "Income"
-            source = "role_rule"
-            reasoning = "Income-first wording or high-yield signal present."
-            evidence.append("income_signal")
-        elif _growth_signals(record, ticker):
-            primary_group = "Growth"
-            source = "role_rule"
-            reasoning = "Growth or thematic satellite signal present."
-            evidence.append("growth_signal")
-        elif _quality_signals(record, bundle, ticker):
-            primary_group = "Quality"
-            source = "quality_bias"
-            reasoning = "Blue-chip / durable compounder signal present."
-            evidence.append("quality_signal")
-        else:
-            biases = _sector_bias(bundle, sector)
-            if biases:
-                evidence.append(f"sector_bias:{sector}")
-                for bias in biases:
-                    if bias == "Income" and _income_signals(record):
-                        primary_group = "Income"
-                        source = "sector_bias"
-                        reasoning = f"{sector} sector bias plus income signal."
-                        break
-                    if bias == "Growth" and _growth_signals(record, ticker):
-                        primary_group = "Growth"
-                        source = "sector_bias"
-                        reasoning = f"{sector} sector bias plus growth signal."
-                        break
-                    if bias == "Quality" and _quality_signals(record, bundle, ticker):
-                        primary_group = "Quality"
-                        source = "sector_bias"
-                        reasoning = f"{sector} sector bias plus quality signal."
-                        break
-                    if bias == "Alternatives" and _alternatives_signals(record):
-                        primary_group = "Alternatives"
-                        source = "sector_bias"
-                        reasoning = f"{sector} sector bias plus alternatives signal."
-                        break
-
-    if not primary_group:
-        primary_group = "Needs Review"
-        source = "fallback"
-        reasoning = "Insufficient evidence or conflicting signals."
-        evidence.append("fallback_needs_review")
+    primary_group, rule_ref, confidence, reasoning = _run_rule_engine(bundle, record)
 
     if primary_group not in bundle.approved_groups:
         primary_group = "Needs Review"
-
-    review_needed = _review_flag(record, None, primary_group) or primary_group == "Needs Review" or bool(missing_data)
-    confidence = _confidence_from_source(source, missing_data, review_needed)
-    if source == "fallback":
+        rule_ref = "fallback_needs_review"
         confidence = "low"
+        reasoning = "Matched rule assigns an unapproved group."
+
+    # required_fields_v1_1.yaml: classifying without a stated user_thesis
+    # (i.e. by metadata/rules alone, not explicit intent) caps confidence at
+    # medium, even for a nominally "high" confidence rule match.
+    if not _user_thesis_text(record) and confidence == "high":
+        confidence = "medium"
+
+    if primary_group == "Needs Review":
+        confidence = "low"
+
+    tags = list(_secondary_tags(record))
+    review_needed = _review_flag(record, None, primary_group) or primary_group == "Needs Review" or bool(missing_data)
 
     return ClassificationResult(
         ticker=ticker,
         company_name=company_name,
         primary_group=primary_group,
-        secondary_tags=_secondary_tags(record, override_tags=()),
+        secondary_tags=tags,
         confidence=confidence,
         reasoning=reasoning,
-        evidence_used=tuple(evidence),
+        evidence_used=(rule_ref,),
         missing_data=tuple(missing_data),
         review_needed=review_needed,
     )

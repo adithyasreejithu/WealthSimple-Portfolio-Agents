@@ -9,6 +9,8 @@ This repository is a Python data pipeline for Wealthsimple exports, statements, 
 - `src/` contains the application code, including pipeline orchestration (`app.py`), extraction logic (`email_extractor.py`, `statement_extractor.py`, `yfinance_extractor.py`), storage (`database.py`, `database_command.py`), and utilities (`data_sorter.py`, `staging.py`, `system_logger.py`).
 - `tests/` contains `unittest` test cases that mirror the main modules.
 - `docs/` contains design notes, handover material, and success criteria.
+- `dashboard/api/` is the read-only FastAPI backend that serves already-computed pipeline output (DuckDB reads via `src/analytics.py`) to the dashboard frontend. See `docs/architecture/dashboard_api.md`.
+- `dashboard/web/` is the Next.js + shadcn/ui dashboard frontend (App Router). Server components fetch the API; charts/tables/price-explorer are client components. It only formats API values and does presentation-layer derivations (`src/lib/derive.ts`) — never portfolio math. See `docs/architecture/dashboard_api.md` (Frontend section) and `dashboard/web/README.md`.
 - `requirements.txt` lists runtime dependencies.
 
 ## Agent and Skill Documentation
@@ -86,6 +88,7 @@ uv sync
 - `uv run python -m unittest discover -s tests` runs the full test suite.
 - `uv run python -m unittest tests.test_app` runs one test module.
 - `uv run python src/app.py --help` shows the CLI entry points for the pipeline.
+- `uv run uvicorn main:app --reload --port 8000 --app-dir dashboard/api` runs the dashboard API locally.
 
 See `docs/reference/cli.md` for the complete CLI reference.
 

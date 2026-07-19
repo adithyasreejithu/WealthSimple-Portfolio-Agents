@@ -5,6 +5,9 @@ Use this document when signing off, clearing context, or resuming work after a b
 ## Current Focus
 
 - WealthSimple portfolio tooling.
+- Phase 3 (minimal hosted view): the read-only dashboard API backend is
+  formalized (see "Dashboard API (Phase 3) Status" below); the Next.js
+  frontend in `dashboard/web/` is in progress separately.
 - Planning a constrained portfolio-classification agent with one supported prompt:
   `Classify my portfolio`.
 - Main active modules: `src/data_sorter.py`, `src/statement_extractor.py`, `src/email_extractor.py`, and `src/yfinance_extractor.py`.
@@ -118,11 +121,125 @@ The research knowledge base and decision-support system (`.claude/agents/_archiv
 Phase 0. It is real, substantial work that is parked as reference material, not
 abandoned. The system includes agents (`kb-discovery`, `kb-intake`, `stock-data-prep`,
 `stock-analyst`, `holdings-reconciliation`) and supporting skills for thesis
-management, portfolio classification, and stock research scoring. It will be
-rebuilt incrementally per `docs/plans/goals/development-roadmap.md` (Phases 4–5:
-single-ticker decision support, then portfolio-wide scaling), not restored in
-one pass. The archived code and rubric serve as the design baseline for this
-future work.
+management and stock research scoring. It will be rebuilt incrementally per
+`docs/plans/goals/development-roadmap.md` (Phases 4–5: single-ticker decision
+support, then portfolio-wide scaling), not restored in one pass. The archived
+code and rubric serve as the design baseline for this future work.
+
+**Portfolio classification is active again, not part of this parked system.**
+The Phase 0 archive commit swept `classify-portfolio` in with everything else,
+which broke `src/app.py`'s `portfolio-classify` step
+(`ModuleNotFoundError: No module named 'classification_workflow'`) since
+`CLASSIFY_SKILL_SCRIPTS` still pointed at the live path. Restored on
+2026-07-16 by un-archiving `.claude/skills/classify-portfolio`,
+`.claude/skills/read-portfolio-classification-data`,
+`.claude/skills/fetch-yfinance-classification-data`, and
+`.claude/agents/portfolio-classifier.md` — the vision doc called this system
+"cheap to bring back," and Phase 2's exit criteria requires the pipeline to
+run end to end, which needs this step working. Verified via
+`uv run python src/app.py portfolio-classify --pretty` and the full test
+suite (`tests/test_classification_workflow.py`,
+`tests/test_portfolio_classifier.py`, `tests/test_app.py` all green).
+
+While restoring it, found and fixed a real design gap: `portfolio_classifier.py`
+loaded `Knowledge-Base/ref/classification_rules_v1_1.yaml` but only ever read
+its `approved_groups` key — every actual matching rule was reimplemented as
+hardcoded Python (`_classify_by_etf`, `_income_signals`, `_growth_signals`,
+`_quality_signals`, `_sector_bias`), which had drifted from the YAML (missing
+`role_quality`/`role_core`/`role_alternatives` user-thesis rules; an
+undocumented hardcoded ticker allowlist not in any YAML). Editing the YAML did
+nothing. Rewrote the classifier as a small rule interpreter that reads
+`decision_rules`/`rule_priority` directly, deleted the now-redundant hardcoded
+ticker lists (every ticker in them already had a `manual_overrides_v1_1.yaml`
+entry, which is checked first regardless), and filled two content gaps the
+rewrite surfaced in `classification_rules_v1_1.yaml` itself: a missing
+`cash_to_cash` rule, and 3 sectors (`Consumer Cyclical`, `Energy`, `Basic
+Materials`) present in `security_grouping_reference_v1_1.yaml`'s taxonomy but
+absent from the rules file's `sector_industry_bias_rules` tier. Added
+`RuleEngineTest` to `tests/test_portfolio_classifier.py` (11 new tests) since
+the existing sample-portfolio tests only ever exercised the manual-override
+path and would have masked rule-engine bugs. Verified against the real
+portfolio (27 holdings, output unchanged in shape, sector-bias tier now
+correctly reachable for previously-uncovered sectors like Consumer Cyclical).
+
+## Dashboard API (Phase 3) Status
+
+Formalized on 2026-07-17 per the approved plan in
+`docs/plans/dashboard-api-formalization.md`. The prototype at
+`dashboard/api/main.py` (thin read-only FastAPI wrapper over
+`src/analytics.py`, serving the in-progress Next.js frontend in
+`dashboard/web/`) is now a real subsystem:
+
+- **Git**: `dashboard/api/` was invisible to git (`.gitignore`'s `*`
+  catch-all); un-ignored. `dashboard/web/` stays ignored until the frontend
+  is formalized. Note `pyproject.toml` was also untracked — include it in the
+  next commit.
+- **Deps**: `fastapi` + `uvicorn[standard]` declared in `pyproject.toml` via
+  `uv add`; `httpx` in a new dev dependency group for the test client;
+  `dashboard/api/requirements.txt` deleted.
+- **Hardening**: lifespan check refuses to start when the DuckDB file is
+  missing (prevents `get_shared_connection` silently creating an empty DB);
+  CORS origins configurable via `DASHBOARD_CORS_ORIGINS` (default
+  `http://localhost:3000`).
+- **New endpoint**: `GET /api/portfolio/report` recomputes
+  `analytics.portfolio_report` live, cached on the DuckDB file's mtime
+  (rebuilds at most once per pipeline run; verified ~7s first hit, ~0.3s
+  cached). No live market data — prices stay pipeline-sourced; the benchmark
+  yfinance fetch degrades gracefully offline. Every planned dashboard visual
+  maps to a path in this response (table in
+  `docs/architecture/dashboard_api.md`).
+- **Tests**: `tests/test_dashboard_api.py`, 23 tests, all DB access mocked
+  (wrapper-layer coverage; analytics math is tested elsewhere against real
+  temp DuckDBs). All green.
+- **Docs**: `docs/architecture/dashboard_api.md` (endpoints, visual map,
+  config, and the designed-but-not-built `POST /api/actions/*` namespace for
+  Phase 6 website-triggered ingestion/agent runs), linked from
+  `docs/README.md`; CLAUDE.md structure and commands sections updated.
+
+### Frontend build (2026-07-17, `docs/plans/proud-enchanting-russell` scope)
+
+The Next.js + shadcn/ui frontend (`dashboard/web/`) is now built and
+un-ignored in git. Stack: Next 16 App Router, React 19, Tailwind v4, shadcn
+"base-nova" (Base UI primitives — components use the `render` prop and array
+`value`/`onValueChange`, not Radix `asChild`/`type="single"`). Pages: Overview,
+Portfolio (3 tabs), Stocks + `/holdings/[symbol]` detail, ETFs, Income, Data
+Quality, behind a collapsible sidebar with a light/dark toggle and a freshness
+badge (DB mtime / report generated_at / latest price date). Data layer in
+`src/lib/` (`api.ts`, `types.ts`, `format.ts`, `derive.ts`); chart palette and
+`--gain`/`--loss` tokens in `globals.css`. Verified against the live API: KPIs
+and charts cross-check the report JSON.
+
+Two backend endpoints were added to feed it (both wrap new read-only
+`src/analytics.py` functions, tested in `tests/test_dashboard_api.py` +
+`tests/test_analytics.py`): `GET /api/portfolio/classifications` (per-holding
+classification detail — also normalizes the double-encoded `sector_weights`/
+`top_holdings` nested JSON) and `GET /api/stocks/{symbol}/history?range=`
+(per-ticker daily close series; 404 unknown symbol, 422 bad range). Endpoint
+table and a page→data map are in `docs/architecture/dashboard_api.md`.
+
+Verification: `uv run python -m unittest tests.test_dashboard_api
+tests.test_analytics` (64 tests green); `npm run build` in `dashboard/web`
+clean; all routes smoke-tested against the running API on :8000.
+
+Still open for Phase 3 exit: single-user auth gate, deployment to an
+always-on host. (ETF `expense_ratio` is unpopulated by the classifier, so the
+blended-MER KPI shows "—" — a data-coverage gap, not a UI bug.)
+
+## Known Issue: Orphaned KB/Decision-Support Test Files
+
+The Phase 0 archive commit (`feb3cdf`) claimed a passing test suite, but
+`uv run python -m unittest discover -s tests` currently reports 10 import
+errors: `test_decision_rubric`, `test_fetch_stock_research_data`,
+`test_generate_reconciliation_report`, `test_ingest_recommendation`,
+`test_kb_intake_document`, `test_kb_search`, `test_kb_sync_portfolio`,
+`test_kb_thesis_scripts`, `test_scoring_worksheet`,
+`test_validate_recommendation`. Their target modules moved into
+`.claude/*/_archive/.../scripts/` but the test files themselves were left in
+`tests/` unarchived, so they fail to import (e.g. `ModuleNotFoundError: No
+module named 'rubric'`). Not touched by the classify-portfolio restoration
+above — these belong to the still-parked KB/decision-support system. Fix by
+either moving these test files alongside their archived skills or skipping
+them explicitly, whenever Phase 2 test-suite cleanup is picked up.
 
 ## Next Session: Phase 2 — Pipeline Hardening
 

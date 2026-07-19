@@ -1,0 +1,37 @@
+[project]
+name = "wealthsimple-portfolio-agents"
+version = "0.1.0"
+description = "Python data pipeline for Wealthsimple exports, statements, and email extraction"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "Adithya Sreejithu", email = "1adithyapanicker@gmail.com"}
+]
+
+dependencies = [
+    "pandas",
+    "pdfplumber",
+    "camelot-py",
+    "opencv-python",
+    "keyring",
+    "pyotp",
+    "python-dotenv",
+    "imap-tools",
+    "PyYAML",
+    "yfinance",
+    "curl_cffi",
+    "duckdb",
+    "markitdown[pdf,docx,pptx,xlsx]",
+    "fastapi>=0.139.2",
+    "uvicorn[standard]>=0.51.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+]

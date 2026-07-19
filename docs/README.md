@@ -7,6 +7,7 @@ New here? Start with the [project overview](project/overview.md) for a plain-Eng
 ## Architecture and Technical References
 
 - [Claude agent and skill structure](architecture/claude_agent_skill_structure.md)
+- [Dashboard API](architecture/dashboard_api.md)
 - [Database foundation and schema](architecture/database_schema.md)
 - [Logger notes](architecture/logger_notes.md)
 
@@ -18,6 +19,7 @@ New here? Start with the [project overview](project/overview.md) for a plain-Eng
 ## Implementation Plans
 
 - [Camelot extraction refactor](plans/camelot_extraction_refactor.md)
+- [Dashboard API formalization](plans/dashboard-api-formalization.md)
 - [Email extraction](plans/email_extraction.md)
 
 ## Success Criteria

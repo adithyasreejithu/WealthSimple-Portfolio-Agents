@@ -15,6 +15,11 @@
 !requirements.txt
 !tests/
 !tests/**
+!dashboard/
+!dashboard/api/
+!dashboard/api/**
+!dashboard/web/
+!dashboard/web/**
 !.claude/
 !.claude/**
 !pyproject.toml

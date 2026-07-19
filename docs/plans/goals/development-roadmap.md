@@ -76,19 +76,28 @@ from my phone, anywhere, anytime" — while the only thing behind it is
 already-reliable pipeline data. If the hosting approach needs to change,
 better to find out now than after agent output depends on it.
 
+**Already resolved:** the original "Claude artifact" starting point was
+checked against actual product behavior and ruled out — live artifacts only
+render in the Claude desktop app (not mobile/web), and any artifact
+touching local files needs the desktop app open and the laptop awake
+regardless. See `project-vision.md`'s "Hosting shape" section for the
+replacement approach below.
+
 **Work:**
-- Stand up a Claude artifact (per the vision doc's starting point) that
-  reads current holdings, allocation, and key analytics from the pipeline's
-  output and refreshes on open.
+- Thin read-only backend API (Python) that serves already-computed pipeline
+  output (holdings, allocation, analytics) — reads a pushed snapshot, never
+  runs ingestion itself.
+- Next.js + shadcn/ui frontend consuming that API — one responsive UI, no
+  separate mobile build.
+- Single-user auth gate in front of both.
+- Deploy frontend + backend to an always-on host reachable without the
+  laptop being on.
 - Deliberately no agent reasoning in this phase — read-only numbers, so the
   hosting mechanism is tested in isolation.
 
-**Exit criteria:** Adithya can check current portfolio state from his phone
-in under 10 seconds, with no terminal involved. If the artifact model hits a
-hard limit here (can't refresh reliably, can't be reached reliably from
-phone), that's the trigger to evaluate the self-hosted web app fallback —
-explicitly *before* Phase 4, not after agent work is already built on top of
-whichever hosting choice turns out to be wrong.
+**Exit criteria:** Adithya can check current portfolio state from his phone,
+over the open internet, in under 10 seconds, with the laptop off and no
+terminal involved.
 
 ---
 

@@ -79,6 +79,12 @@ decision_rules:
         assign_primary_group: Alternatives
         confidence: high
 
+      - id: cash_to_cash
+        when:
+          asset_class: cash
+        assign_primary_group: Cash
+        confidence: high
+
   portfolio_role_rules:
     rules:
       - id: role_core
@@ -176,6 +182,12 @@ decision_rules:
           - Growth
           - Income
 
+      - id: consumer_cyclical_bias
+        sector: Consumer Cyclical
+        default_group_bias:
+          - Growth
+          - Quality
+
       - id: consumer_defensive_bias
         sector: Consumer Defensive
         default_group_bias:
@@ -195,6 +207,12 @@ decision_rules:
           - Income
           - Growth
 
+      - id: energy_bias
+        sector: Energy
+        default_group_bias:
+          - Income
+          - Growth
+
       - id: healthcare_bias
         sector: Healthcare
         default_group_bias:
@@ -211,6 +229,12 @@ decision_rules:
         sector: Real Estate
         default_group_bias:
           - Income
+
+      - id: basic_materials_bias
+        sector: Basic Materials
+        default_group_bias:
+          - Alternatives
+          - Growth
 
 fallback:
   group: Needs Review

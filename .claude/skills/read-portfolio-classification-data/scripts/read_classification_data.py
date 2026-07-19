@@ -157,7 +157,13 @@ def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[s
         record["market_cap"] = None
         record["user_thesis"] = None
         record["target_weight_percent"] = None
-        record["unrealized_gain_loss_percent"] = None
+        market_value = record.get("position_market_value")
+        cost_basis = record.get("cost_basis")
+        record["unrealized_gain_loss_percent"] = (
+            (float(market_value) - float(cost_basis)) / float(cost_basis) * 100
+            if market_value is not None and cost_basis not in (None, 0)
+            else None
+        )
         # data_quality_flags is a JSON column; DuckDB returns it as JSON text
         # (see analytics.py's identical json.loads(flags_json) handling), so
         # unwrap it into a real list here rather than leaving raw JSON text
@@ -171,7 +177,10 @@ def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[s
         record["field_provenance"] = {
             key: (
                 "derived"
-                if key in {"position_market_value", "current_weight_percent", "has_provisional_activity"}
+                if key in {
+                    "position_market_value", "current_weight_percent",
+                    "has_provisional_activity", "unrealized_gain_loss_percent",
+                }
                 else "database"
             )
             for key, value in record.items()

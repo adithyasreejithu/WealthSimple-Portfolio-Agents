@@ -127,14 +127,29 @@ this is a product decision, not just an implementation detail:
   gated by the roadmap, specifically because "rebuild everything at once" is
   the failure mode this document exists to prevent.
 
-## Hosting shape (starting point, not a permanent commitment)
+## Hosting shape
 
-Access-anywhere-anytime is the actual requirement, not a specific technology.
-The starting point: a **Claude artifact** wired to the pipeline's data,
-because it requires no separate hosting infrastructure, is reachable from
-phone or laptop anywhere Claude is available, and can be stood up fast enough
-to validate the whole "one place, always current" idea before investing
-further. A dedicated self-hosted web app remains the fallback if the artifact
-model hits a real limit (needs to trigger scheduled jobs Claude itself can't
-run, needs to work fully offline, needs push notifications) — see the
-roadmap for exactly where that decision gets revisited, not before.
+Access-anywhere-anytime is the actual requirement, not a specific
+technology — and it's been verified that a Cowork live artifact doesn't
+satisfy it: live artifacts render in the Claude desktop app only (not
+mobile or claude.ai web), and any artifact reading local files needs the
+desktop app open and the laptop awake regardless. That rules out "artifact
+as the whole product."
+
+The path forward is a small, self-hosted web app:
+
+- **Frontend:** Next.js + shadcn/ui — one responsive web UI that works the
+  same in a phone browser as a laptop browser, no separate mobile app.
+- **Backend:** a thin read-only API (Python, alongside the existing
+  pipeline) that serves *already-computed* outputs — current holdings,
+  analytics, decision-support verdicts — not the pipeline itself. The
+  pipeline still runs locally/on a schedule and pushes its results (a
+  DuckDB snapshot or exported JSON) to wherever the backend reads from; the
+  always-on web app never runs ingestion itself.
+- **Hosting:** a cheap always-on host (e.g. Vercel for the frontend,
+  Fly.io/Railway for the backend) so the app is reachable at any time
+  without the laptop being on.
+- **Access control:** a single-user auth gate (one allowed login) — no
+  multi-user auth system, per the non-goals above.
+
+See `development-roadmap.md` Phase 3 for the concrete build-out.
