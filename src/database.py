@@ -39,6 +39,7 @@ REQUIRED_TABLES = frozenset(
         "position_ledger",
         "position_snapshots",
         "position_engine_meta",
+        "statement_balances",
     }
 )
 TRADE_EVENTS_VIEW = "v_trade_events"
@@ -194,6 +195,38 @@ def _apply_v10_position_engine_schema(connection: duckdb.DuckDBPyConnection) -> 
         "ALTER TABLE email_transactions ADD COLUMN IF NOT EXISTS matched_activity_id BIGINT"
     )
     _create_position_engine_tables(connection)
+
+
+def _create_statement_balances_table(connection: duckdb.DuckDBPyConnection) -> None:
+    """Create the table tracking every statement line's trailing balance.
+
+    Shared between `_deploy_schema` (fresh installs) and the v10->v11
+    migration. A statement PDF states a running `balance` on *every* line,
+    but `upload_statement_transactions` only used to persist it for lines
+    with no resolved ticker (`cash_transactions.balance`) -- BUY/SELL/DIV
+    rows tied to a security went to `transactions`, which has no `balance`
+    column, silently discarding it. `get_cash_summary` (`analytics.py`) then
+    had no choice but to report the latest *cash-only* balance, which is
+    wrong whenever a trade is the last line of the statement. This table
+    captures the balance from every line regardless of ticker resolution, so
+    the true most recent balance is always available (`analytics.py`'s
+    `get_cash_summary`, ordered by `transaction_date DESC,
+    statement_balance_id DESC`, the same insertion-order tie-break already
+    used for `cash_transactions`).
+    """
+    connection.execute("CREATE SEQUENCE IF NOT EXISTS statement_balance_id_sequence START 1")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS statement_balances (
+            statement_balance_id BIGINT PRIMARY KEY
+                DEFAULT nextval('statement_balance_id_sequence'),
+            transaction_date DATE NOT NULL,
+            transaction_type VARCHAR NOT NULL,
+            balance DECIMAL(20, 4) NOT NULL,
+            UNIQUE (transaction_date, transaction_type, balance)
+        )
+        """
+    )
 
 
 def _create_trade_events_view(connection: duckdb.DuckDBPyConnection) -> None:
@@ -678,6 +711,7 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
             """
         )
         _create_position_engine_tables(connection)
+        _create_statement_balances_table(connection)
         connection.execute(
             """
             INSERT INTO schema_metadata (component, schema_version)
@@ -999,14 +1033,29 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
                     _apply_v10_position_engine_schema(connection)
                     connection.execute(
                         "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
-                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                        [10, SCHEMA_COMPONENT],
                     )
                     connection.execute("COMMIT")
                 except Exception:
                     connection.execute("ROLLBACK")
                     logger.exception("Database migration from version 9 failed")
                     raise
-                logger.info("Database migrated from schema version 9 to %d", DATABASE_SCHEMA_VERSION)
+                logger.info("Database migrated from schema version 9 to 10")
+                row = (10,)
+            if row and row[0] == 10:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    _create_statement_balances_table(connection)
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 10 failed")
+                    raise
+                logger.info("Database migrated from schema version 10 to %d", DATABASE_SCHEMA_VERSION)
                 _create_trade_events_view(connection)
                 return False
         if existing_tables:

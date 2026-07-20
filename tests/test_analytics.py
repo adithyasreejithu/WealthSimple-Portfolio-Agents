@@ -13,6 +13,7 @@ from analytics import (
     get_classification_details,
     get_currency_exposure,
     get_dividend_history,
+    get_etf_overlap,
     get_excluded_positions,
     get_price_history,
     get_expense_ratios,
@@ -117,20 +118,101 @@ class AnalyticsTest(unittest.TestCase):
         connection = database.get_shared_connection(self.db_path)
         connection.executemany(
             """
-            INSERT INTO cash_transactions (
-                transaction_date, transaction_type, execution_date,
-                debit, credit, fx_rate, balance
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO statement_balances (transaction_date, transaction_type, balance)
+            VALUES (?, ?, ?)
             """,
             [
-                (date(2025, 1, 1), "DEPOSIT", date(2025, 1, 1), Decimal("0"), Decimal("1000"), Decimal("0"), None),
-                (date(2025, 1, 2), "BALANCE", date(2025, 1, 2), Decimal("0"), Decimal("0"), Decimal("0"), Decimal("1250")),
+                (date(2025, 1, 1), "DEPOSIT", Decimal("1000")),
+                (date(2025, 1, 2), "BALANCE", Decimal("1250")),
             ],
         )
 
         cash = get_cash_summary(self.db_path)
 
         self.assertEqual(cash.balance, Decimal("1250"))
+        self.assertEqual(cash.source, "explicit_balance")
+
+    def test_cash_balance_prefers_a_later_ticker_linked_trade_over_an_earlier_cash_only_balance(self):
+        """
+        Reproduces a real production bug: a statement's trailing balance is
+        stated on every line, but only cash-only lines (deposits, interest,
+        loans) used to keep that balance -- a BUY/SELL/DIV row tied to a
+        resolved ticker went to `transactions`, which has no `balance`
+        column, silently discarding it. `get_cash_summary` then reported a
+        stale mid-month balance ($21.73) instead of the true end-of-statement
+        balance ($0.00) whenever a trade was the last line of the month.
+        `statement_balances` now records every line regardless of ticker
+        resolution, so the truly latest balance always wins.
+        """
+        connection = database.get_shared_connection(self.db_path)
+        connection.executemany(
+            """
+            INSERT INTO statement_balances (transaction_date, transaction_type, balance)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (date(2026, 5, 14), "FPLINT", Decimal("21.73")),
+                (date(2026, 5, 21), "BUY", Decimal("0.00")),
+            ],
+        )
+
+        cash = get_cash_summary(self.db_path)
+
+        self.assertEqual(cash.balance, Decimal("0.00"))
+        self.assertEqual(cash.source, "explicit_balance")
+
+    def test_cash_balance_rolls_forward_with_activities_after_the_statement_anchor(self):
+        """
+        Reproduces the gap discovered right after fixing the statement-
+        balance bug: statement PDFs lag the activities CSV export by weeks,
+        so anchoring cash to the latest statement alone leaves it stale
+        between statements. `activities` (the deduplicated, typed CSV table)
+        already reports every cash-affecting row in CAD, so summing
+        `net_cash_amount` for dates strictly after the anchor and adding it
+        to the anchor balance keeps cash current without waiting for the
+        next statement.
+        """
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO statement_balances (transaction_date, transaction_type, balance) "
+            "VALUES ('2026-05-21', 'BUY', 0.00)"
+        )
+        import_id = connection.execute(
+            "INSERT INTO activity_imports (source_file, file_hash, status) "
+            "VALUES ('f', 'h-cash-rollforward', 'succeeded') RETURNING import_id"
+        ).fetchone()[0]
+        connection.executemany(
+            """
+            INSERT INTO activities (
+                transaction_date, account_id, account_type, activity_type, activity_code,
+                transaction_currency, net_cash_amount,
+                row_fingerprint, duplicate_ordinal, first_seen_import_id, last_seen_import_id
+            ) VALUES (?, 'A1', 'TFSA', ?, 'X', 'CAD', ?, ?, 1, ?, ?)
+            """,
+            [
+                # This trade's cash impact is already embedded in the
+                # $0.00 anchor balance -- it must NOT be double-counted.
+                (date(2026, 5, 21), "Trade", Decimal("-14.82"), "fp-anchor", import_id, import_id),
+                (date(2026, 6, 15), "Dividend", Decimal("0.29"), "fp-div1", import_id, import_id),
+                (date(2026, 7, 15), "Dividend", Decimal("0.02"), "fp-div2", import_id, import_id),
+            ],
+        )
+
+        cash = get_cash_summary(self.db_path)
+
+        self.assertEqual(cash.balance, Decimal("0.31"))
+        self.assertEqual(cash.source, "explicit_balance_rolled_forward")
+
+    def test_cash_balance_source_stays_explicit_when_no_activity_follows_the_anchor(self):
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO statement_balances (transaction_date, transaction_type, balance) "
+            "VALUES ('2026-05-21', 'BUY', 0.00)"
+        )
+
+        cash = get_cash_summary(self.db_path)
+
+        self.assertEqual(cash.balance, Decimal("0.00"))
         self.assertEqual(cash.source, "explicit_balance")
 
     def test_net_cash_flow_is_used_when_no_balance_exists(self):
@@ -276,6 +358,42 @@ class AnalyticsTest(unittest.TestCase):
         self.assertEqual(by_date[date(2025, 1, 1)]["cash_balance"], Decimal("1000"))
         self.assertEqual(by_date[date(2025, 1, 3)]["cash_balance"], Decimal("800"))
         self.assertEqual(by_date[date(2025, 1, 3)]["portfolio_value"], Decimal("800"))
+
+    def test_historical_cash_balance_rolls_forward_with_activities_after_the_statement_anchor(self):
+        """
+        Same statement-lags-the-CSV gap as `get_cash_summary`, but for the
+        historical series: a date after the last statement anchor should
+        reflect that day's cumulative activities-sourced cash flow on top of
+        the anchor, not stay flat at the anchor's own balance.
+        """
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO statement_balances (transaction_date, transaction_type, balance) "
+            "VALUES ('2025-01-01', 'DEPOSIT', 1000.00)"
+        )
+        import_id = connection.execute(
+            "INSERT INTO activity_imports (source_file, file_hash, status) "
+            "VALUES ('f', 'h-hist-cash-rollforward', 'succeeded') RETURNING import_id"
+        ).fetchone()[0]
+        connection.executemany(
+            """
+            INSERT INTO activities (
+                transaction_date, account_id, account_type, activity_type, activity_code,
+                transaction_currency, net_cash_amount,
+                row_fingerprint, duplicate_ordinal, first_seen_import_id, last_seen_import_id
+            ) VALUES (?, 'A1', 'TFSA', ?, 'X', 'CAD', ?, ?, 1, ?, ?)
+            """,
+            [
+                (date(2025, 1, 1), "Deposit", Decimal("1000"), "fp-anchor", import_id, import_id),
+                (date(2025, 1, 3), "Dividend", Decimal("5"), "fp-div", import_id, import_id),
+            ],
+        )
+
+        values = get_historical_portfolio_values(self.db_path)
+        by_date = {row["date"]: row for row in values}
+
+        self.assertEqual(by_date[date(2025, 1, 1)]["cash_balance"], Decimal("1000"))
+        self.assertEqual(by_date[date(2025, 1, 3)]["cash_balance"], Decimal("1005"))
 
     def test_negative_net_quantity_is_excluded_from_holdings(self):
         ticker_id = self._ticker()
@@ -944,6 +1062,143 @@ class AnalyticsAllocationTest(unittest.TestCase):
 
     def test_get_price_history_unknown_symbol_returns_none(self):
         self.assertIsNone(get_price_history("NOPE", self.db_path))
+
+
+class EtfOverlapTest(unittest.TestCase):
+    def setUp(self):
+        database.close_connection()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
+        self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
+        database.initialize_database(self.db_path)
+
+    def _etf(self, symbol, name=None):
+        connection = database.get_shared_connection(self.db_path)
+        return connection.execute(
+            """
+            INSERT INTO tickers (
+                ticker_symbol, exchange, currency, security_name, security_type
+            )
+            VALUES (?, 'NASDAQ', 'USD', ?, 'etf')
+            RETURNING ticker_id
+            """,
+            [symbol, name or f"{symbol} Fund"],
+        ).fetchone()[0]
+
+    def _hold(self, ticker_id, quantity, debit, close):
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            """
+            INSERT INTO transactions (
+                transaction_date, transaction_type, ticker_id, quantity,
+                execution_date, debit, credit, fx_rate
+            ) VALUES (?, 'BUY', ?, ?, ?, ?, NULL, 1)
+            """,
+            [date(2025, 1, 2), ticker_id, Decimal(str(quantity)), date(2025, 1, 2), Decimal(str(debit))],
+        )
+        connection.execute(
+            "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [ticker_id, date(2025, 1, 2), close, close, close, close, close, 100],
+        )
+
+    def _classify_with_holdings(self, ticker_id, top_holdings, double_encoded=False):
+        """Store a classification row whose `fields` carries top_holdings.
+
+        The classifier has written this nested blob both as a real structure and
+        as a JSON string, so both are exercised.
+        """
+        payload = json.dumps(top_holdings) if double_encoded else top_holdings
+        database.get_shared_connection(self.db_path).execute(
+            """
+            INSERT INTO portfolio_classifications (
+                ticker_id, primary_group, review_needed, fields, generated_at
+            ) VALUES (?, 'Core', FALSE, ?, CURRENT_TIMESTAMP)
+            """,
+            [ticker_id, json.dumps({"top_holdings": payload})],
+        )
+
+    def test_overlap_splits_sleeve_into_overlapping_unique_and_unreported(self):
+        # Two equally-sized funds: each reports 50% of itself, sharing one name
+        # at 30/20. Overlapping = 0.5*0.3 + 0.5*0.2 = 0.25 of the sleeve.
+        first = self._etf("AAA")
+        second = self._etf("BBB")
+        self._hold(first, 10, 1000, 100)
+        self._hold(second, 10, 1000, 100)
+        self._classify_with_holdings(
+            first,
+            [
+                {"Name": "Broadcom Inc", "Holding Percent": 0.3},
+                {"Name": "Solo One Corp", "Holding Percent": 0.2},
+            ],
+        )
+        self._classify_with_holdings(
+            second,
+            [
+                {"Name": "Broadcom Inc", "Holding Percent": 0.2},
+                {"Name": "Solo Two Corp", "Holding Percent": 0.3},
+            ],
+            double_encoded=True,
+        )
+
+        result = get_etf_overlap(self.db_path)
+        share = result["share"]
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["compared_count"], 2)
+        self.assertAlmostEqual(share["overlapping_weight"], 0.25)
+        self.assertAlmostEqual(share["unique_weight"], 0.25)
+        self.assertAlmostEqual(share["unreported_weight"], 0.5)
+        # The three slices always account for the whole sleeve.
+        self.assertAlmostEqual(sum(share.values()), 1.0)
+
+    def test_overlap_pair_uses_the_smaller_side_of_each_shared_name(self):
+        first = self._etf("AAA")
+        second = self._etf("BBB")
+        self._hold(first, 10, 1000, 100)
+        self._hold(second, 10, 1000, 100)
+        self._classify_with_holdings(first, [{"Name": "Broadcom Inc", "Holding Percent": 0.3}])
+        self._classify_with_holdings(second, [{"Name": "Broadcom Inc", "Holding Percent": 0.2}])
+
+        pairs = get_etf_overlap(self.db_path)["pairs"]
+
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual((pairs[0]["a"], pairs[0]["b"]), ("AAA", "BBB"))
+        self.assertAlmostEqual(pairs[0]["overlap_pct"], 0.2)
+        self.assertEqual(pairs[0]["shared"][0]["name"], "Broadcom Inc")
+
+    def test_overlap_matches_names_despite_legal_suffix_differences(self):
+        first = self._etf("AAA")
+        second = self._etf("BBB")
+        self._hold(first, 10, 1000, 100)
+        self._hold(second, 10, 1000, 100)
+        self._classify_with_holdings(first, [{"Name": "The Home Depot Inc", "Holding Percent": 0.4}])
+        self._classify_with_holdings(second, [{"Name": "Home Depot", "Holding Percent": 0.4}])
+
+        result = get_etf_overlap(self.db_path)
+
+        self.assertEqual(len(result["top_shared_holdings"]), 1)
+        self.assertAlmostEqual(result["share"]["overlapping_weight"], 0.4)
+
+    def test_overlap_unavailable_with_fewer_than_two_reporting_funds(self):
+        only = self._etf("AAA")
+        bare = self._etf("BBB")
+        self._hold(only, 10, 1000, 100)
+        self._hold(bare, 10, 1000, 100)
+        self._classify_with_holdings(only, [{"Name": "Broadcom Inc", "Holding Percent": 0.4}])
+
+        result = get_etf_overlap(self.db_path)
+
+        self.assertFalse(result["available"])
+        self.assertIn("two", result["reason"])
+        # The per-fund rows still come back so the UI can explain the gap.
+        self.assertEqual({row["ticker_symbol"] for row in result["etfs"]}, {"AAA", "BBB"})
+
+    def test_overlap_unavailable_without_etf_holdings(self):
+        result = get_etf_overlap(self.db_path)
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["etf_count"], 0)
 
 
 if __name__ == "__main__":

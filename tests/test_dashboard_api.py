@@ -13,6 +13,7 @@ database check actually runs.
 """
 
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -85,6 +86,10 @@ class ToJsonableTests(unittest.TestCase):
     def test_passes_through_plain_values(self):
         for value in ("text", 3, None, True):
             self.assertEqual(dashboard_api.to_jsonable(value), value)
+
+    def test_converts_path_to_string(self):
+        path = Path("Data") / "full_exports" / "activities-export-2025-04.csv"
+        self.assertEqual(dashboard_api.to_jsonable(path), str(path))
 
 
 class CorsOriginsTests(unittest.TestCase):
@@ -357,6 +362,61 @@ class ClassificationsEndpointTests(_EndpointTestCase):
         self.assertEqual(response.json(), payload)
 
 
+class EtfOverlapEndpointTests(_EndpointTestCase):
+    def test_returns_overlap_payload_with_decimals_serialized(self):
+        payload = {
+            "available": True,
+            "basis": "top_holdings",
+            "caveat": "Based on reported top holdings.",
+            "etf_count": 2,
+            "compared_count": 2,
+            "etfs": [
+                {
+                    "ticker_symbol": "AAA",
+                    "security_name": "AAA Fund",
+                    "market_value": Decimal("1000"),
+                    "sleeve_weight": 0.5,
+                    "reported_weight": 0.5,
+                    "holdings_count": 2,
+                }
+            ],
+            "share": {
+                "overlapping_weight": 0.25,
+                "unique_weight": 0.25,
+                "unreported_weight": 0.5,
+            },
+            "pairs": [{"a": "AAA", "b": "BBB", "overlap_pct": 0.2, "shared": []}],
+            "top_shared_holdings": [],
+        }
+        with patch.object(analytics, "get_etf_overlap", return_value=payload):
+            response = self.client.get("/api/etfs/overlap")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["available"])
+        # Decimal market values must come back as plain JSON numbers.
+        self.assertEqual(body["etfs"][0]["market_value"], 1000.0)
+        self.assertAlmostEqual(sum(body["share"].values()), 1.0)
+
+    def test_unavailable_overlap_passes_reason_through(self):
+        payload = {
+            "available": False,
+            "reason": "Fewer than two ETFs have reported holdings to compare.",
+            "basis": "top_holdings",
+            "etf_count": 1,
+            "etfs": [],
+            "share": {"overlapping_weight": 0.0, "unique_weight": 0.0, "unreported_weight": 0.0},
+            "pairs": [],
+            "top_shared_holdings": [],
+        }
+        with patch.object(analytics, "get_etf_overlap", return_value=payload):
+            response = self.client.get("/api/etfs/overlap")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["available"])
+        self.assertIn("two", response.json()["reason"])
+
+
 class StockHistoryEndpointTests(_EndpointTestCase):
     def _history(self, count: int = 2) -> dict:
         return {
@@ -398,6 +458,227 @@ class StockHistoryEndpointTests(_EndpointTestCase):
             response = self.client.get("/api/stocks/NOPE/history")
         self.assertEqual(response.status_code, 404)
         self.assertIn("NOPE", response.json()["detail"])
+
+
+class ActionAuthTests(_EndpointTestCase):
+    """The gate in front of every state-changing endpoint."""
+
+    def setUp(self):
+        super().setUp()
+        # TestClient presents 'testclient' as the host, which is not loopback,
+        # so requests are treated as remote unless a test says otherwise.
+        self.addCleanup(os.environ.pop, "DASHBOARD_ACTION_TOKEN", None)
+        os.environ.pop("DASHBOARD_ACTION_TOKEN", None)
+
+    def test_non_loopback_request_is_refused_without_a_token(self):
+        response = self.client.post("/api/actions/classify")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("DASHBOARD_ACTION_TOKEN", response.json()["detail"])
+
+    def test_loopback_request_is_allowed_without_a_token(self):
+        with patch.object(dashboard_api.runner, "submit") as submit:
+            submit.return_value = dashboard_api.Job(id="j1", kind="classify")
+            response = TestClient(dashboard_api.app, client=("127.0.0.1", 1234)).post(
+                "/api/actions/classify"
+            )
+        self.assertEqual(response.status_code, 202)
+
+    def test_token_mode_requires_a_matching_bearer_token(self):
+        os.environ["DASHBOARD_ACTION_TOKEN"] = "s3cret"
+
+        missing = self.client.post("/api/actions/classify")
+        wrong = self.client.post(
+            "/api/actions/classify", headers={"Authorization": "Bearer nope"}
+        )
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(wrong.status_code, 401)
+
+        with patch.object(dashboard_api.runner, "submit") as submit:
+            submit.return_value = dashboard_api.Job(id="j1", kind="classify")
+            ok = self.client.post(
+                "/api/actions/classify", headers={"Authorization": "Bearer s3cret"}
+            )
+        self.assertEqual(ok.status_code, 202)
+
+    def test_token_mode_applies_to_a_loopback_caller_too(self):
+        os.environ["DASHBOARD_ACTION_TOKEN"] = "s3cret"
+        response = TestClient(dashboard_api.app, client=("127.0.0.1", 1234)).post(
+            "/api/actions/classify"
+        )
+        self.assertEqual(response.status_code, 401)
+
+
+class ActionEndpointTests(_EndpointTestCase):
+    def setUp(self):
+        super().setUp()
+        os.environ["DASHBOARD_ACTION_TOKEN"] = "s3cret"
+        self.addCleanup(os.environ.pop, "DASHBOARD_ACTION_TOKEN", None)
+        self.headers = {"Authorization": "Bearer s3cret"}
+
+    def test_classify_action_queues_a_job(self):
+        with patch.object(dashboard_api.runner, "submit") as submit:
+            submit.return_value = dashboard_api.Job(id="job-1", kind="classify")
+            response = self.client.post("/api/actions/classify", headers=self.headers)
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["id"], "job-1")
+        self.assertEqual(response.json()["status"], "queued")
+        self.assertEqual(submit.call_args.args[0], "classify")
+
+    def test_a_second_job_is_rejected_with_409(self):
+        busy = dashboard_api.JobBusyError(dashboard_api.Job(id="job-1", kind="refresh"))
+        with patch.object(dashboard_api.runner, "submit", side_effect=busy):
+            response = self.client.post("/api/actions/refresh", headers=self.headers)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("already running", response.json()["detail"])
+
+    def test_override_writes_the_yaml_then_queues_reclassification(self):
+        stored = {"ticker": "BN", "primary_group": "Quality"}
+        payload = {"ticker": "bn", "primary_group": "Quality", "rationale": "Owner call."}
+        with patch.object(dashboard_api.manual_overrides, "upsert_override", return_value=stored) as upsert:
+            with patch.object(dashboard_api.runner, "submit") as submit:
+                submit.return_value = dashboard_api.Job(id="job-2", kind="classify")
+                response = self.client.post(
+                    "/api/actions/overrides", json=payload, headers=self.headers
+                )
+
+        self.assertEqual(response.status_code, 202)
+        body = response.json()
+        self.assertEqual(body["override"], stored)
+        self.assertEqual(body["job"]["id"], "job-2")
+        self.assertEqual(upsert.call_args.args, ("bn", "Quality"))
+        self.assertEqual(upsert.call_args.kwargs["rationale"], "Owner call.")
+
+    def test_override_validation_failure_is_a_422_and_queues_nothing(self):
+        error = dashboard_api.manual_overrides.OverrideError("Group 'Nope' is not assignable.")
+        with patch.object(dashboard_api.manual_overrides, "upsert_override", side_effect=error):
+            with patch.object(dashboard_api.runner, "submit") as submit:
+                response = self.client.post(
+                    "/api/actions/overrides",
+                    json={"ticker": "BN", "primary_group": "Nope", "rationale": "x"},
+                    headers=self.headers,
+                )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("not assignable", response.json()["detail"])
+        submit.assert_not_called()
+
+    def test_resolve_ticker_action_queues_a_job(self):
+        body = {
+            "source_symbol": "XYZ",
+            "canonical_symbol": "XYZ",
+            "yahoo_symbol": "XYZ.TO",
+            "currency": "CAD",
+        }
+        with patch.object(dashboard_api.runner, "submit") as submit:
+            submit.return_value = dashboard_api.Job(id="job-3", kind="resolve-ticker")
+            response = self.client.post(
+                "/api/actions/resolve-ticker", json=body, headers=self.headers
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(submit.call_args.args[0], "resolve-ticker")
+
+    def test_resolve_ticker_action_also_retries_export_quarantine(self):
+        """A successful resolve should try to un-quarantine matching export
+        data in the same click, not just save the mapping."""
+        body = {
+            "source_symbol": "MDA",
+            "canonical_symbol": "MDA",
+            "yahoo_symbol": "MDA.TO",
+            "currency": "CAD",
+        }
+        resolved = {"source_symbol": "MDA", "status": "verified"}
+        retry_results = [dashboard_api.pipeline_app.SourceResult("export", None, "succeeded", 1)]
+
+        def fake_submit(kind, work):
+            return dashboard_api.Job(id="job-x", kind=kind, status="succeeded", result=work())
+
+        with (
+            patch.object(
+                dashboard_api.ticker_mapping, "resolve_pending_symbol", return_value=resolved
+            ),
+            patch.object(
+                dashboard_api.pipeline_app, "retry_quarantined_exports_for_symbol",
+                return_value=retry_results,
+            ) as retry,
+            patch.object(dashboard_api.runner, "submit", side_effect=fake_submit),
+        ):
+            response = self.client.post(
+                "/api/actions/resolve-ticker", json=body, headers=self.headers
+            )
+
+        self.assertEqual(response.status_code, 202)
+        retry.assert_called_once_with("MDA", db_path=dashboard_api.db_path())
+        result = response.json()["result"]
+        self.assertEqual(result["source_symbol"], "MDA")
+        self.assertEqual(result["export_retry"][0]["status"], "succeeded")
+
+    def test_retry_ticker_action_queues_a_job(self):
+        with patch.object(dashboard_api.runner, "submit") as submit:
+            submit.return_value = dashboard_api.Job(id="job-5", kind="retry-ticker")
+            response = self.client.post(
+                "/api/actions/retry-ticker", json={"source_symbol": "MDA"}, headers=self.headers
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(submit.call_args.args[0], "retry-ticker")
+
+    def test_pending_tickers_is_a_plain_get(self):
+        rows = [{"source_symbol": "XYZ", "trade_count": 2, "sources": ["email"]}]
+        with patch.object(dashboard_api.ticker_mapping, "list_pending", return_value=rows):
+            response = self.client.get("/api/tickers/pending")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), rows)
+
+    def test_job_status_lookup_and_unknown_id(self):
+        job = dashboard_api.Job(id="job-4", kind="classify", status="succeeded")
+        with patch.object(dashboard_api.runner, "get", return_value=job):
+            found = self.client.get("/api/actions/job-4")
+        with patch.object(dashboard_api.runner, "get", return_value=None):
+            missing = self.client.get("/api/actions/nope")
+
+        self.assertEqual(found.status_code, 200)
+        self.assertEqual(found.json()["status"], "succeeded")
+        self.assertEqual(missing.status_code, 404)
+
+
+class RunCliTests(unittest.TestCase):
+    """The subprocess wrapper actions use to hand the database to a writer."""
+
+    def test_releases_the_connection_before_running_the_writer(self):
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="done\n", stderr="")
+        with patch.object(dashboard_api.database, "close_connection") as close:
+            with patch.object(dashboard_api.subprocess, "run", return_value=completed) as run:
+                result = dashboard_api._run_cli("portfolio-classify")
+
+        close.assert_called_once()
+        self.assertEqual(result["command"], "portfolio-classify")
+        self.assertEqual(result["output"], "done")
+        self.assertIn("portfolio-classify", run.call_args.args[0])
+
+    def test_nonzero_exit_raises_with_stderr_detail(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=2, stdout="", stderr="boom: missing input"
+        )
+        with patch.object(dashboard_api.database, "close_connection"):
+            with patch.object(dashboard_api.subprocess, "run", return_value=completed):
+                with self.assertRaises(RuntimeError) as raised:
+                    dashboard_api._run_cli("pipeline")
+
+        self.assertIn("boom: missing input", str(raised.exception))
+
+    def test_classify_action_runs_workflow_then_sync_in_order(self):
+        with patch.object(dashboard_api, "_run_cli", side_effect=lambda *a: {"command": " ".join(a)}) as cli:
+            result = dashboard_api._classify_and_sync()
+
+        self.assertEqual(
+            [call.args for call in cli.call_args_list],
+            [("portfolio-classify",), ("classification-sync",)],
+        )
+        self.assertEqual(len(result["steps"]), 2)
 
 
 class StartupTests(unittest.TestCase):

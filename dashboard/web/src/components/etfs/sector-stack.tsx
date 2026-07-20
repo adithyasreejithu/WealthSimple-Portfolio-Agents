@@ -1,4 +1,4 @@
-import { categoryColor, OTHER_COLOR } from "@/lib/derive";
+import { canonicalSector, OTHER_COLOR, sectorColor } from "@/lib/derive";
 import { fmtPct } from "@/lib/format";
 
 interface SectorStackProps {
@@ -26,10 +26,12 @@ export function SectorStack({ symbol, weights }: SectorStackProps) {
   const top = entries.slice(0, 5);
   const restWeight = entries.slice(5).reduce((s, [, v]) => s + v, 0);
 
-  const segments = top.map(([label, v], i) => ({
-    label,
+  // Color follows the sector name, never its rank within this ETF, so the same
+  // sector reads the same across every stack on the page.
+  const segments = top.map(([label, v]) => ({
+    label: canonicalSector(label),
     pct: v / total,
-    color: categoryColor(i),
+    color: sectorColor(label),
   }));
   if (restWeight > 0) segments.push({ label: "Other", pct: restWeight / total, color: OTHER_COLOR });
 

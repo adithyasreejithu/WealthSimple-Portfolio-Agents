@@ -152,10 +152,84 @@ def list_pending(db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
         entry["last_seen"] = max(seen_dates) if seen_dates else None
         entry["sources"].add(source_label)
 
-    return [
-        {**entry, "sources": sorted(entry["sources"])}
-        for _, entry in sorted(merged.items(), key=lambda kv: kv[0])
-    ]
+    mappings_by_symbol = _active_mappings_by_symbol(db_path)
+    result = []
+    for symbol, entry in sorted(merged.items(), key=lambda kv: kv[0]):
+        candidates = mappings_by_symbol.get(symbol, [])
+        chosen = next(
+            (m for m in candidates if m["currency"] == entry["detected_currency"]),
+            candidates[0] if candidates else None,
+        )
+        result.append({
+            **entry, "sources": sorted(entry["sources"]),
+            "already_mapped": chosen is not None, "mapping": chosen,
+        })
+    return result
+
+
+def _active_mappings_by_symbol(db_path: Path | str) -> dict[str, list[dict[str, Any]]]:
+    """Return every source_symbol's currently-active saved mapping(s).
+
+    `resolve_or_enrich_ticker` never consults `ticker_symbol_history` (export
+    resolution is a live `tickers`-table match), so this is the only place
+    that reports "this symbol was already mapped once" back to callers such
+    as `list_pending`.
+    """
+    rows = get_shared_connection(db_path).execute(
+        """
+        SELECT h.source_symbol, t.ticker_symbol, h.provider_symbol, h.currency, h.exchange
+        FROM ticker_symbol_history h JOIN tickers t USING (ticker_id)
+        WHERE h.effective_to IS NULL
+        """
+    ).fetchall()
+    mapped: dict[str, list[dict[str, Any]]] = {}
+    for source_symbol, canonical, provider_symbol, currency, exchange in rows:
+        mapped.setdefault(source_symbol, []).append({
+            "canonical_symbol": canonical, "provider_symbol": provider_symbol,
+            "currency": currency, "exchange": exchange,
+        })
+    return mapped
+
+
+def resolve_pending_symbol(
+    source_symbol: str,
+    canonical_symbol: str,
+    yahoo_symbol: str,
+    currency: str,
+    exchange: str = "",
+    *,
+    created_by: str = "dashboard-api",
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    """Resolve one pending source symbol without prompting.
+
+    Applies the same two steps as `resolve_pending_interactively` -- verify the
+    provider symbol against Yahoo Finance, then save the mapping -- for callers
+    that cannot prompt, such as the dashboard's resolve action. The interactive
+    command keeps its own loop because it re-prompts on a failed match; here a
+    bad symbol is simply an error the caller surfaces.
+
+    Raises `ValueError` when the provider symbol cannot be verified, so an
+    unverified alias never reaches `ticker_provider_mappings`.
+    """
+    configure_yfinance_cache(_default_yfinance_cache_dir())
+    provider = str(yahoo_symbol or "").strip().upper()
+    normalized_currency = str(currency or "").strip().upper()
+    if _verify_provider_symbol(provider, normalized_currency) is None:
+        raise ValueError(
+            f"Could not verify {provider} as a {normalized_currency or 'tradeable'} security on "
+            "Yahoo Finance."
+        )
+    return add_mapping(
+        source_symbol,
+        canonical_symbol,
+        provider,
+        normalized_currency,
+        exchange,
+        reason="resolved pending ticker",
+        created_by=created_by,
+        db_path=db_path,
+    )
 
 
 def resolve_pending_interactively(db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:

@@ -4,7 +4,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { KpiCard } from "@/components/kpi-card";
 import { EtfTable, type EtfRow } from "@/components/etfs/etf-table";
 import { SectorStack } from "@/components/etfs/sector-stack";
-import { getClassifications, getReport } from "@/lib/api";
+import { OverlapCard } from "@/components/etfs/overlap-card";
+import { getClassifications, getEtfOverlap, getReport } from "@/lib/api";
 import { classificationsById, blendedMer } from "@/lib/derive";
 import { fmtCad, fmtPct } from "@/lib/format";
 
@@ -13,9 +14,10 @@ function num(v: unknown): number | null {
 }
 
 export default async function EtfsPage() {
-  const [{ report }, classifications] = await Promise.all([
+  const [{ report }, classifications, overlap] = await Promise.all([
     getReport(),
     getClassifications().catch(() => null),
+    getEtfOverlap().catch(() => null),
   ]);
 
   const byTicker = classificationsById(classifications?.classifications ?? []);
@@ -82,6 +84,8 @@ export default async function EtfsPage() {
           <EtfTable rows={rows} />
         </CardContent>
       </Card>
+
+      {overlap ? <OverlapCard overlap={overlap} sleeveValue={sleeveValue} /> : null}
 
       {sectorStacks.length > 0 ? (
         <Card>

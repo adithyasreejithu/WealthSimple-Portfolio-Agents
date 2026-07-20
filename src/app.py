@@ -324,6 +324,124 @@ def _stage_export_files(
     return staged, sequence, results
 
 
+def _resolve_and_publish_export_file(
+    staged_file_id: int,
+    file: Path,
+    data_dir: Path | str,
+    db_path: Path | str,
+) -> SourceResult:
+    """Publish one already-staged export file, or quarantine it.
+
+    Shared by `run_full_exports` (fresh batches) and
+    `retry_quarantined_exports_for_symbol` (reprocessing an existing
+    quarantined `staged_file_id` in place) so both paths make the identical
+    publish-or-quarantine decision.
+    """
+    unresolved_rows = get_shared_connection(db_path).execute(
+        """
+        SELECT DISTINCT source_symbol
+        FROM staged_records
+        WHERE staged_file_id = ? AND source_symbol IS NOT NULL
+          AND resolution_status <> 'resolved'
+        ORDER BY source_symbol
+        """,
+        [staged_file_id],
+    ).fetchall()
+    if unresolved_rows:
+        error = (
+            f"not published; unresolved ticker(s): "
+            f"{', '.join(symbol for (symbol,) in unresolved_rows)}; "
+            "run `python src/app.py resolve-tickers` to map them and retry"
+        )
+        mark_file(staged_file_id, "quarantined", error, db_path)
+        return SourceResult("export", file, "failed", error=error)
+    try:
+        imported = sort_data(
+            source_file=file,
+            data_dir=Path(data_dir),
+            db_path=db_path,
+            enrich_tickers=False,
+            processed_dir=_archive_dir(data_dir, "full_exports"),
+        )
+        mark_file(staged_file_id, "published", db_path=db_path)
+        return SourceResult(
+            "export",
+            file,
+            imported.status,
+            imported.rows_written,
+            None if imported.status == "succeeded" else "Ticker resolution failed",
+        )
+    except Exception as exc:
+        logger.exception("Full export pipeline failed | file=%s", file)
+        mark_file(staged_file_id, "quarantined", str(exc), db_path)
+        return SourceResult("export", file, "failed", error=str(exc))
+
+
+def retry_quarantined_exports_for_symbol(
+    source_symbol: str,
+    db_path: Path | str = DATABASE_PATH,
+    data_dir: Path | str = DATA_FOLDER,
+) -> list[SourceResult]:
+    """Reprocess quarantined export files blocked by `source_symbol`.
+
+    Applies the mapping already saved in `ticker_symbol_history` directly to
+    the stuck `staged_records` (export resolution is a live `tickers`-table
+    match, never a `ticker_symbol_history` lookup -- see
+    `ticker_pipeline.resolve_or_enrich_ticker`), then republishes in place on
+    the existing `staged_file_id`. Never creates a new batch, so it can never
+    leave a duplicate orphaned quarantine row behind the way a full pipeline
+    rerun would.
+    """
+    initialize_database(db_path)
+    connection = get_shared_connection(db_path)
+    symbol = source_symbol.strip().upper()
+    mapping = connection.execute(
+        """
+        SELECT ticker_id FROM ticker_symbol_history
+        WHERE source_symbol = ? AND effective_to IS NULL
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        [symbol],
+    ).fetchone()
+    if not mapping:
+        return [SourceResult(
+            "export", None, "failed", error=f"No saved mapping for {symbol}; resolve it first.",
+        )]
+    ticker_id = int(mapping[0])
+    files = connection.execute(
+        """
+        SELECT DISTINCT f.staged_file_id, f.source_path
+        FROM staged_files f JOIN staged_records r USING (staged_file_id)
+        WHERE f.source_type = 'export' AND f.status = 'quarantined'
+          AND r.source_symbol = ? AND r.resolution_status <> 'resolved'
+        """,
+        [symbol],
+    ).fetchall()
+    results: list[SourceResult] = []
+    for staged_file_id, source_path in files:
+        connection.execute(
+            """
+            UPDATE staged_records SET ticker_id = ?, resolution_status = 'resolved',
+                resolution_method = 'manual_mapping'
+            WHERE staged_file_id = ? AND source_symbol = ? AND resolution_status <> 'resolved'
+            """,
+            [ticker_id, staged_file_id, symbol],
+        )
+        file_path = Path(source_path) if source_path else None
+        if file_path is None or not file_path.exists():
+            error = (
+                f"Mapping saved, but the original export file is no longer at "
+                f"{source_path or '(unknown path)'}; run the full pipeline to reprocess it."
+            )
+            mark_file(staged_file_id, "quarantined", error, db_path)
+            results.append(SourceResult("export", file_path, "failed", error=error))
+            continue
+        results.append(
+            _resolve_and_publish_export_file(staged_file_id, file_path, data_dir, db_path)
+        )
+    return results
+
+
 def run_full_exports(
     data_dir: Path | str = DATA_FOLDER,
     db_path: Path | str = DATABASE_PATH,
@@ -340,47 +458,7 @@ def run_full_exports(
 
     resolve_batch(batch_id, db_path, [staged_file_id for staged_file_id, _, _ in staged])
     for staged_file_id, file, _data in staged:
-        unresolved_rows = get_shared_connection(db_path).execute(
-            """
-            SELECT DISTINCT source_symbol
-            FROM staged_records
-            WHERE staged_file_id = ? AND source_symbol IS NOT NULL
-              AND resolution_status <> 'resolved'
-            ORDER BY source_symbol
-            """,
-            [staged_file_id],
-        ).fetchall()
-        if unresolved_rows:
-            error = (
-                f"not published; unresolved ticker(s): "
-                f"{', '.join(symbol for (symbol,) in unresolved_rows)}; "
-                "run `python src/app.py resolve-tickers` to map them and retry"
-            )
-            mark_file(staged_file_id, "quarantined", error, db_path)
-            results.append(SourceResult("export", file, "failed", error=error))
-            continue
-        try:
-            imported = sort_data(
-                source_file=file,
-                data_dir=Path(data_dir),
-                db_path=db_path,
-                enrich_tickers=False,
-                processed_dir=_archive_dir(data_dir, "full_exports"),
-            )
-            mark_file(staged_file_id, "published", db_path=db_path)
-            results.append(
-                SourceResult(
-                    "export",
-                    file,
-                    imported.status,
-                    imported.rows_written,
-                    None if imported.status == "succeeded" else "Ticker resolution failed",
-                )
-            )
-        except Exception as exc:
-            logger.exception("Full export pipeline failed | file=%s", file)
-            mark_file(staged_file_id, "quarantined", str(exc), db_path)
-            results.append(SourceResult("export", file, "failed", error=str(exc)))
+        results.append(_resolve_and_publish_export_file(staged_file_id, file, data_dir, db_path))
     complete_batch(batch_id, db_path)
     return results
 

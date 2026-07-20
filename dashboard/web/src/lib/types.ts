@@ -278,6 +278,82 @@ export interface PriceHistory {
   points: PricePoint[];
 }
 
+export interface OverlapEtf {
+  ticker_symbol: string;
+  security_name: string;
+  market_value: number;
+  sleeve_weight: number;
+  /** Share of the fund its reported top holdings cover (rest is unreported). */
+  reported_weight: number;
+  holdings_count: number;
+}
+
+export interface OverlapPair {
+  a: string;
+  b: string;
+  overlap_pct: number;
+  shared: { name: string; a_pct: number; b_pct: number }[];
+}
+
+export interface SharedHolding {
+  name: string;
+  etfs: string[];
+  combined_weight: number;
+}
+
+export interface EtfOverlap {
+  available: boolean;
+  reason?: string;
+  basis: string;
+  caveat?: string;
+  etf_count: number;
+  compared_count?: number;
+  etfs: OverlapEtf[];
+  share: {
+    overlapping_weight: number;
+    unique_weight: number;
+    unreported_weight: number;
+  };
+  pairs: OverlapPair[];
+  top_shared_holdings: SharedHolding[];
+}
+
+export type JobStatus = "queued" | "running" | "succeeded" | "failed";
+
+export interface Job {
+  id: string;
+  kind: string;
+  status: JobStatus;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  detail: string | null;
+  result: unknown;
+}
+
+export interface ActionsState {
+  active: Job | null;
+  jobs: Job[];
+}
+
+export interface PendingTickerMapping {
+  canonical_symbol: string;
+  provider_symbol: string;
+  currency: string;
+  exchange: string | null;
+}
+
+export interface PendingTicker {
+  source_symbol: string;
+  detected_currency: string | null;
+  trade_count: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  sources: string[];
+  already_mapped: boolean;
+  mapping: PendingTickerMapping | null;
+}
+
 export interface Health {
   status: string;
   database: string;

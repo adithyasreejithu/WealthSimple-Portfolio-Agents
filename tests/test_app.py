@@ -503,5 +503,131 @@ class AppPipelineTest(unittest.TestCase):
         self.assertEqual(mismatch_output, 1)
 
 
+class RetryQuarantinedExportsTest(unittest.TestCase):
+    def setUp(self):
+        database.close_connection()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
+        self.data_dir = Path(self.temp_dir.name)
+        self.db_path = self.data_dir / "db.duckdb"
+
+    def _write_export(self, name: str, symbol: str) -> Path:
+        export = self.data_dir / name
+        export.write_text(
+            "transaction_date,settlement_date,account_id,account_type,activity_type,"
+            "activity_sub_type,direction,symbol,name,currency,quantity,unit_price,"
+            "commission,net_cash_amount\n"
+            f"2025-04-01,2025-04-03,A1,TFSA,Trade,Buy,Buy,{symbol},{symbol} Inc.,CAD,1,10,0,-10\n",
+            encoding="utf-8",
+        )
+        return export
+
+    def _quarantine_one_export(self, symbol: str) -> int:
+        """Stage+resolve one export file with an unresolvable symbol, returning
+        its staged_file_id -- mirrors what run_full_exports does today when a
+        ticker doesn't exist yet."""
+        self._write_export(f"activities-export-{symbol}.csv", symbol)
+        app.run_full_exports(self.data_dir, self.db_path)
+        row = database.get_shared_connection(self.db_path).execute(
+            "SELECT staged_file_id FROM staged_files WHERE source_type = 'export'"
+        ).fetchone()
+        self.assertIsNotNone(row, "expected the export to be staged and quarantined")
+        return int(row[0])
+
+    def _insert_mapping(self, source_symbol: str, currency: str = "CAD") -> int:
+        connection = database.get_shared_connection(self.db_path)
+        ticker_id = int(connection.execute(
+            "INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type) "
+            "VALUES (?, 'TSX', ?, ?, 'equity') RETURNING ticker_id",
+            [source_symbol, currency, f"{source_symbol} Inc."],
+        ).fetchone()[0])
+        connection.execute(
+            "INSERT INTO ticker_symbol_history (ticker_id, source_symbol, provider_symbol, "
+            "currency, exchange, reason, mapping_source, created_by) "
+            "VALUES (?, ?, ?, ?, 'TSX', 'resolved pending ticker', 'manual', 'user')",
+            [ticker_id, source_symbol, f"{source_symbol}.TO", currency],
+        )
+        return ticker_id
+
+    def test_retry_republishes_quarantined_export_in_place(self):
+        staged_file_id = self._quarantine_one_export("MDA")
+        status = database.get_shared_connection(self.db_path).execute(
+            "SELECT status FROM staged_files WHERE staged_file_id = ?", [staged_file_id]
+        ).fetchone()[0]
+        self.assertEqual(status, "quarantined")
+        self._insert_mapping("MDA")
+
+        results = app.retry_quarantined_exports_for_symbol("MDA", self.db_path, self.data_dir)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "succeeded")
+        connection = database.get_shared_connection(self.db_path)
+        export_files = connection.execute(
+            "SELECT staged_file_id, status FROM staged_files WHERE source_type = 'export'"
+        ).fetchall()
+        # Reprocessed in place: still exactly one staged_files row, now published.
+        self.assertEqual(export_files, [(staged_file_id, "published")])
+        resolution = connection.execute(
+            "SELECT resolution_status FROM staged_records WHERE staged_file_id = ?", [staged_file_id]
+        ).fetchone()[0]
+        self.assertEqual(resolution, "resolved")
+
+    def test_retry_without_saved_mapping_returns_clear_error(self):
+        results = app.retry_quarantined_exports_for_symbol("ZZZZ", self.db_path, self.data_dir)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "failed")
+        self.assertIn("No saved mapping", results[0].error)
+
+    def test_retry_reports_missing_source_file_without_crashing(self):
+        staged_file_id = self._quarantine_one_export("MDA")
+        self._insert_mapping("MDA")
+        # Simulate the source CSV having been moved/deleted since it was quarantined.
+        (self.data_dir / "activities-export-MDA.csv").unlink()
+
+        results = app.retry_quarantined_exports_for_symbol("MDA", self.db_path, self.data_dir)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "failed")
+        self.assertIn("no longer at", results[0].error)
+        status = database.get_shared_connection(self.db_path).execute(
+            "SELECT status FROM staged_files WHERE staged_file_id = ?", [staged_file_id]
+        ).fetchone()[0]
+        self.assertEqual(status, "quarantined")
+
+    def test_retry_leaves_file_quarantined_when_another_symbol_still_unresolved(self):
+        export = self.data_dir / "activities-export-multi.csv"
+        export.write_text(
+            "transaction_date,settlement_date,account_id,account_type,activity_type,"
+            "activity_sub_type,direction,symbol,name,currency,quantity,unit_price,"
+            "commission,net_cash_amount\n"
+            "2025-04-01,2025-04-03,A1,TFSA,Trade,Buy,Buy,MDA,MDA Inc.,CAD,1,10,0,-10\n"
+            "2025-04-01,2025-04-03,A1,TFSA,Trade,Buy,Buy,OTHER,Other Inc.,CAD,1,10,0,-10\n",
+            encoding="utf-8",
+        )
+        app.run_full_exports(self.data_dir, self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        staged_file_id = int(connection.execute(
+            "SELECT staged_file_id FROM staged_files WHERE source_type = 'export'"
+        ).fetchone()[0])
+        self._insert_mapping("MDA")
+
+        results = app.retry_quarantined_exports_for_symbol("MDA", self.db_path, self.data_dir)
+
+        self.assertEqual(results[0].status, "failed")
+        self.assertIn("OTHER", results[0].error)
+        mda_status, other_status = connection.execute(
+            "SELECT resolution_status FROM staged_records WHERE staged_file_id = ? "
+            "ORDER BY source_symbol", [staged_file_id]
+        ).fetchall()
+        self.assertEqual(mda_status[0], "resolved")
+        self.assertEqual(other_status[0], "unresolved")
+        status = connection.execute(
+            "SELECT status FROM staged_files WHERE staged_file_id = ?", [staged_file_id]
+        ).fetchone()[0]
+        self.assertEqual(status, "quarantined")
+
+
 if __name__ == "__main__":
     unittest.main()

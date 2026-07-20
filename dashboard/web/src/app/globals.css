@@ -73,17 +73,20 @@
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
-  /* Categorical palette for portfolio charts (CVD-validated as an ordered
-     set in both modes -- keep the slot order fixed; fold a 9th+ category
-     into a neutral "Other"). */
-  --chart-1: #2a78d6; /* blue */
-  --chart-2: #008300; /* green */
-  --chart-3: #e87ba4; /* magenta */
-  --chart-4: #eda100; /* yellow */
-  --chart-5: #1baf7a; /* aqua */
-  --chart-6: #eb6834; /* orange */
-  --chart-7: #4a3aa7; /* violet */
-  --chart-8: #e34948; /* red */
+  /* Categorical palette for portfolio charts. Cool-and-muted, anchored on the
+     blue. Slots 1-5 are the strategy groups in their fixed display order
+     (Core, Quality, Income, Growth, Alternatives), so validator adjacency
+     matches on-screen adjacency. CVD-validated as an ordered set in both
+     modes -- keep the slot order fixed; fold a 9th+ category into a neutral
+     "Other". */
+  --chart-1: #2a78d6; /* blue    - Core */
+  --chart-2: #b07520; /* amber   - Quality */
+  --chart-3: #00795c; /* teal    - Income */
+  --chart-4: #2b86bd; /* sky     - Growth */
+  --chart-5: #b84d75; /* rose    - Alternatives */
+  --chart-6: #6f5fd0; /* violet */
+  --chart-7: #4d7a2c; /* green */
+  --chart-8: #9c4aa8; /* orchid */
   /* Semantic gain/loss/warning, distinct from the series hues. */
   --gain: #006300;
   --loss: #d03b3b;
@@ -118,14 +121,14 @@
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
-  --chart-1: #3987e5;
-  --chart-2: #008300;
-  --chart-3: #d55181;
-  --chart-4: #c98500;
-  --chart-5: #199e70;
-  --chart-6: #d95926;
-  --chart-7: #9085e9;
-  --chart-8: #e66767;
+  --chart-1: #3987e5; /* blue    - Core */
+  --chart-2: #c2822f; /* amber   - Quality */
+  --chart-3: #0e8168; /* teal    - Income */
+  --chart-4: #2f9ecc; /* sky     - Growth */
+  --chart-5: #ce6b90; /* rose    - Alternatives */
+  --chart-6: #8b7de0; /* violet */
+  --chart-7: #63973f; /* green */
+  --chart-8: #b869c6; /* orchid */
   --gain: #0ca30c;
   --loss: #d03b3b;
   --warning: #fab219;

@@ -1,6 +1,6 @@
 import { Badge } from "@/components/ui/badge";
 import type { TargetGroup } from "@/lib/types";
-import { driftBadgeVariant, groupColor } from "@/lib/derive";
+import { driftBadgeVariant, groupColor, sortByGroupOrder } from "@/lib/derive";
 import { fmtPp } from "@/lib/format";
 
 /**
@@ -14,7 +14,7 @@ export function TargetVsActual({ groups }: { groups: TargetGroup[] }) {
     1,
   );
 
-  const sorted = [...groups].sort((a, b) => b.actual_percent - a.actual_percent);
+  const sorted = sortByGroupOrder(groups, (g) => g.group);
 
   return (
     <ul className="space-y-3">

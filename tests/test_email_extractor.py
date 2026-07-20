@@ -154,6 +154,48 @@ class EmailExtractorTest(unittest.TestCase):
 
         self.assertEqual(resolved, date(2025, 4, 10))
 
+    def test_resolve_email_date_accepts_drift_at_the_tolerance_boundary(self):
+        resolved = resolve_email_date(date(2025, 4, 24), date(2025, 4, 10), "Wealthsimple")
+
+        self.assertEqual(resolved, date(2025, 4, 24))
+
+    def test_resolve_email_date_discards_implausible_parsed_date_and_falls_back(self):
+        """
+        Reproduces a real production incident: a DRIP "Fractional Buy"
+        confirmation email received 2024-12-31 had its body date parsed as
+        2025-12-31 (exactly one year later) because the matched date field
+        omitted an explicit year and the date library's own default-year
+        behavior filled in the wrong one. That single bad row left the
+        position stuck 'provisional' forever, since the reconciliation date
+        window (a few days) can never bridge a full-year gap.
+        """
+        with self.assertLogs("email_extractor", level="WARNING") as captured:
+            resolved = resolve_email_date(date(2025, 12, 31), date(2024, 12, 31), "Wealthsimple")
+
+        self.assertEqual(resolved, date(2024, 12, 31))
+        self.assertIn("Discarding implausible", "\n".join(captured.output))
+
+    def test_parse_wealthsimple_email_discards_implausible_body_date_end_to_end(self):
+        """
+        Same incident as above, exercised through the full parser: an
+        ambiguous "Date:" field resolves to the wrong year, but the message's
+        real IMAP received date should still win in the final output.
+        """
+        email = """
+        Account: TFSA
+        Type: Fractional Buy
+        Symbol: L
+        Shares: 0.0063
+        Average price: $188.86
+        Total cost: $1.19
+        Date: Dec 31, 2025
+        Amount: $1.19
+        """
+
+        parsed = parse_wealthsimple_email(email, "Your order filled", received_date=date(2024, 12, 31))
+
+        self.assertEqual(parsed.loc[0, "date"], date(2024, 12, 31))
+
     def test_parse_wealthsimple_email_uses_received_date_when_no_body_date_is_present(self):
         email = """
         Account: TFSA

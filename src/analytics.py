@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -224,19 +225,42 @@ def get_excluded_positions(db_path: str = DATABASE_PATH) -> list[Holding]:
 
 
 def get_cash_summary(db_path: str = DATABASE_PATH) -> CashSummary:
+    """Return the current cash balance, anchored to the latest statement and
+    rolled forward with any CSV-sourced activity since then.
+
+    `statement_balances` captures every statement line's trailing balance
+    regardless of whether that line resolved to a ticker (unlike
+    `cash_transactions.balance`, which only ever sees cash-only lines and so
+    understates the balance whenever a BUY/SELL/DIV row is the statement's
+    last line -- see `docs/architecture/ingestion_and_reconciliation.md`).
+    Statement PDFs typically lag the activities CSV export by weeks, so the
+    latest statement balance alone is stale between statements; `activities`
+    (the deduplicated, typed CSV table -- see `data_sorter.py`) already
+    reports every cash-affecting row (trades, dividends, interest, tax
+    withholding) in CAD regardless of the security's own listing currency,
+    so summing `net_cash_amount` for rows strictly after the anchor date and
+    adding it to the anchor balance gives a currently-accurate figure
+    without waiting for the next statement.
+    """
     connection = get_shared_connection(db_path)
-    # Prefer the most recent explicit cash balance when the source data provides one.
     row = connection.execute(
         """
-        SELECT balance
-        FROM cash_transactions
-        WHERE balance IS NOT NULL
-        ORDER BY transaction_date DESC, cash_transaction_id DESC
+        SELECT transaction_date, balance
+        FROM statement_balances
+        ORDER BY transaction_date DESC, statement_balance_id DESC
         LIMIT 1
         """
     ).fetchone()
     if row is not None:
-        return CashSummary(balance=_decimal(row[0]), source="explicit_balance")
+        anchor_date, anchor_balance = row
+        rollforward = _decimal(
+            connection.execute(
+                "SELECT COALESCE(SUM(net_cash_amount), 0) FROM activities WHERE transaction_date > ?",
+                [anchor_date],
+            ).fetchone()[0]
+        )
+        source = "explicit_balance" if rollforward == 0 else "explicit_balance_rolled_forward"
+        return CashSummary(balance=_decimal(anchor_balance) + rollforward, source=source)
 
     # Fall back to net cash flow when the source set does not store a direct balance.
     row = connection.execute(
@@ -455,8 +479,10 @@ def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[s
     forward from the latest known close on or before each date and converted
     to CAD using the configured FX pair's close (forward-filled the same way),
     so the series stays in one currency throughout. Cash uses the latest
-    explicit balance on or before each date, falling back to cumulative net
-    cash flow, mirroring ``get_cash_summary``.
+    explicit statement balance on or before each date, rolled forward with
+    CSV-sourced activity since that statement, falling back to cumulative
+    net cash flow before any statement balance is known -- mirroring
+    `get_cash_summary`.
     """
     connection = get_shared_connection(db_path)
     ensure_positions_fresh(connection)
@@ -488,6 +514,10 @@ def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[s
                 SELECT record_date AS value_date FROM historical_records
                 UNION
                 SELECT transaction_date AS value_date FROM cash_transactions
+                UNION
+                SELECT transaction_date AS value_date FROM statement_balances
+                UNION
+                SELECT transaction_date AS value_date FROM activities
             )
             WHERE value_date IS NOT NULL
         ),
@@ -540,28 +570,82 @@ def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[s
             LEFT JOIN fx_series fx ON fx.value_date = q.value_date
             GROUP BY q.value_date
         ),
-        cash_by_date AS (
-            SELECT transaction_date AS d, MAX(balance) AS balance_on_date,
+        -- Explicit balances come from `statement_balances` (every statement
+        -- line, regardless of whether it resolved to a ticker -- see
+        -- `database._create_statement_balances_table`), but a statement
+        -- typically lags the activities CSV export by weeks. `activities`
+        -- (the deduplicated, typed CSV table) reports every cash-affecting
+        -- row in CAD, so it rolls each statement anchor forward to stay
+        -- current: `adjusted_baseline` folds the anchor's own date out of
+        -- the all-time activities running total once
+        -- (`balance_on_date - cumulative_activities_flow(anchor_date)`), so
+        -- adding the (also all-time) `cumulative_activities_flow(date)` back
+        -- at every later date yields exactly
+        -- `balance_on_date + sum(activities after anchor_date, through date)`
+        -- without re-summing per anchor. `cash_transactions` net flow is
+        -- unchanged and is only ever used before the first explicit balance
+        -- is known, via the `cumulative_flow` fallback below.
+        activities_flow_by_date AS (
+            SELECT transaction_date AS d, SUM(COALESCE(net_cash_amount, 0)) AS activities_flow_on_date
+            FROM activities
+            GROUP BY transaction_date
+        ),
+        activities_cumulative AS (
+            SELECT vd.value_date,
+                   SUM(COALESCE(af.activities_flow_on_date, 0)) OVER (
+                       ORDER BY vd.value_date
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                   ) AS cumulative_activities_flow
+            FROM value_dates vd
+            LEFT JOIN activities_flow_by_date af ON af.d = vd.value_date
+        ),
+        statement_balance_by_date AS (
+            SELECT sb.d,
+                   sb.balance_on_date,
+                   sb.balance_on_date - ac.cumulative_activities_flow AS adjusted_baseline
+            FROM (
+                SELECT transaction_date AS d, MAX(balance) AS balance_on_date
+                FROM statement_balances
+                GROUP BY transaction_date
+            ) sb
+            JOIN activities_cumulative ac ON ac.value_date = sb.d
+        ),
+        cash_flow_by_date AS (
+            SELECT transaction_date AS d,
                    SUM(COALESCE(credit, 0) - COALESCE(debit, 0)) AS net_flow_on_date
             FROM cash_transactions
             GROUP BY transaction_date
         ),
+        cash_by_date AS (
+            SELECT
+                COALESCE(sb.d, cf.d) AS d,
+                sb.adjusted_baseline,
+                cf.net_flow_on_date
+            FROM statement_balance_by_date sb
+            FULL JOIN cash_flow_by_date cf ON cf.d = sb.d
+        ),
         cash_series AS (
             SELECT vd.value_date,
-                   LAST_VALUE(cb.balance_on_date IGNORE NULLS) OVER (
+                   LAST_VALUE(cb.adjusted_baseline IGNORE NULLS) OVER (
                        ORDER BY vd.value_date
                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                   ) AS explicit_balance,
+                   ) AS adjusted_baseline,
                    SUM(COALESCE(cb.net_flow_on_date, 0)) OVER (
                        ORDER BY vd.value_date
                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                   ) AS cumulative_flow
+                   ) AS cumulative_flow,
+                   ac.cumulative_activities_flow
             FROM value_dates vd
             LEFT JOIN cash_by_date cb ON cb.d = vd.value_date
+            LEFT JOIN activities_cumulative ac ON ac.value_date = vd.value_date
         )
         SELECT vd.value_date,
                COALESCE(sv.securities_value, 0) AS securities_value,
-               COALESCE(cs.explicit_balance, cs.cumulative_flow, 0) AS cash_balance
+               CASE
+                   WHEN cs.adjusted_baseline IS NOT NULL
+                       THEN cs.adjusted_baseline + COALESCE(cs.cumulative_activities_flow, 0)
+                   ELSE COALESCE(cs.cumulative_flow, 0)
+               END AS cash_balance
         FROM value_dates vd
         LEFT JOIN securities_series sv ON sv.value_date = vd.value_date
         LEFT JOIN cash_series cs ON cs.value_date = vd.value_date
@@ -1209,6 +1293,225 @@ def get_look_through_sector_exposure(db_path: str, holdings: list[Holding]) -> d
     total_exposure = sum(exposure.values())
     weights = {sector: value / total_exposure for sector, value in exposure.items()} if total_exposure else {}
     return {"available": True, "weights": weights, "coverage_percent": coverage_percent}
+
+
+# Legal-form tokens stripped when matching an underlying holding across two
+# funds. The stored `top_holdings` records carry a display name and a weight
+# but no ticker symbol, so the name is the only identity available and it has
+# to survive "Broadcom Inc" vs "Broadcom". Class letters are deliberately not
+# stripped -- "Berkshire Hathaway Class B" must not collapse into Class A.
+_HOLDING_NAME_SUFFIXES = {
+    "inc", "incorporated", "corp", "corporation", "co", "company", "ltd",
+    "limited", "plc", "nv", "sa", "ag", "adr", "ordinary", "shares",
+}
+
+
+def _normalize_holding_name(name: str) -> str:
+    """Reduce a fund's holding label to a comparable key across providers."""
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", str(name).strip().lower())
+    tokens = cleaned.split()
+    if tokens and tokens[0] == "the":
+        tokens = tokens[1:]
+    while tokens and tokens[-1] in _HOLDING_NAME_SUFFIXES:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def _parse_top_holdings(raw: Any) -> dict[str, float]:
+    """Return ``{normalized_name: weight}`` from a stored top_holdings blob.
+
+    Accepts both shapes the pipeline has produced: a list of
+    ``{"Name": ..., "Holding Percent": ...}`` records (what the classifier
+    stores today) and a mapping keyed by row index. Malformed rows are skipped
+    rather than failing the whole fund.
+    """
+    parsed = _load_json_column(raw, None)
+    if isinstance(parsed, dict):
+        records: list[Any] = list(parsed.values())
+    elif isinstance(parsed, list):
+        records = parsed
+    else:
+        return {}
+    holdings: dict[str, float] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        name = record.get("Name") or record.get("name") or record.get("Symbol")
+        weight = record.get("Holding Percent", record.get("holding_percent"))
+        if not name or weight is None:
+            continue
+        try:
+            value = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        key = _normalize_holding_name(name)
+        if not key:
+            continue
+        holdings[key] = holdings.get(key, 0.0) + value
+    return holdings
+
+
+def get_etf_overlap(db_path: str = DATABASE_PATH) -> dict[str, Any]:
+    """Measure how much the portfolio's ETFs hold the same underlying names.
+
+    Each fund's reported top holdings are scaled by that fund's share of the
+    ETF sleeve, so the returned shares are portfolio-level: `overlapping` is
+    the slice of ETF money sitting in a name at least two funds report holding,
+    `unique` is reported holdings only one fund carries, and `unreported` is
+    the remainder of each fund that its top-holdings list does not cover.
+
+    The provider only publishes each fund's largest positions (typically ten)
+    and publishes them without ticker symbols, so this is a floor on true
+    overlap computed by name -- two funds can share names further down their
+    books than either reports. `basis` and `caveat` carry that caveat to the UI.
+    """
+    etfs = [h for h in get_holdings(db_path) if h.security_type == "etf" and h.market_value > 0]
+    sleeve_value = sum((h.market_value for h in etfs), Decimal("0"))
+    unavailable = {
+        "available": False,
+        "basis": "top_holdings",
+        "etf_count": len(etfs),
+        "etfs": [],
+        "share": {"overlapping_weight": 0.0, "unique_weight": 0.0, "unreported_weight": 0.0},
+        "pairs": [],
+        "top_shared_holdings": [],
+    }
+    if not etfs or sleeve_value <= 0:
+        return {**unavailable, "reason": "No ETF holdings with market value."}
+
+    connection = get_shared_connection(db_path)
+    ticker_ids = [h.ticker_id for h in etfs]
+    placeholders = ",".join("?" for _ in ticker_ids)
+    rows = connection.execute(
+        f"SELECT ticker_id, fields FROM portfolio_classifications WHERE ticker_id IN ({placeholders})",
+        ticker_ids,
+    ).fetchall()
+    raw_by_ticker = {
+        int(ticker_id): _normalize_classification_fields(fields).get("top_holdings")
+        for ticker_id, fields in rows
+    }
+
+    # Keep display names alongside the match keys so the UI can label a shared
+    # position with the wording the funds actually use.
+    holdings_by_etf: dict[str, dict[str, float]] = {}
+    display_names: dict[str, str] = {}
+    sleeve_weights: dict[str, float] = {}
+    etf_rows: list[dict[str, Any]] = []
+    for holding in etfs:
+        parsed = _parse_top_holdings(raw_by_ticker.get(holding.ticker_id))
+        raw = _load_json_column(raw_by_ticker.get(holding.ticker_id), None)
+        for record in (raw.values() if isinstance(raw, dict) else raw or []):
+            if isinstance(record, dict) and record.get("Name"):
+                display_names.setdefault(_normalize_holding_name(record["Name"]), str(record["Name"]).strip())
+        sleeve_weight = float(holding.market_value / sleeve_value)
+        sleeve_weights[holding.ticker_symbol] = sleeve_weight
+        reported = sum(parsed.values())
+        etf_rows.append(
+            {
+                "ticker_symbol": holding.ticker_symbol,
+                "security_name": holding.security_name,
+                "market_value": holding.market_value,
+                "sleeve_weight": sleeve_weight,
+                "reported_weight": reported,
+                "holdings_count": len(parsed),
+            }
+        )
+        if parsed:
+            holdings_by_etf[holding.ticker_symbol] = parsed
+
+    etf_rows.sort(key=lambda row: row["market_value"], reverse=True)
+    if len(holdings_by_etf) < 2:
+        return {
+            **unavailable,
+            "reason": "Fewer than two ETFs have reported holdings to compare.",
+            "etfs": etf_rows,
+        }
+
+    funds_by_name: dict[str, list[str]] = {}
+    for symbol, parsed in holdings_by_etf.items():
+        for name in parsed:
+            funds_by_name.setdefault(name, []).append(symbol)
+
+    overlapping = unique = 0.0
+    shared_rows: list[dict[str, Any]] = []
+    for name, symbols in funds_by_name.items():
+        contribution = sum(sleeve_weights[s] * holdings_by_etf[s][name] for s in symbols)
+        if len(symbols) > 1:
+            overlapping += contribution
+            shared_rows.append(
+                {
+                    "name": display_names.get(name, name),
+                    "etfs": sorted(symbols),
+                    "combined_weight": contribution,
+                }
+            )
+        else:
+            unique += contribution
+    unreported = sum(
+        sleeve_weights[row["ticker_symbol"]] * max(0.0, 1.0 - row["reported_weight"])
+        for row in etf_rows
+        if row["ticker_symbol"] in holdings_by_etf
+    )
+    # Funds with no reported holdings at all are entirely unreported exposure.
+    unreported += sum(
+        row["sleeve_weight"] for row in etf_rows if row["ticker_symbol"] not in holdings_by_etf
+    )
+    shared_rows.sort(key=lambda row: row["combined_weight"], reverse=True)
+
+    pairs: list[dict[str, Any]] = []
+    symbols = sorted(holdings_by_etf)
+    for index, first in enumerate(symbols):
+        for second in symbols[index + 1 :]:
+            shared_names = set(holdings_by_etf[first]) & set(holdings_by_etf[second])
+            if not shared_names:
+                continue
+            # Overlap coefficient: the weight both funds commit to the same
+            # names, taking the smaller position on each side.
+            overlap_pct = sum(
+                min(holdings_by_etf[first][name], holdings_by_etf[second][name]) for name in shared_names
+            )
+            pairs.append(
+                {
+                    "a": first,
+                    "b": second,
+                    "overlap_pct": overlap_pct,
+                    "shared": sorted(
+                        (
+                            {
+                                "name": display_names.get(name, name),
+                                "a_pct": holdings_by_etf[first][name],
+                                "b_pct": holdings_by_etf[second][name],
+                            }
+                            for name in shared_names
+                        ),
+                        key=lambda row: min(row["a_pct"], row["b_pct"]),
+                        reverse=True,
+                    ),
+                }
+            )
+    pairs.sort(key=lambda row: row["overlap_pct"], reverse=True)
+
+    return {
+        "available": True,
+        "basis": "top_holdings",
+        "caveat": (
+            "Based on each fund's reported top holdings matched by name, weighted by "
+            "the fund's share of the ETF sleeve. Providers publish only the largest "
+            "positions, so true overlap is at least this much."
+        ),
+        "etf_count": len(etfs),
+        "compared_count": len(holdings_by_etf),
+        "etfs": etf_rows,
+        "share": {
+            "overlapping_weight": overlapping,
+            "unique_weight": unique,
+            "unreported_weight": unreported,
+        },
+        "pairs": pairs,
+        "top_shared_holdings": shared_rows,
+    }
 
 
 def get_currency_exposure(holdings: list[Holding]) -> dict[str, dict[str, Any]]:

@@ -153,6 +153,33 @@ class DatabaseTest(unittest.TestCase):
         # The view must exist and be queryable (empty result on an empty DB).
         self.assertEqual(connection.execute("SELECT COUNT(*) FROM v_trade_events").fetchone()[0], 0)
 
+    def test_version_ten_schema_is_upgraded_and_adds_statement_balances_table(self):
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute("DROP TABLE statement_balances")
+        connection.execute(
+            "UPDATE schema_metadata SET schema_version = 10 WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        )
+
+        created = database.initialize_database(self.db_path)
+
+        version = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        ).fetchone()[0]
+        self.assertFalse(created)
+        self.assertEqual(version, database.DATABASE_SCHEMA_VERSION)
+        self.assertTrue(database.is_database_active(connection))
+        self.assertIn("statement_balances", database._get_table_names(connection))
+        connection.execute(
+            "INSERT INTO statement_balances (transaction_date, transaction_type, balance) "
+            "VALUES ('2026-01-01', 'BUY', 100.00)"
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM statement_balances").fetchone()[0], 1
+        )
+
     def test_trade_events_view_is_recreated_on_every_startup(self):
         database.initialize_database(self.db_path)
         connection = database.get_shared_connection(self.db_path)

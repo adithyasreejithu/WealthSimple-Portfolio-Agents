@@ -21,7 +21,7 @@ LOG_FOLDER = BASE_DIR / "logs"
 DATABASE_PATH = Path(
     os.getenv("DB_PATH", str(DATA_FOLDER / "PRD_WealthSimple.duckdb"))
 ).expanduser()
-DATABASE_SCHEMA_VERSION = 10
+DATABASE_SCHEMA_VERSION = 11
 
 """
 Financial analytics assumptions. Keep business constants here so calculations
@@ -43,6 +43,8 @@ SINGLE_NAME_MAX_WEIGHT = Decimal("0.10")
 ANALYTICS_EXPORT_FOLDER = EXPORT_FOLDER / "analytics"
 ANALYTICS_EXPORT_FILENAME = "portfolio-analytics.json"
 POLICY_FILE = PORTFOLIO_GROUPING_FOLDER / "policy_v1_1.yaml"
+CLASSIFICATION_RULES_FILE = PORTFOLIO_GROUPING_FOLDER / "classification_rules_v1_1.yaml"
+MANUAL_OVERRIDES_FILE = PORTFOLIO_GROUPING_FOLDER / "manual_overrides_v1_1.yaml"
 
 """
 Position reconciliation config used by `database_command.py` (statement <->
@@ -73,6 +75,21 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 """
 Email extractor config used by `email_extractor.py`.
 """
+# `extract_wealthsimple_date`/`extract_interac_date` hand whatever text follows
+# a date-like label to `pd.to_datetime` with no format hint. If that text is
+# missing an explicit year (a real observed case: a DRIP "Fractional Buy"
+# confirmation whose matched field read just "Dec 31"), the resolved year
+# depends on the date-parsing library's own default-year behavior, which is
+# not pinned and has changed across pandas/dateutil versions -- silently
+# producing a transaction_date up to a full year away from the truth. The
+# email's IMAP `received_at` is always reliable, so any parsed body date more
+# than this many days from `received_at` is treated as a bad parse and
+# discarded in favor of the received-date fallback. Every correctly-parsed
+# email observed in production has landed on drift_days == 0; this is sized
+# well above the widest reconciliation window (`RECON_DATE_WINDOW_DAYS_STMT`
+# = 5 days) to comfortably allow a legitimate multi-day record-date/payment-
+# date gap without ever being wide enough to mask a wrong-year bug.
+EMAIL_BODY_DATE_MAX_DRIFT_DAYS = 14
 EMAIL_OUTPUT_COLUMNS = [
     "account",
     "transaction",

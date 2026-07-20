@@ -127,50 +127,61 @@ export function PriceExplorer({ initialSymbol, symbols }: PriceExplorerProps) {
         ) : null}
       </div>
 
-      {loading ? (
-        <Skeleton className="h-72 w-full rounded-lg" />
-      ) : error ? (
-        <p className="text-muted-foreground flex h-72 items-center justify-center text-sm">{error}</p>
-      ) : (
-        <ChartContainer config={config} className="h-72 w-full">
-          <LineChart data={chartData} margin={{ left: 4, right: 8, top: 4 }}>
-            <CartesianGrid vertical={false} strokeDasharray="3 3" />
-            <XAxis
-              dataKey="date"
-              tickLine={false}
-              axisLine={false}
-              minTickGap={40}
-              tickFormatter={(v) => fmtDate(v)}
-            />
-            <YAxis
-              tickLine={false}
-              axisLine={false}
-              width={56}
-              domain={["auto", "auto"]}
-              tickFormatter={(v) => (indexed ? fmtNumber(Number(v), 0) : fmtCcy(Number(v), currency, 0))}
-              label={
-                indexed
-                  ? { value: "Indexed (100 = start)", angle: -90, position: "insideLeft", className: "fill-muted-foreground text-xs" }
-                  : undefined
-              }
-            />
-            <ChartTooltip
-              content={
-                <ChartTooltipContent
-                  labelFormatter={(v) => fmtDate(String(v))}
-                  formatter={(value, name) =>
-                    `${name}: ${indexed ? fmtNumber(Number(value)) : fmtCcy(Number(value), currency)}`
-                  }
-                />
-              }
-            />
-            <Line dataKey="base" type="monotone" stroke="var(--chart-1)" dot={false} strokeWidth={2} />
-            {indexed ? (
-              <Line dataKey="compare" type="monotone" stroke="var(--chart-3)" dot={false} strokeWidth={2} />
-            ) : null}
-          </LineChart>
-        </ChartContainer>
-      )}
+      {/* The chart stays mounted across loading states with the skeleton overlaid on
+          top. Mounting it only once loading flipped false made recharts'
+          ResponsiveContainer take its first measurement in that same commit, where it
+          could read a zero width and paint an empty SVG until the next resize — which
+          is why the initial symbol showed blank until a reload or re-select. */}
+      <div className="relative h-72 w-full">
+        {error ? (
+          <p className="text-muted-foreground flex h-full items-center justify-center text-sm">{error}</p>
+        ) : (
+          <ChartContainer config={config} className="h-72 w-full">
+            <LineChart data={chartData} margin={{ left: 4, right: 8, top: 4 }}>
+              <CartesianGrid vertical={false} strokeDasharray="3 3" />
+              <XAxis
+                dataKey="date"
+                tickLine={false}
+                axisLine={false}
+                minTickGap={40}
+                tickFormatter={(v) => fmtDate(v)}
+              />
+              <YAxis
+                tickLine={false}
+                axisLine={false}
+                width={56}
+                domain={["auto", "auto"]}
+                tickFormatter={(v) => (indexed ? fmtNumber(Number(v), 0) : fmtCcy(Number(v), currency, 0))}
+                label={
+                  indexed
+                    ? { value: "Indexed (100 = start)", angle: -90, position: "insideLeft", className: "fill-muted-foreground text-xs" }
+                    : undefined
+                }
+              />
+              <ChartTooltip
+                content={
+                  <ChartTooltipContent
+                    labelFormatter={(v) => fmtDate(String(v))}
+                    formatter={(value, name) =>
+                      `${name}: ${indexed ? fmtNumber(Number(value)) : fmtCcy(Number(value), currency)}`
+                    }
+                  />
+                }
+              />
+              <Line dataKey="base" type="monotone" stroke="var(--chart-1)" dot={false} strokeWidth={2} />
+              {indexed ? (
+                <Line dataKey="compare" type="monotone" stroke="var(--chart-3)" dot={false} strokeWidth={2} />
+              ) : null}
+            </LineChart>
+          </ChartContainer>
+        )}
+        {loading ? <Skeleton className="absolute inset-0 z-10 rounded-lg" /> : null}
+        {!loading && !error && chartData.length === 0 ? (
+          <p className="text-muted-foreground bg-card absolute inset-0 z-10 flex items-center justify-center text-sm">
+            No price history for {symbol}.
+          </p>
+        ) : null}
+      </div>
     </div>
   );
 }

@@ -15,6 +15,7 @@ from database_command import (
     update_email_checkpoint,
     upload_email_transactions,
     upload_portfolio_classifications,
+    upload_statement_transactions,
     reconcile_email_transactions,
     reconcile_statement_activities,
     upload_security_metadata,
@@ -31,6 +32,62 @@ class DatabaseCommandTest(unittest.TestCase):
         self.addCleanup(database.close_connection)
         self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
         database.initialize_database(self.db_path)
+
+    def test_upload_statement_transactions_records_balance_regardless_of_ticker_resolution(self):
+        """
+        A statement line's trailing balance used to only survive ingestion
+        when the line had no resolved ticker (cash_transactions.balance);
+        BUY/SELL/DIV rows tied to a security went to `transactions`, which
+        has no `balance` column, silently discarding it. This exercises the
+        real write path (not a direct table insert) to confirm every line's
+        balance now lands in `statement_balances`, in original statement
+        order, regardless of which branch (cash vs. ticker) the transaction
+        itself took.
+        """
+        connection = database.get_shared_connection(self.db_path)
+        ticker_id = connection.execute(
+            """
+            INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+            VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock')
+            RETURNING ticker_id
+            """
+        ).fetchone()[0]
+
+        data = pd.DataFrame(
+            [
+                {
+                    "date": date(2026, 5, 14), "transaction": "FPLINT", "ticker_id": None,
+                    "quantity": None, "execDate": date(2026, 5, 14), "fx_rate": None,
+                    "debit": "0.00", "credit": "0.01", "balance": "21.73",
+                },
+                {
+                    "date": date(2026, 5, 21), "transaction": "BUY", "ticker_id": ticker_id,
+                    "quantity": "1", "execDate": date(2026, 5, 21), "fx_rate": None,
+                    "debit": "14.82", "credit": "0.00", "balance": "0.00",
+                },
+            ]
+        )
+
+        upload_statement_transactions(data, self.db_path)
+
+        rows = connection.execute(
+            "SELECT transaction_date, transaction_type, balance "
+            "FROM statement_balances ORDER BY statement_balance_id"
+        ).fetchall()
+        self.assertEqual(
+            rows,
+            [
+                (date(2026, 5, 14), "FPLINT", Decimal("21.73")),
+                (date(2026, 5, 21), "BUY", Decimal("0.00")),
+            ],
+        )
+
+        # transactions still has no balance column at all; this is the gap
+        # statement_balances exists to close.
+        transactions_columns = {
+            row[0] for row in connection.execute("DESCRIBE transactions").fetchall()
+        }
+        self.assertNotIn("balance", transactions_columns)
 
     def test_first_seen_etf_is_enriched_and_normalized(self):
         calls = []

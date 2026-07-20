@@ -10,7 +10,7 @@ import { TargetVsActual } from "@/components/portfolio/target-vs-actual";
 import { ConcentrationCard } from "@/components/portfolio/concentration-card";
 import { RealizedTable } from "@/components/tables/realized-table";
 import { getClassifications, getReport } from "@/lib/api";
-import { CURRENCY_COLORS, topWeights } from "@/lib/derive";
+import { canonicalSector, CURRENCY_COLORS, sectorColor, topWeights } from "@/lib/derive";
 import { fmtCad, fmtDate, fmtNumber, fmtPct, fmtSignedPct } from "@/lib/format";
 
 function pct(a: { available: boolean; reason?: string | null }, value: number, signed = false) {
@@ -37,8 +37,13 @@ export default async function PortfolioPage() {
     group: groupByTicker.get(h.ticker_id) ?? "Other",
   }));
 
+  // Same sector -> same hue as the /etfs stacks and the overview donut.
   const lookThrough = Object.entries(allocation.look_through_sector.weights ?? {})
-    .map(([label, weight]) => ({ label, weight }))
+    .map(([label, weight]) => ({
+      label: canonicalSector(label),
+      weight,
+      color: sectorColor(label),
+    }))
     .sort((a, b) => b.weight - a.weight)
     .slice(0, 12);
 

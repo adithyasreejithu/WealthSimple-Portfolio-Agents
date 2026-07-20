@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from imap_tools import AND, OR, MailBox
 
 from config import (
+    EMAIL_BODY_DATE_MAX_DRIFT_DAYS,
     EMAIL_OUTPUT_COLUMNS,
     EXPORT_FOLDER,
     INTERAC_SENDER,
@@ -88,11 +89,21 @@ def extract_wealthsimple_date(text: str) -> date | None:
 """
 Resolve the final output date using the agreed precedence: first the date
 found inside the email content, then the IMAP received date, and only then
-fall back to a blank value with a warning.
+fall back to a blank value with a warning. A body date implausibly far from
+the IMAP received date (e.g. a year-ambiguous match resolved by the date
+library's own default-year behavior) is distrusted and discarded in favor of
+the received date, since the received timestamp always comes straight from
+the mail server and cannot be misparsed the same way.
 """
 def resolve_email_date(parsed_date: date | None, received_date: date | None, source_name: str) -> date | str:
     if parsed_date is not None:
-        return parsed_date
+        drift_days = abs((parsed_date - received_date).days) if received_date is not None else 0
+        if drift_days <= EMAIL_BODY_DATE_MAX_DRIFT_DAYS:
+            return parsed_date
+        logger.warning(
+            "Discarding implausible %s email body date | parsed=%s | received=%s | drift_days=%d",
+            source_name, parsed_date, received_date, drift_days,
+        )
     if received_date is not None:
         logger.debug("Using received-date fallback for %s email", source_name)
         return received_date

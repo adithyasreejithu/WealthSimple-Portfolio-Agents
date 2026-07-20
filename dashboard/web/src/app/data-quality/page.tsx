@@ -3,7 +3,11 @@ export const dynamic = "force-dynamic";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { FlagsTable } from "@/components/tables/flags-table";
-import { getClassifications, getHealth, getReport } from "@/lib/api";
+import { ClassifyDialog } from "@/components/actions/classify-dialog";
+import { RefreshButtons } from "@/components/actions/refresh-buttons";
+import { ResolveTickerForm } from "@/components/actions/resolve-ticker-form";
+import { getClassifications, getHealth, getPendingTickers, getReport } from "@/lib/api";
+import { ASSIGNABLE_GROUPS } from "@/lib/derive";
 import { fmtDateTime, fmtNumber } from "@/lib/format";
 
 const SEVERITY_STYLE: Record<string, string> = {
@@ -13,10 +17,11 @@ const SEVERITY_STYLE: Record<string, string> = {
 };
 
 export default async function DataQualityPage() {
-  const [{ database_mtime, report }, classifications, health] = await Promise.all([
+  const [{ database_mtime, report }, classifications, health, pendingTickers] = await Promise.all([
     getReport(),
     getClassifications().catch(() => null),
     getHealth().catch(() => null),
+    getPendingTickers().catch(() => []),
   ]);
 
   const flags = report.data_quality.flags;
@@ -48,6 +53,19 @@ export default async function DataQualityPage() {
       </div>
 
       <Card>
+        <CardHeader className="flex-row items-center justify-between">
+          <CardTitle>Pipeline actions</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          <RefreshButtons />
+          <p className="text-muted-foreground text-xs">
+            Equivalent to <code>app.py portfolio-classify</code> + <code>classification-sync</code>{" "}
+            and <code>app.py pipeline</code>. One runs at a time.
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card>
         <CardHeader>
           <CardTitle>Data-quality flags</CardTitle>
         </CardHeader>
@@ -55,6 +73,21 @@ export default async function DataQualityPage() {
           <FlagsTable flags={flags} />
         </CardContent>
       </Card>
+
+      {pendingTickers.length ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Unresolved ticker symbols</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-muted-foreground text-sm">
+              These symbols block ingestion until they are mapped to a canonical and Yahoo
+              symbol. The symbol is verified before the mapping is saved.
+            </p>
+            <ResolveTickerForm pending={pendingTickers} />
+          </CardContent>
+        </Card>
+      ) : null}
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
@@ -87,17 +120,28 @@ export default async function DataQualityPage() {
             {review.length ? (
               <ul className="space-y-3 text-sm">
                 {review.map((c) => (
-                  <li key={c.ticker_id}>
-                    <div className="flex items-center gap-2">
-                      <span className="font-medium">{c.ticker_symbol}</span>
-                      <Badge variant="outline" className="font-normal capitalize">
-                        {c.confidence ?? "unknown"}
-                      </Badge>
+                  <li key={c.ticker_id} className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">{c.ticker_symbol}</span>
+                        <Badge variant="outline" className="font-normal capitalize">
+                          {c.confidence ?? "unknown"}
+                        </Badge>
+                      </div>
+                      {c.missing_data.length ? (
+                        <p className="text-muted-foreground text-xs">
+                          Missing: {c.missing_data.join(", ")}
+                        </p>
+                      ) : null}
+                      {c.reasoning ? (
+                        <p className="text-muted-foreground text-xs">{c.reasoning}</p>
+                      ) : null}
                     </div>
-                    {c.missing_data.length ? (
-                      <p className="text-muted-foreground text-xs">Missing: {c.missing_data.join(", ")}</p>
-                    ) : null}
-                    {c.reasoning ? <p className="text-muted-foreground text-xs">{c.reasoning}</p> : null}
+                    <ClassifyDialog
+                      ticker={c.ticker_symbol}
+                      groups={ASSIGNABLE_GROUPS}
+                      currentGroup={c.primary_group}
+                    />
                   </li>
                 ))}
               </ul>

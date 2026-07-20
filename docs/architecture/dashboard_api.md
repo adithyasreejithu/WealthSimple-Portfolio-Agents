@@ -1,6 +1,6 @@
 # Dashboard API
 
-The read-only FastAPI backend for the hosted dashboard — Phase 3 of the
+The FastAPI backend for the hosted dashboard — Phase 3 of the
 [development roadmap](../plans/goals/development-roadmap.md) ("minimal hosted
 view"), serving the [project vision](../plans/goals/project-vision.md)'s
 requirement of "open one place from my phone, anywhere, anytime." It is a thin
@@ -15,14 +15,18 @@ dashboard can never diverge from what the CLI reports.
 ┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
 │ email / statement /  │      │ FastAPI              │      │ Next.js + shadcn/ui  │
 │ yfinance ingestion   │ ───► │ dashboard/api/main.py│ ───► │ dashboard/web/       │
-│ writes DuckDB        │ DB   │ :8000, GET only      │ JSON │ :3000                │
-│ Data/*.duckdb        │ read │ wraps src/analytics  │      │ (server + client)    │
-└──────────────────────┘      └──────────────────────┘      └──────────────────────┘
+│ writes DuckDB        │ DB   │ :8000, GET data +    │ JSON │ :3000                │
+│ Data/*.duckdb        │ read │ guarded POST actions │      │ (server + client)    │
+└──────────────────────┘  ▲   └──────────────────────┘      └──────────────────────┘
+                          └── actions shell back out to src/app.py
 ```
 
 ## Design constraints
 
-- **Read-only.** The API never runs ingestion and never writes the database.
+- **Read-only data surface.** Every `GET` endpoint only reads; none of them
+  writes the database. The sole exception is the guarded `POST /api/actions/*`
+  namespace ([below](#website-initiated-actions)), which does not write
+  directly either — it runs the same CLI commands as a subprocess.
   If the DuckDB file does not exist at startup, the process raises and exits
   instead of letting `database.get_shared_connection` silently create an
   empty database.
@@ -46,7 +50,32 @@ dashboard can never diverge from what the CLI reports.
 | `GET /api/portfolio/trend` | Chronological portfolio value series | `analytics.get_historical_portfolio_values` | `[]`, 200 |
 | `GET /api/portfolio/report` | Full analytics report (see below) | `analytics.portfolio_report` | 503 with remediation detail when the database file is missing |
 | `GET /api/portfolio/classifications` | Per-holding classification detail (group, confidence, reasoning, evidence, review flag, enriched fields) | `analytics.get_classification_details` | `{generated_at: null, count: 0, review_count: 0, classifications: []}`, 200 |
+| `GET /api/etfs/overlap` | Share of the ETF sleeve held in underlying names more than one fund reports, plus per-pair overlap | `analytics.get_etf_overlap` | `{available: false, reason: ...}`, 200 |
 | `GET /api/stocks/{symbol}/history?range=` | One ticker's daily close series (`range` = `1m`/`3m`/`6m`/`1y`/`3y`/`max`) | `analytics.get_price_history` | 404 for unknown symbol; 422 for invalid range |
+
+## ETF overlap, and why it is a floor
+
+`GET /api/etfs/overlap` answers "how much of my ETF money is buying the same
+companies twice". It reads each fund's `top_holdings` from
+`portfolio_classifications.fields` and scales every position by that fund's
+share of the ETF sleeve, so the three returned shares — `overlapping_weight`
+(names at least two funds report), `unique_weight` (names only one fund
+reports), `unreported_weight` (the rest of each fund) — always sum to 1.
+
+Two limits are baked into the number and surfaced to the UI as `basis` and
+`caveat`:
+
+- Providers publish only each fund's **largest** positions (usually ten), so
+  funds can overlap further down their books than either one reports. The
+  result is a floor on true overlap, never an upper bound.
+- Those records store a **display name and weight but no ticker symbol**, so
+  matching is by normalized name (`_normalize_holding_name` strips a leading
+  "The" and trailing legal-form tokens, and deliberately keeps share-class
+  letters so Class A and Class B stay distinct).
+
+`pairs[].overlap_pct` is an overlap coefficient: for each shared name it takes
+the smaller of the two funds' weights and sums them. `available` is false with
+a `reason` when fewer than two funds report holdings.
 
 ## The report endpoint and the visual map
 
@@ -115,30 +144,64 @@ Pages and their primary data source:
 | `/` Overview | Value/book-cost/unrealized/cash KPIs, value trend with net-deposit + benchmark overlay toggles, sector donut, group cards vs target | `report.summary`, `.performance.historical_values`, `.performance.trend_overlays`, `.allocation`, `.targets` (+ classifications for per-group top holding) |
 | `/portfolio` | Tabs: Allocation (target-vs-actual, treemap, look-through, currency/geography, concentration), Performance (return/risk tiles, drawdown, benchmark), Costs & Activity (fees, turnover, realized) | `report.allocation`, `.performance`, `.fees`, `.activity`, `.realized_gains` |
 | `/stocks` | Sortable stock table + price explorer with benchmark compare | `report.holdings` (stocks) ⋈ `classifications`; `/api/stocks/{symbol}/history` |
-| `/etfs` | Blended MER, ETF table, underlying sector mix | `report.holdings` (ETFs) ⋈ `classifications` (`fields.expense_ratio`, `aum`, `sector_weights`) |
+| `/etfs` | Blended MER, ETF table, fund overlap, underlying sector mix | `report.holdings` (ETFs) ⋈ `classifications` (`fields.expense_ratio`, `aum`, `sector_weights`); `/api/etfs/overlap` |
 | `/income` | Yield KPIs, 36-month dividend bars + rolling average | `report.income` |
-| `/data-quality` | Severity summary, flags table, provisional holdings, review-needed classifications, unavailable metrics | `report.data_quality`, `.unavailable_metrics`, `classifications`, `/health` |
+| `/data-quality` | Severity summary, pipeline action buttons, flags table, unresolved symbols, provisional holdings, review-needed classifications (each with a Classify action), unavailable metrics | `report.data_quality`, `.unavailable_metrics`, `classifications`, `/api/tickers/pending`, `/health` |
 | `/holdings/[symbol]` | Shared stock/ETF detail: KPIs, price chart, classification, facts | `report.holdings` ⋈ `classifications`; `/api/stocks/{symbol}/history` |
 
 The frontend never computes portfolio math — it formats API values and does
 only presentation-layer derivations (blended MER, index-to-100 compare,
 group→color mapping) in `dashboard/web/src/lib/derive.ts`.
 
-## Future: website-initiated actions (designed, not built)
+## Website-initiated actions
 
-Phase 6 of the roadmap brings decision support into the hosted view and adds
-automation. When that happens, the API grows a `POST /api/actions/*`
-namespace — for example `POST /api/actions/ingest` (run the pipeline) and
-`POST /api/actions/evaluate/{ticker}` (invoke the stock-data-prep →
-stock-analyst flow). Constraints already decided for that work:
+`POST /api/actions/*` is the only part of the API that changes state. It
+exists so the fixes the dashboard already surfaces — a holding the classifier
+could not place, a symbol it could not map, data that needs a re-run — can be
+applied from the page that reports them. **Every action has a CLI equivalent
+and the CLI remains canonical**; these endpoints shell out to it rather than
+reimplementing anything.
 
-- Action endpoints arrive **after** the single-user auth gate, never before.
-- They run as background jobs with a status endpoint — a request never blocks
-  on ingestion or an agent run.
-- CORS `allow_methods` widens from `["GET"]` to include `POST` only then; the
-  GET surface stays read-only.
-- No new cache plumbing is needed: an ingestion trigger rewrites the DuckDB
-  file, which invalidates the report cache automatically.
+| Endpoint | Does | CLI equivalent |
+| --- | --- | --- |
+| `POST /api/actions/classify` | Re-run classification and sync it into DuckDB | `app.py portfolio-classify` + `classification-sync` |
+| `POST /api/actions/refresh` | Run the full ingestion pipeline | `app.py pipeline` |
+| `POST /api/actions/overrides` | Pin a ticker to a group, then re-classify | edit `ref/manual_overrides_v1_1.yaml`, then the two commands above |
+| `POST /api/actions/resolve-ticker` | Map a pending source symbol to a verified symbol | `app.py resolve-tickers` (interactive) |
+| `GET /api/tickers/pending` | Source symbols still blocking ingestion | `app.py ticker-map pending` |
+| `GET /api/actions` / `GET /api/actions/{job_id}` | Recent jobs / one job's status | — |
+
+### Constraints this surface honors
+
+- **Auth gate first.** `require_action_auth` runs on every action. With
+  `DASHBOARD_ACTION_TOKEN` set it requires a matching bearer token (the mode
+  to use if the API is ever bound to a non-loopback interface); unset, it
+  accepts loopback callers only. The GET surface is unauthenticated as before.
+- **Never blocks.** Actions return `202` with a job (`dashboard/api/jobs.py`)
+  that the frontend polls. `409` means another job is already running.
+- **One writer.** DuckDB permits a single read-write process. A single-worker
+  executor plus the one-job-at-a-time rule keeps actions serialized, `_db_lock`
+  serializes the API's own database use, and a writer subprocess only starts
+  after `database.close_connection()` releases the file. **Run one uvicorn
+  worker** — job state is in-process.
+- **CORS** `allow_methods` is `["GET", "POST"]`; POST is only routed under
+  `/api/actions/*`.
+- **No new cache plumbing.** A writer rewrites the DuckDB file, whose mtime
+  invalidates the report cache automatically.
+
+### Writing the override YAML
+
+`POST /api/actions/overrides` is the one action that edits a
+`Knowledge-Base/ref/*.yaml` reference file. `src/manual_overrides.py` validates
+the group against `approved_groups` (rejecting `Cash`/`Needs Review`), requires
+a rationale, splices the entry as text so the rest of the hand-curated document
+stays byte-identical, re-parses before committing, and replaces the file
+atomically. This is an **owner-initiated** edit that happens to arrive over
+HTTP — distinct from the CLAUDE.md rule that knowledge-base *agents* never
+edit `ref/*.yaml`.
+
+Still unbuilt: `POST /api/actions/evaluate/{ticker}` (the stock-data-prep →
+stock-analyst flow), which would follow the same job model.
 
 ## Configuration
 
@@ -146,6 +209,9 @@ stock-analyst flow). Constraints already decided for that work:
 | --- | --- | --- |
 | `DB_PATH` | `Data/PRD_WealthSimple.duckdb` | DuckDB file to serve (via `src/config.py`) |
 | `DASHBOARD_CORS_ORIGINS` | `http://localhost:3000` | Comma-separated allowed browser origins |
+| `DASHBOARD_ACTION_TOKEN` | unset | Bearer token required for `POST /api/actions/*`; unset means loopback-only |
+
+The frontend sends that token as `NEXT_PUBLIC_ACTION_TOKEN` when it is set.
 
 ## Running locally
 

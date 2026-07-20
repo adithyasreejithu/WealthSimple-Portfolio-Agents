@@ -199,6 +199,64 @@ class ListPendingTest(unittest.TestCase):
         self.assertEqual(by_symbol["XNDU"]["trade_count"], 1)
         self.assertEqual(by_symbol["XNDU"]["first_seen"], date(2026, 6, 19))
 
+    def test_list_pending_flags_already_mapped_symbol(self):
+        connection = database.get_shared_connection(self.db_path)
+        ticker_id = int(
+            connection.execute(
+                "INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type) "
+                "VALUES ('XNDU', 'TSX', 'CAD', 'Test Fund', 'etf') RETURNING ticker_id"
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "INSERT INTO ticker_symbol_history (ticker_id, source_symbol, provider_symbol, "
+            "currency, exchange, reason, mapping_source, created_by) "
+            "VALUES (?, 'XNDU', 'XNDU.TO', 'CAD', 'TSX', 'resolved pending ticker', 'manual', 'user')",
+            [ticker_id],
+        )
+        batch_id = int(
+            connection.execute(
+                "INSERT INTO ingestion_batches (status) VALUES ('resolved') RETURNING batch_id"
+            ).fetchone()[0]
+        )
+        staged_file_id = int(
+            connection.execute(
+                "INSERT INTO staged_files (batch_id, source_type, source_path, source_hash, "
+                "file_sequence, status) VALUES (?, 'export', 'export.csv', 'hash', 1, 'quarantined') "
+                "RETURNING staged_file_id",
+                [batch_id],
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "INSERT INTO staged_records (staged_file_id, record_sequence, transaction_date, "
+            "source_symbol, price_currency, resolution_status, raw_payload, normalized_payload) "
+            "VALUES (?, 1, ?, 'XNDU', 'CAD', 'unresolved', '{}', '{}')",
+            [staged_file_id, date(2026, 6, 19)],
+        )
+
+        pending = ticker_mapping.list_pending(self.db_path)
+        by_symbol = {item["source_symbol"]: item for item in pending}
+
+        self.assertTrue(by_symbol["XNDU"]["already_mapped"])
+        self.assertEqual(by_symbol["XNDU"]["mapping"], {
+            "canonical_symbol": "XNDU", "provider_symbol": "XNDU.TO",
+            "currency": "CAD", "exchange": "TSX",
+        })
+
+    def test_list_pending_marks_unmapped_symbol_not_already_mapped(self):
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO email_transactions (transaction_type, transaction_date, "
+            "source_symbol, price_currency, ticker_resolution_status) "
+            "VALUES ('Market Buy', ?, 'MDA', 'CAD', 'pending')",
+            [date(2026, 6, 19)],
+        )
+
+        pending = ticker_mapping.list_pending(self.db_path)
+        by_symbol = {item["source_symbol"]: item for item in pending}
+
+        self.assertFalse(by_symbol["MDA"]["already_mapped"])
+        self.assertIsNone(by_symbol["MDA"]["mapping"])
+
     def test_list_pending_excludes_email_deposit_placeholder(self):
         connection = database.get_shared_connection(self.db_path)
         connection.execute(

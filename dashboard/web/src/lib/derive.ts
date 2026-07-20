@@ -9,11 +9,45 @@ import type { ClassificationDetail, PriceHistory, WeightMap } from "./types";
 // neutral slot handled by the caller.
 export const GROUP_COLORS: Record<string, string> = {
   Core: "var(--chart-1)",
-  Growth: "var(--chart-2)",
-  Quality: "var(--chart-3)",
-  Income: "var(--chart-4)",
+  Quality: "var(--chart-2)",
+  Income: "var(--chart-3)",
+  Growth: "var(--chart-4)",
   Alternatives: "var(--chart-5)",
 };
+
+// Canonical policy order for the strategy groups, mirroring the allocation
+// targets in Knowledge-Base/ref/policy_v1_1.yaml (Core 60 / Quality 15 /
+// Income 15 / Growth 10 / Alternatives 5). Display order is fixed so a group
+// never moves as market values shift; operational buckets sort last.
+export const GROUP_ORDER = [
+  "Core",
+  "Quality",
+  "Income",
+  "Growth",
+  "Alternatives",
+  "Cash",
+  "Needs Review",
+];
+
+// Groups a holding can actually be pinned to from the UI. Mirrors
+// `manual_overrides.assignable_groups` on the API side, which is the authority
+// -- a mismatch here is rejected there with a 422 rather than silently saved.
+export const ASSIGNABLE_GROUPS = ["Core", "Quality", "Income", "Growth", "Alternatives"];
+
+export function groupRank(group: string): number {
+  const index = GROUP_ORDER.indexOf(group);
+  return index === -1 ? GROUP_ORDER.length : index;
+}
+
+/** Sort by canonical group order, keeping unranked groups last and alphabetical. */
+export function sortByGroupOrder<T>(items: T[], key: (item: T) => string): T[] {
+  return [...items].sort((a, b) => {
+    const groupA = key(a);
+    const groupB = key(b);
+    const rankDelta = groupRank(groupA) - groupRank(groupB);
+    return rankDelta !== 0 ? rankDelta : groupA.localeCompare(groupB);
+  });
+}
 
 export const CHART_SLOTS = [
   "var(--chart-1)",
@@ -36,6 +70,65 @@ export const CURRENCY_COLORS: Record<string, string> = {
 
 export function groupColor(group: string): string {
   return GROUP_COLORS[group] ?? OTHER_COLOR;
+}
+
+// Sector labels arrive in two vocabularies: yfinance fund keys on an ETF's
+// `fields.sector_weights` (snake_case) and stock_details display names on
+// `allocation.by_sector` (Title Case). Both fold to one canonical label so a
+// sector keeps the same hue in every ETF stack and every donut. Mirrors
+// `_ETF_SECTOR_LABELS` in src/analytics.py.
+const SECTOR_ALIASES: Record<string, string> = {
+  realestate: "Real Estate",
+  real_estate: "Real Estate",
+  basic_materials: "Basic Materials",
+  consumer_cyclical: "Consumer Cyclical",
+  consumer_defensive: "Consumer Defensive",
+  financial_services: "Financial Services",
+  financials: "Financial Services",
+  communication_services: "Communication Services",
+  technology: "Technology",
+  healthcare: "Healthcare",
+  utilities: "Utilities",
+  industrials: "Industrials",
+  energy: "Energy",
+};
+
+export function canonicalSector(label: string): string {
+  const key = label.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (SECTOR_ALIASES[key]) return SECTOR_ALIASES[key];
+  return label
+    .trim()
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// The palette is a fixed eight slots, so the eight sectors that carry real
+// weight in this portfolio get a pinned hue and the long tail shares the
+// neutral. Labels always accompany the swatch, so identity is never
+// color-alone for the folded sectors.
+export const SECTOR_COLORS: Record<string, string> = {
+  Technology: "var(--chart-1)",
+  "Financial Services": "var(--chart-2)",
+  Healthcare: "var(--chart-3)",
+  "Consumer Cyclical": "var(--chart-4)",
+  Industrials: "var(--chart-5)",
+  "Communication Services": "var(--chart-6)",
+  Energy: "var(--chart-7)",
+  "Consumer Defensive": "var(--chart-8)",
+};
+
+export function sectorColor(label: string): string {
+  return SECTOR_COLORS[canonicalSector(label)] ?? OTHER_COLOR;
+}
+
+/** Pinned color map for `topWeights`, keyed by the labels as they arrive. */
+export function sectorPins(labels: string[]): Record<string, string> {
+  const pins: Record<string, string> = {};
+  for (const label of labels) {
+    const color = SECTOR_COLORS[canonicalSector(label)];
+    if (color) pins[label] = color;
+  }
+  return pins;
 }
 
 /** Assign colors to an ordered set of category labels, folding extras to Other. */

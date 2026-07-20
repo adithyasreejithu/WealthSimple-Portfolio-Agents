@@ -502,6 +502,43 @@ def normalize_ticker_dataframe(
     return normalized
 
 
+def record_statement_balance(
+    connection: Any,
+    transaction_date: str | date | None,
+    transaction_type: str,
+    balance: Decimal | None,
+) -> None:
+    """Record one statement line's trailing balance, deduplicated by content.
+
+    Independent of ticker resolution by design -- every statement line
+    states a balance regardless of whether it resolved to a ticker, and this
+    table exists precisely so a BUY/SELL/DIV row's balance is never silently
+    dropped the way `transactions` (no `balance` column) drops it. Shared
+    between `upload_statement_transactions` (the normal ingestion path) and
+    the one-off `statement_balances` backfill for already-archived PDFs
+    (see `docs/architecture/ingestion_and_reconciliation.md`), so both stay
+    in lockstep with the same dedup rule.
+    """
+    if balance is None or transaction_date is None:
+        return
+    duplicate = connection.execute(
+        """
+        SELECT 1 FROM statement_balances
+        WHERE transaction_date = ? AND transaction_type = ? AND balance = ?
+        """,
+        [transaction_date, transaction_type, balance],
+    ).fetchone()
+    if duplicate is not None:
+        return
+    connection.execute(
+        """
+        INSERT INTO statement_balances (transaction_date, transaction_type, balance)
+        VALUES (?, ?, ?)
+        """,
+        [transaction_date, transaction_type, balance],
+    )
+
+
 def upload_statement_transactions(
     data: pd.DataFrame,
     db_path: Path | str = DATABASE_PATH,
@@ -538,8 +575,9 @@ def upload_statement_transactions(
             fx_count += 1
             fx_exposure += cad_amount
             estimated_fx_fees += estimate_wealthsimple_fx_fee_cad(kind, cad_amount)
+        balance = _decimal(row.get("balance"))
+        record_statement_balance(connection, transaction_date, transaction_type, balance)
         if ticker_id is None or pd.isna(ticker_id):
-            balance = _decimal(row.get("balance"))
             cash_values = [
                 transaction_date,
                 transaction_type,
