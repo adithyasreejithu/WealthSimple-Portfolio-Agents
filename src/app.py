@@ -37,7 +37,7 @@ from database_command import (
 from analytics import portfolio_report
 from email_extractor import fetch_email_transactions
 from holdings_reconciler import format_report, reconcile_holdings
-from market_data import sync_market_data
+from market_data import sync_earnings_dividends, sync_financial_snapshots, sync_market_data
 from position_engine import ensure_positions_fresh, recompute_positions
 from statement_extractor import extract_statement_pdf
 from staging import (
@@ -52,6 +52,9 @@ logger = get_logger(__name__)
 SUPPORTED_DATA_SUFFIXES = frozenset({".csv", ".pdf", ".xlsx", ".xls"})
 CLASSIFY_SKILL_SCRIPTS = (
     Path(__file__).resolve().parents[1] / ".claude" / "skills" / "classify-portfolio" / "scripts"
+)
+BOOTSTRAP_SKILL_SCRIPTS = (
+    Path(__file__).resolve().parents[1] / ".claude" / "skills" / "bootstrap-stock-research" / "scripts"
 )
 
 
@@ -716,6 +719,25 @@ def _print_root_help() -> None:
     commands.add_parser(
         "yfinance-sync", help="Synchronize owned ticker market data to DuckDB."
     )
+    commands.add_parser(
+        "earnings-dividends", help="Fetch company-declared earnings and dividend calendars."
+    )
+    commands.add_parser(
+        "earnings-dividends-sync",
+        help="Synchronize owned tickers' earnings/dividend calendars to DuckDB.",
+    )
+    commands.add_parser(
+        "financial-snapshots", help="Fetch per-quarter company financial statement data."
+    )
+    commands.add_parser(
+        "financial-snapshots-sync",
+        help="Synchronize owned tickers' per-quarter financial statement data to DuckDB.",
+    )
+    commands.add_parser(
+        "annual-financial-context",
+        help="Fetch one ticker's annual financial statements as ephemeral "
+             "first-run KB context (not persisted).",
+    )
     commands.add_parser("ticker-map", help="Manage ticker mappings.")
     commands.add_parser(
         "resolve-tickers",
@@ -1048,6 +1070,9 @@ def _run_delegated_command(command: str, argv: list[str]) -> int:
         "statements": ("statement_extractor", "main"),
         "email": ("email_extractor", "main"),
         "yfinance": ("yfinance_extractor", "main"),
+        "earnings-dividends": ("earnings_dividends_extractor", "main"),
+        "financial-snapshots": ("financial_snapshots_extractor", "main"),
+        "annual-financial-context": ("annual_financial_context", "main"),
         "ticker-map": ("ticker_mapping", "main"),
         "import-activities": ("data_sorter", "main"),
         "portfolio-classify": ("classify_portfolio", "main"),
@@ -1057,6 +1082,10 @@ def _run_delegated_command(command: str, argv: list[str]) -> int:
         # The classification workflow and its helper modules live beside the
         # classify-portfolio skill, not in src/, so expose them for import.
         sys.path.insert(0, str(CLASSIFY_SKILL_SCRIPTS))
+    elif command == "annual-financial-context":
+        # The bootstrap-stock-research skill's scripts live beside the skill,
+        # not in src/, so expose them for import.
+        sys.path.insert(0, str(BOOTSTRAP_SKILL_SCRIPTS))
     module = __import__(module_name, fromlist=[function_name])
     command_main = getattr(module, function_name)
     try:
@@ -1089,6 +1118,56 @@ def _run_yfinance_sync_command(argv: list[str]) -> int:
         f"yfinance: {'succeeded' if result.succeeded else 'failed'} "
         f"({result.rows} row(s), {result.tickers} ticker(s), "
         f"{result.skipped} skipped){error_text}"
+    )
+    return 0 if result.succeeded else 1
+
+
+def _run_earnings_dividends_sync_command(argv: list[str]) -> int:
+    """Synchronize owned tickers' company-declared earnings/dividend calendars into DuckDB."""
+    parser = argparse.ArgumentParser(
+        description="Synchronize company-declared earnings and dividend calendars into DuckDB."
+    )
+    parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    parser.add_argument(
+        "--tickers",
+        nargs="+",
+        help="Optionally limit synchronization to canonical or Yahoo symbols.",
+    )
+    parser.add_argument("--skip-earnings", action="store_true", help="Skip the earnings calendar sync.")
+    parser.add_argument("--skip-dividends", action="store_true", help="Skip the dividend schedule sync.")
+    args = parser.parse_args(argv)
+    result = sync_earnings_dividends(
+        args.database,
+        args.tickers,
+        skip_earnings=args.skip_earnings,
+        skip_dividends=args.skip_dividends,
+    )
+    error_text = f" - {result.error}" if result.error else ""
+    print(
+        f"earnings-dividends: {'succeeded' if result.succeeded else 'failed'} "
+        f"({result.earnings_rows} earnings row(s), {result.dividend_rows} dividend row(s), "
+        f"{result.tickers} ticker(s)){error_text}"
+    )
+    return 0 if result.succeeded else 1
+
+
+def _run_financial_snapshots_sync_command(argv: list[str]) -> int:
+    """Synchronize owned tickers' per-quarter financial statement data into DuckDB."""
+    parser = argparse.ArgumentParser(
+        description="Synchronize per-quarter company financial statement data into DuckDB."
+    )
+    parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    parser.add_argument(
+        "--tickers",
+        nargs="+",
+        help="Optionally limit synchronization to canonical or Yahoo symbols.",
+    )
+    args = parser.parse_args(argv)
+    result = sync_financial_snapshots(args.database, args.tickers)
+    error_text = f" - {result.error}" if result.error else ""
+    print(
+        f"financial-snapshots: {'succeeded' if result.succeeded else 'failed'} "
+        f"({result.snapshot_rows} row(s), {result.tickers} ticker(s)){error_text}"
     )
     return 0 if result.succeeded else 1
 
@@ -1153,6 +1232,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_analytics_command(raw_args[1:])
     if raw_args and raw_args[0] == "yfinance-sync":
         return _run_yfinance_sync_command(raw_args[1:])
+    if raw_args and raw_args[0] == "earnings-dividends-sync":
+        return _run_earnings_dividends_sync_command(raw_args[1:])
+    if raw_args and raw_args[0] == "financial-snapshots-sync":
+        return _run_financial_snapshots_sync_command(raw_args[1:])
     if raw_args and raw_args[0] == "classification-sync":
         return _run_classification_sync_command(raw_args[1:])
     if raw_args and raw_args[0] == "resolve-tickers":
@@ -1164,7 +1247,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Delegate to module entry points so each command keeps one argument contract.
     delegated_commands = {
-        "statements", "email", "yfinance", "ticker-map", "import-activities", "portfolio-classify"
+        "statements", "email", "yfinance", "earnings-dividends", "financial-snapshots",
+        "annual-financial-context", "ticker-map", "import-activities", "portfolio-classify"
     }
     if raw_args and raw_args[0] in delegated_commands:
         return _run_delegated_command(raw_args[0], raw_args[1:])

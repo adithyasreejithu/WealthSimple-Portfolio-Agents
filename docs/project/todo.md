@@ -12,6 +12,45 @@
 
 ## Backlog
 
+- Define the KB required-fields schema (what must be populated per stock
+  page/ticker before it counts as "done", including validated
+  `tickers:`/`tags:` accuracy per the KB population system's decision #8)
+  once the agent rebuild in `docs/plans/kb-population-agent-rebuild.md` is
+  far enough along to know what's actually needed in practice, rather than
+  designing it up front. A prior version already exists archived at
+  `.claude/skills/_archive/kb-update-thesis/references/thesis-contract.md`
+  — restore and update that against decisions #7-#18 when this comes up,
+  rather than starting from scratch.
+
+- Add a dashboard "upcoming earnings" view once `earnings_events`/
+  `dividend_events` tables exist in the pipeline database (see
+  `docs/plans/` KB population system scope): API endpoint + calendar/chart
+  surfacing upcoming report dates with consensus EPS/revenue estimates, and
+  a yearly rollup estimate. Dashboard-facing only — the underlying pull and
+  storage is pipeline work, not a dashboard concern.
+
+- Restrict `earnings-dividends-sync` to equities only: currently pulls
+  earnings and dividend data for both stocks and ETFs, but the decision
+  rubric only scores equities (ETFs use a different set of fund-appropriate
+  dimensions). Filter out fund tickers at sync time to avoid unnecessary
+  yfinance calls and database rows for tickers that will never be scored or
+  displayed in the analyst's worksheet.
+
+- Add a dashboard "financials trend" view once a `financial_snapshots`
+  table exists in the pipeline database (see
+  `docs/plans/financial-snapshots-pipeline.md`): API endpoint + chart(s)
+  surfacing revenue/margin/EPS trends over time per held ticker.
+  Dashboard-facing only — the underlying pull and storage is pipeline work,
+  not a dashboard concern.
+
+- Revisit a persisted `insider_events`-style table once `earnings_events`/
+  `dividend_events`/`financial_snapshots` have proven out in practice. The
+  rubric's `insider_activity` dimension reads `derived:net_insider_shares`,
+  recomputed fresh from yfinance every analysis run with no history kept —
+  same root problem financials had before `financial_snapshots`, but
+  deliberately not built alongside it to avoid standing up three new tables
+  in one pass before the first two are validated in use.
+
 - Implement technical analysis for the stock decision-support system per the
   proposed plan in `docs/plans/stock-decision-support-technical-analysis.md`
   (awaiting approval): new `analyze-stock-technicals` skill computing
