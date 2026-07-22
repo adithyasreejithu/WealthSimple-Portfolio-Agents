@@ -87,6 +87,99 @@ completed Wealthsimple ingestion batch; it is returned as a failed pipeline
 partial pipeline result for retry through `yfinance-sync`. One failed Yahoo symbol
 does not prevent successful symbols from being committed.
 
+## Earnings & Dividends Calendars
+
+Two reference tables hold company-declared market data pulled from yfinance:
+`earnings_events` (earnings calendar keyed by `(ticker_id, report_date)` with
+`eps_estimate`, `eps_actual`, `surprise_pct`) and `dividend_events` (declared
+dividend schedule keyed by `(ticker_id, ex_dividend_date)` with
+`declared_amount`). `Surprise(%)` is stored exactly as yfinance returns it
+(already in percentage points, verified against live held tickers). Columns
+`earnings_events.period`/`revenue_estimate`/`revenue_actual` and
+`dividend_events.pay_date`/`frequency` exist but stay `NULL` in v1 — yfinance's
+`earnings_dates`/`dividends` calls do not carry them at the needed granularity.
+
+This is company-declared reference data, **completely distinct** from
+`cash_transactions`/`transactions`, which record the user's own received
+dividend cash from brokerage statements. The two must never be joined,
+implicitly merged, or conflated; `dividend_events` has no relationship to
+position/holdings math.
+
+Scope is the same owned + verified-Yahoo-mapping ticker set as the OHLCV sync
+(`get_market_targets`). Unlike OHLCV history, there is no incremental date
+window: every `earnings-dividends-sync` run re-fetches each ticker's full
+available window and reconciles it against stored rows in one transaction.
+Dividends upsert on `(ticker_id, ex_dividend_date)`. Earnings upsert on
+`(ticker_id, report_date)`, and before each ticker's freshly fetched batch is
+inserted, still-unreported future rows (`report_date >= CURRENT_DATE AND
+eps_actual IS NULL`) are deleted so an estimate that gains an actual updates in
+place and an abandoned/revised speculative date is retired; confirmed past rows
+are never deleted. ETF/fund tickers legitimately return no earnings events and
+are not treated as failures.
+
+## Financial Snapshots
+
+`financial_snapshots` holds per-quarter company financial statement data
+pulled from yfinance's `quarterly_income_stmt`/`quarterly_balance_sheet`/
+`quarterly_cashflow`, keyed by `(ticker_id, period_end_date)`. It is a hybrid
+schema: named, typed columns (`revenue`, `net_income`, `eps`, `gross_margin`,
+`operating_margin`, `debt_to_equity`, `current_ratio`, `free_cash_flow`) exist
+only for the fields `Knowledge-Base/taxonomy/decision-rubric.yml`'s
+`derived:*` evidence already scores against (plus revenue/EPS/margins as
+first-class columns), and one `extra JSON` column carries every other line
+item either statement returns (total assets, R&D, SG&A, industry-specific
+lines like a bank's net interest income, etc.), so a new ratio never requires
+its own migration. Figures are stored exactly as yfinance reports them in the
+ticker's `financial_currency` — no FX conversion here (see
+`portfolio_metrics.py`/`analytics.py` for that).
+
+Named-column values come from an alias-list lookup (e.g. `Total Revenue`,
+`TotalRevenue`, `Revenue` are all tried in order for `revenue`), since line
+items vary by yfinance version and industry — confirmed live: a bank's
+balance sheet (e.g. `JPM`) has no `Current Assets`/`Current Liabilities`
+split at all, so `current_ratio` is legitimately `NULL` for banks while
+`debt_to_equity` still computes; this is intentional, not a fetch failure.
+`free_cash_flow` prefers yfinance's own direct `Free Cash Flow` row (present
+for every equity checked live) and falls back to `operating_cash_flow +
+capital_expenditure` when absent — confirmed live that `Capital Expenditure`
+is stored negative-as-outflow, so this fallback is addition, not subtraction.
+
+**Update semantics deliberately differ from `dividend_events`/
+`earnings_events`.** A row here is a **plain upsert on `(ticker_id,
+period_end_date)`** with no delete-before-insert step: quarterly figures can
+legitimately restate after the fact (reclassifications,
+discontinued-operations restatement, vendor data corrections), so
+overwriting a stored row in place with newly fetched figures is the correct
+and desired behavior, not a bug. Unlike `earnings_events`' speculative
+future rows, a `period_end_date` can never be forward-looking (a snapshot
+cannot exist before its period has ended and been reported), so there is
+nothing to retire the way `upload_earnings_events` does.
+
+Scope is the same owned + verified-Yahoo-mapping ticker set as the OHLCV and
+earnings/dividends syncs (`get_market_targets`). Like earnings/dividends,
+there is no incremental date window — yfinance's quarterly statement calls
+return whatever trailing window is currently available (confirmed live:
+roughly 5 quarters for the income statement, 6-7 for the balance
+sheet/cash flow — not perfectly aligned across the three, so a period
+present in only one or two statements still produces a row with the other
+statement's named columns `NULL`), and every `financial-snapshots-sync` run
+re-fetches and upserts that window. **This means the table only slowly
+accumulates real year-over-year trend depth as repeated syncs run over
+time** — a single sync never backfills years of history the way yfinance
+itself never exposes it. ETF/fund tickers legitimately return empty
+statements (confirmed live for `CDZ.TO`) and are not treated as failures.
+This sync is not auto-triggered by the pipeline (same as
+earnings/dividends); run it on demand.
+
+A future rubric change (via the `author-decision-rubric` skill) may upgrade
+`decision-rubric.yml`'s `derived:*` financial metrics to read trend-aware
+figures from this table instead of a fresh per-run yfinance pull — out of
+scope for the change that introduced this table.
+
+Unlike the OHLCV sync, this is **not** part of the automatic post-email sync —
+it runs on demand only via the `earnings-dividends-sync` CLI command (see
+`docs/reference/cli.md`), before a knowledge-base pass or dashboard refresh.
+
 ## Implementation Metadata
 
 Database foundation implementation model: 5.5 Medium.

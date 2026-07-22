@@ -37,6 +37,15 @@ skills:
 |---|---|
 | `evaluate-stock-decision` | Score the worksheet and validate the recommendation (`validate_recommendation.py`, and the rubric/worksheet contracts). |
 
+## First-run annual context (decision #9)
+
+On a ticker's first-ever run, `stock-data-prep` hands over an
+`annual-financial-context.v1` JSON (a couple of years of annual statements the
+shallow quarterly window can't yet provide). The analyst uses it **only** as
+narrative background for the initial `company_overview` / `original_thesis` —
+it is never a scored gate or dimension, never cited as evidence, and never
+persisted. On an incremental run there is no such context.
+
 ## The rubric it applies
 
 `Knowledge-Base/taxonomy/decision-rubric.yml` — hard gates, weighted 1-5

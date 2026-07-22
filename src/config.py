@@ -21,7 +21,7 @@ LOG_FOLDER = BASE_DIR / "logs"
 DATABASE_PATH = Path(
     os.getenv("DB_PATH", str(DATA_FOLDER / "PRD_WealthSimple.duckdb"))
 ).expanduser()
-DATABASE_SCHEMA_VERSION = 11
+DATABASE_SCHEMA_VERSION = 13
 
 """
 Financial analytics assumptions. Keep business constants here so calculations

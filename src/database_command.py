@@ -340,6 +340,178 @@ def upload_security_history(
     return written
 
 
+def upload_dividend_events(
+    data: pd.DataFrame,
+    ticker_ids: dict[str, int],
+    db_path: Path | str = DATABASE_PATH,
+) -> int:
+    """Upsert company-declared dividend events by provider symbol and ex-date.
+
+    Market data (the company's declared dividend schedule), distinct from
+    `cash_transactions`/`transactions` (the user's own received dividend cash).
+    Mirrors `upload_security_history`'s upsert convention -- rows missing a
+    ticker mapping, ex-dividend date, or declared amount are rejected rather
+    than silently dropped.
+    """
+    connection = get_shared_connection(db_path)
+    written = 0
+    for row in data.to_dict(orient="records"):
+        provider_symbol = _text(row.get("ProviderSymbol") or row.get("Ticker")).upper()
+        ticker_id = ticker_ids.get(provider_symbol)
+        ex_dividend_date = _optional_date(row.get("ExDividendDate"))
+        declared_amount = _optional_decimal(row.get("DeclaredAmount"))
+        if ticker_id is None:
+            raise ValueError(f"No ticker_id mapping for yfinance symbol {provider_symbol}")
+        if not ex_dividend_date or declared_amount is None:
+            raise ValueError(
+                f"Incomplete dividend event row for {provider_symbol or 'unknown'}"
+            )
+        connection.execute(
+            """
+            INSERT INTO dividend_events (ticker_id, ex_dividend_date, declared_amount)
+            VALUES (?, ?, ?)
+            ON CONFLICT (ticker_id, ex_dividend_date) DO UPDATE SET
+                declared_amount = excluded.declared_amount,
+                fetched_at = now()
+            """,
+            [ticker_id, ex_dividend_date, declared_amount],
+        )
+        written += 1
+    return written
+
+
+def upload_earnings_events(
+    data: pd.DataFrame,
+    ticker_ids: dict[str, int],
+    db_path: Path | str = DATABASE_PATH,
+) -> int:
+    """Upsert company-declared earnings events, retiring superseded estimates.
+
+    For each ticker present in the fetched batch, first delete any existing
+    still-unreported future rows (`report_date >= CURRENT_DATE AND
+    eps_actual IS NULL`) so an abandoned/revised speculative report date does
+    not linger, then upsert every freshly fetched row. An estimate that later
+    gains an actual reported value updates its existing row via
+    `ON CONFLICT DO UPDATE` (same PK) rather than duplicating; confirmed past
+    rows are never deleted, only upserted.
+    """
+    connection = get_shared_connection(db_path)
+    prepared: list[tuple[int, str, Decimal | None, Decimal | None, Decimal | None]] = []
+    batch_ticker_ids: set[int] = set()
+    for row in data.to_dict(orient="records"):
+        provider_symbol = _text(row.get("ProviderSymbol") or row.get("Ticker")).upper()
+        ticker_id = ticker_ids.get(provider_symbol)
+        report_date = _optional_date(row.get("ReportDate"))
+        if ticker_id is None:
+            raise ValueError(f"No ticker_id mapping for yfinance symbol {provider_symbol}")
+        if not report_date:
+            raise ValueError(
+                f"Incomplete earnings event row for {provider_symbol or 'unknown'}"
+            )
+        prepared.append(
+            (
+                ticker_id,
+                report_date,
+                _optional_decimal(row.get("EpsEstimate")),
+                _optional_decimal(row.get("EpsActual")),
+                _optional_decimal(row.get("SurprisePct")),
+            )
+        )
+        batch_ticker_ids.add(ticker_id)
+
+    for ticker_id in batch_ticker_ids:
+        connection.execute(
+            "DELETE FROM earnings_events "
+            "WHERE ticker_id = ? AND report_date >= CURRENT_DATE AND eps_actual IS NULL",
+            [ticker_id],
+        )
+
+    written = 0
+    for ticker_id, report_date, eps_estimate, eps_actual, surprise_pct in prepared:
+        connection.execute(
+            """
+            INSERT INTO earnings_events (
+                ticker_id, report_date, eps_estimate, eps_actual, surprise_pct
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (ticker_id, report_date) DO UPDATE SET
+                eps_estimate = excluded.eps_estimate,
+                eps_actual = excluded.eps_actual,
+                surprise_pct = excluded.surprise_pct,
+                fetched_at = now()
+            """,
+            [ticker_id, report_date, eps_estimate, eps_actual, surprise_pct],
+        )
+        written += 1
+    return written
+
+
+def upload_financial_snapshots(
+    data: pd.DataFrame,
+    ticker_ids: dict[str, int],
+    db_path: Path | str = DATABASE_PATH,
+) -> int:
+    """Upsert per-quarter financial statement snapshots by provider symbol and period.
+
+    Unlike dividend_events'/earnings_events' immutable-ex-date/speculative-row
+    semantics, a row here can legitimately be overwritten in place: quarterly
+    figures can restate after the fact (reclassifications,
+    discontinued-operations restatement, vendor data corrections), so a plain
+    `ON CONFLICT DO UPDATE` is the correct and desired behavior -- a
+    period_end_date is never a forward-looking or speculative row, so there
+    is nothing to retire the way `upload_earnings_events` does. Rows missing
+    a ticker mapping or period_end_date are rejected rather than silently
+    dropped; every other named column is legitimately nullable (industry
+    variance -- e.g. a bank's balance sheet has no conventional current-ratio
+    split).
+    """
+    connection = get_shared_connection(db_path)
+    written = 0
+    for row in data.to_dict(orient="records"):
+        provider_symbol = _text(row.get("ProviderSymbol") or row.get("Ticker")).upper()
+        ticker_id = ticker_ids.get(provider_symbol)
+        period_end_date = _optional_date(row.get("PeriodEndDate"))
+        if ticker_id is None:
+            raise ValueError(f"No ticker_id mapping for yfinance symbol {provider_symbol}")
+        if not period_end_date:
+            raise ValueError(
+                f"Incomplete financial snapshot row for {provider_symbol or 'unknown'}"
+            )
+        connection.execute(
+            """
+            INSERT INTO financial_snapshots (
+                ticker_id, period_end_date, revenue, net_income, eps, gross_margin,
+                operating_margin, debt_to_equity, current_ratio, free_cash_flow, extra
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (ticker_id, period_end_date) DO UPDATE SET
+                revenue = excluded.revenue,
+                net_income = excluded.net_income,
+                eps = excluded.eps,
+                gross_margin = excluded.gross_margin,
+                operating_margin = excluded.operating_margin,
+                debt_to_equity = excluded.debt_to_equity,
+                current_ratio = excluded.current_ratio,
+                free_cash_flow = excluded.free_cash_flow,
+                extra = excluded.extra,
+                fetched_at = now()
+            """,
+            [
+                ticker_id,
+                period_end_date,
+                _optional_decimal(row.get("Revenue")),
+                _optional_decimal(row.get("NetIncome")),
+                _optional_decimal(row.get("Eps")),
+                _optional_decimal(row.get("GrossMargin")),
+                _optional_decimal(row.get("OperatingMargin")),
+                _optional_decimal(row.get("DebtToEquity")),
+                _optional_decimal(row.get("CurrentRatio")),
+                _optional_decimal(row.get("FreeCashFlow")),
+                _json(row.get("Extra")),
+            ],
+        )
+        written += 1
+    return written
+
+
 def upload_portfolio_classifications(
     json_path: Path | str | None = None,
     db_path: Path | str = DATABASE_PATH,

@@ -20,6 +20,14 @@ constrained by [../taxonomy/decision-framework.yml](../taxonomy/decision-framewo
 **Immutability rules:** once written, *Original Thesis* is never edited — new
 thinking goes in *Updated Thesis*. *Decision History* rows are append-only.
 
+**Database-regenerated sections:** *Financial Analysis*, *Earnings and
+Catalysts*, and *Dividend Analysis* are current-state views regenerated from
+the pipeline tables (`financial_snapshots`, `earnings_events`,
+`dividend_events`), delimited by `<!-- kb-db-section:begin -->` /
+`<!-- kb-db-section:end -->` markers — do not hand-edit inside them. Their
+freshness follows the last sync run, so they are never part of the staleness
+gate (decision #16).
+
 **Sell/trim decisions and portfolio reviews live here too** — there is no
 separate decision-record page type. A sell or trim updates the `Decision`
 and `status` fields, appends a *Decision History* row (via
@@ -69,6 +77,12 @@ unchanged, or broken versus the original, and why.
 
 ## Financial Analysis
 
+<!-- kb-db-section:begin -->
+Database-regenerated from `financial_snapshots` — a current-state view, not
+hand-edited. Freshness tracks the last `financial-snapshots-sync`, not the
+staleness gate.
+<!-- kb-db-section:end -->
+
 ## Valuation Analysis
 
 ## Technical Analysis
@@ -81,7 +95,19 @@ unchanged, or broken versus the original, and why.
 
 ## Earnings and Catalysts
 
+<!-- kb-db-section:begin -->
+Database-regenerated from `earnings_events` — a current-state view, not
+hand-edited. Freshness tracks the last `earnings-dividends-sync`, not the
+staleness gate.
+<!-- kb-db-section:end -->
+
 ## Dividend Analysis
+
+<!-- kb-db-section:begin -->
+Database-regenerated from `dividend_events` — a current-state view, not
+hand-edited. Freshness tracks the last `earnings-dividends-sync`, not the
+staleness gate.
+<!-- kb-db-section:end -->
 
 ## Portfolio Fit
 

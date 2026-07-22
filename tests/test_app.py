@@ -13,7 +13,7 @@ import pandas as pd
 import app
 import database
 import ticker_mapping
-from market_data import MarketSyncResult
+from market_data import EarningsDividendsSyncResult, FinancialSnapshotsSyncResult, MarketSyncResult
 
 
 class AppPipelineTest(unittest.TestCase):
@@ -377,6 +377,9 @@ class AppPipelineTest(unittest.TestCase):
             "statements": "statement_extractor.main",
             "email": "email_extractor.main",
             "yfinance": "yfinance_extractor.main",
+            "earnings-dividends": "earnings_dividends_extractor.main",
+            "financial-snapshots": "financial_snapshots_extractor.main",
+            "annual-financial-context": "annual_financial_context.main",
             "ticker-map": "ticker_mapping.main",
             "import-activities": "data_sorter.main",
         }
@@ -407,6 +410,11 @@ class AppPipelineTest(unittest.TestCase):
             "email",
             "yfinance",
             "yfinance-sync",
+            "earnings-dividends",
+            "earnings-dividends-sync",
+            "financial-snapshots",
+            "financial-snapshots-sync",
+            "annual-financial-context",
             "ticker-map",
             "resolve-tickers",
             "import-activities",
@@ -439,6 +447,63 @@ class AppPipelineTest(unittest.TestCase):
 
         self.assertEqual(output, 0)
         sync.assert_called_once_with(app.DATABASE_PATH, None, full=True)
+
+    def test_earnings_dividends_sync_command_forwards_database_and_tickers(self):
+        expected = EarningsDividendsSyncResult(2, 40, 12)
+        with patch.object(app, "sync_earnings_dividends", return_value=expected) as sync:
+            output = app.main([
+                "earnings-dividends-sync",
+                "--database",
+                str(self.data_dir / "db.duckdb"),
+                "--tickers",
+                "AAPL",
+                "VFV.TO",
+            ])
+
+        self.assertEqual(output, 0)
+        sync.assert_called_once_with(
+            self.data_dir / "db.duckdb", ["AAPL", "VFV.TO"],
+            skip_earnings=False, skip_dividends=False,
+        )
+
+    def test_earnings_dividends_sync_skip_flags_are_forwarded(self):
+        expected = EarningsDividendsSyncResult(1, 0, 3)
+        with patch.object(app, "sync_earnings_dividends", return_value=expected) as sync:
+            output = app.main(["earnings-dividends-sync", "--skip-earnings"])
+
+        self.assertEqual(output, 0)
+        sync.assert_called_once_with(
+            app.DATABASE_PATH, None, skip_earnings=True, skip_dividends=False,
+        )
+
+    def test_earnings_dividends_sync_failure_returns_nonzero(self):
+        expected = EarningsDividendsSyncResult(1, 0, 0, error="provider down")
+        with patch.object(app, "sync_earnings_dividends", return_value=expected):
+            output = app.main(["earnings-dividends-sync"])
+
+        self.assertEqual(output, 1)
+
+    def test_financial_snapshots_sync_command_forwards_database_and_tickers(self):
+        expected = FinancialSnapshotsSyncResult(2, 8)
+        with patch.object(app, "sync_financial_snapshots", return_value=expected) as sync:
+            output = app.main([
+                "financial-snapshots-sync",
+                "--database",
+                str(self.data_dir / "db.duckdb"),
+                "--tickers",
+                "AAPL",
+                "VFV.TO",
+            ])
+
+        self.assertEqual(output, 0)
+        sync.assert_called_once_with(self.data_dir / "db.duckdb", ["AAPL", "VFV.TO"])
+
+    def test_financial_snapshots_sync_failure_returns_nonzero(self):
+        expected = FinancialSnapshotsSyncResult(1, 0, error="provider down")
+        with patch.object(app, "sync_financial_snapshots", return_value=expected):
+            output = app.main(["financial-snapshots-sync"])
+
+        self.assertEqual(output, 1)
 
     def test_classification_sync_command_forwards_input_and_database(self):
         with patch.object(app, "upload_portfolio_classifications", return_value=3) as upload:

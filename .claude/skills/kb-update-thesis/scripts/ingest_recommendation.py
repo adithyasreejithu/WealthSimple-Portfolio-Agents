@@ -118,14 +118,21 @@ def _infer_company_name(artifact: dict) -> str:
     return ""
 
 
-def _transcribe_narratives(body: str, artifact: dict) -> str:
-    """Transcribe narrative prose from artifact into body markdown, mechanically."""
+def _transcribe_narratives(body: str, artifact: dict) -> tuple[str, set[str]]:
+    """Transcribe narrative prose from artifact into body markdown, mechanically.
+
+    Returns the new body and the set of section header names that were actually
+    rewritten, so the caller can stamp `section_updated` for the gated ones
+    (decision #16).
+    """
     narratives = artifact.get("narratives") or {}
+    rewritten: set[str] = set()
 
     # Updated Thesis (always update).
     updated = narratives.get("updated_thesis", "").strip()
     if updated:
         body = kb_pages.replace_section(body, "Updated Thesis", updated)
+        rewritten.add("Updated Thesis")
 
     # Section updates (from the section_updates map).
     section_updates = narratives.get("section_updates") or {}
@@ -134,6 +141,7 @@ def _transcribe_narratives(body: str, artifact: dict) -> str:
         if content and content.strip():
             try:
                 body = kb_pages.replace_section(body, section_name, content.strip())
+                rewritten.add(section_name)
             except kb_pages.KBPageError:
                 unmatched_sections.append(section_name)
     if unmatched_sections:
@@ -156,6 +164,7 @@ def _transcribe_narratives(body: str, artifact: dict) -> str:
             if content:
                 try:
                     body = kb_pages.replace_section(body, section_name, content)
+                    rewritten.add(section_name)
                 except kb_pages.KBPageError:
                     pass
 
@@ -167,6 +176,7 @@ def _transcribe_narratives(body: str, artifact: dict) -> str:
         if content:
             try:
                 body = kb_pages.replace_section(body, "Monitoring Checklist", content)
+                rewritten.add("Monitoring Checklist")
             except kb_pages.KBPageError:
                 pass
 
@@ -175,6 +185,7 @@ def _transcribe_narratives(body: str, artifact: dict) -> str:
     if analyst:
         try:
             body = kb_pages.replace_section(body, "Analyst View", analyst)
+            rewritten.add("Analyst View")
         except kb_pages.KBPageError:
             pass
 
@@ -188,7 +199,7 @@ def _transcribe_narratives(body: str, artifact: dict) -> str:
             except kb_pages.KBPageError:
                 pass
 
-    return body
+    return body, rewritten
 
 
 def ingest(artifact_path: Path, *, kb_root: Path | None = None) -> dict:
@@ -257,6 +268,8 @@ def ingest(artifact_path: Path, *, kb_root: Path | None = None) -> dict:
             f"stocks/{ticker}.md; refusing to append a duplicate same-day recommendation"
         )
 
+    rewritten_sections: set[str] = set()
+
     # 3a. On first creation only, seed Company Overview and Original Thesis from
     # the artifact's narratives. Gated on real file creation in THIS run (never
     # the artifact's self-reported page_exists), so Original Thesis is only ever
@@ -268,14 +281,17 @@ def ingest(artifact_path: Path, *, kb_root: Path | None = None) -> dict:
             if text:
                 try:
                     body = kb_pages.replace_section(body, section, text)
+                    rewritten_sections.add(section)
                 except kb_pages.KBPageError:
                     pass
 
     # 3b. Transcribe prose from narratives mechanically.
-    body = _transcribe_narratives(body, artifact)
+    body, transcribed = _transcribe_narratives(body, artifact)
+    rewritten_sections |= transcribed
 
     # 4. Update Status block (Decision/Confidence/Time Horizon/Last Updated only).
     body = _update_status_block(body, action, confidence, horizon, today)
+    rewritten_sections.add("Status")
 
     # 5. Decision History row.
     summary = str((artifact.get("narratives") or {}).get("executive_summary") or "").strip()
@@ -293,6 +309,9 @@ def ingest(artifact_path: Path, *, kb_root: Path | None = None) -> dict:
         raise IngestError(f"page structure error: {exc}") from exc
 
     meta = kb_pages.touch_updated(meta, on=today)
+    # Record which gated sections this run rewrote, so the staleness gate
+    # (decision #16) can tell what is fresh without re-reading the prose.
+    meta = kb_pages.stamp_sections_updated(meta, rewritten_sections, on=today)
     page_path.write_text(kb_pages.serialize_page(meta, body), encoding="utf-8", newline="\n")
 
     # 6. Logs.

@@ -180,6 +180,103 @@ class DatabaseTest(unittest.TestCase):
             connection.execute("SELECT COUNT(*) FROM statement_balances").fetchone()[0], 1
         )
 
+    def test_version_eleven_schema_is_upgraded_and_adds_earnings_dividends_tables(self):
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute("DROP TABLE earnings_events")
+        connection.execute("DROP TABLE dividend_events")
+        connection.execute(
+            "UPDATE schema_metadata SET schema_version = 11 WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        )
+
+        created = database.initialize_database(self.db_path)
+
+        version = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        ).fetchone()[0]
+        self.assertFalse(created)
+        self.assertEqual(version, database.DATABASE_SCHEMA_VERSION)
+        self.assertTrue(database.is_database_active(connection))
+        table_names = database._get_table_names(connection)
+        self.assertIn("earnings_events", table_names)
+        self.assertIn("dividend_events", table_names)
+        # Both new tables must be writable after the migration.
+        ticker_id = connection.execute(
+            """
+            INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+            VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock')
+            RETURNING ticker_id
+            """
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO earnings_events (ticker_id, report_date, eps_estimate) "
+            "VALUES (?, '2026-01-30', 1.23)",
+            [ticker_id],
+        )
+        connection.execute(
+            "INSERT INTO dividend_events (ticker_id, ex_dividend_date, declared_amount) "
+            "VALUES (?, '2026-02-07', 0.24)",
+            [ticker_id],
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM earnings_events").fetchone()[0], 1
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM dividend_events").fetchone()[0], 1
+        )
+        # Regression: the terminal-block edit must still recreate the view.
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM v_trade_events").fetchone()[0], 0
+        )
+
+    def test_version_twelve_schema_is_upgraded_and_adds_financial_snapshots_table(self):
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute("DROP TABLE financial_snapshots")
+        connection.execute(
+            "UPDATE schema_metadata SET schema_version = 12 WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        )
+
+        created = database.initialize_database(self.db_path)
+
+        version = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        ).fetchone()[0]
+        self.assertFalse(created)
+        self.assertEqual(version, database.DATABASE_SCHEMA_VERSION)
+        self.assertTrue(database.is_database_active(connection))
+        table_names = database._get_table_names(connection)
+        self.assertIn("financial_snapshots", table_names)
+        # The new table must be writable after the migration.
+        ticker_id = connection.execute(
+            """
+            INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+            VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock')
+            RETURNING ticker_id
+            """
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO financial_snapshots (
+                ticker_id, period_end_date, revenue, net_income, eps,
+                gross_margin, operating_margin, debt_to_equity, current_ratio,
+                free_cash_flow, extra
+            ) VALUES (?, '2026-03-31', 1000.00, 200.00, 1.5, 0.4, 0.3, 1.2, 1.8, 150.00, '{"foo": 1}')
+            """,
+            [ticker_id],
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM financial_snapshots").fetchone()[0], 1
+        )
+        # Regression: the terminal-block edit must still recreate the view.
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM v_trade_events").fetchone()[0], 0
+        )
+
     def test_trade_events_view_is_recreated_on_every_startup(self):
         database.initialize_database(self.db_path)
         connection = database.get_shared_connection(self.db_path)

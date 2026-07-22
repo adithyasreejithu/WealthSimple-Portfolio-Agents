@@ -383,5 +383,206 @@ class BenchmarkHistorySyncTest(unittest.TestCase):
         )
 
 
+class EarningsDividendsSyncTest(unittest.TestCase):
+    def setUp(self):
+        self.target = market_data.MarketTarget(
+            ticker_id=7,
+            symbol="AAPL",
+            provider_symbol="AAPL",
+            currency="USD",
+            security_name="Apple Inc.",
+            first_owned_date=date(2025, 1, 2),
+            latest_market_date=None,
+        )
+
+    def _earnings_frame(self):
+        return pd.DataFrame([{"Ticker": "AAPL", "ProviderSymbol": "AAPL", "ReportDate": "2025-01-30",
+                              "EpsEstimate": 1.2, "EpsActual": 1.3, "SurprisePct": 5.5}])
+
+    def _dividend_frame(self):
+        return pd.DataFrame([{"Ticker": "AAPL", "ProviderSymbol": "AAPL",
+                              "ExDividendDate": "2025-02-07", "DeclaredAmount": 0.24}])
+
+    def test_sync_fetches_owned_scope_and_writes_in_one_transaction(self):
+        connection = Mock()
+        earnings_fetcher = Mock(return_value=self._earnings_frame())
+        dividends_fetcher = Mock(return_value=self._dividend_frame())
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[self.target]),
+            patch.object(market_data, "get_shared_connection", return_value=connection),
+            patch.object(market_data, "upload_earnings_events", return_value=1) as upload_e,
+            patch.object(market_data, "upload_dividend_events", return_value=1) as upload_d,
+        ):
+            result = market_data.sync_earnings_dividends(
+                "portfolio.duckdb",
+                earnings_fetcher=earnings_fetcher,
+                dividends_fetcher=dividends_fetcher,
+            )
+
+        earnings_fetcher.assert_called_once_with(["AAPL"])
+        dividends_fetcher.assert_called_once_with(["AAPL"])
+        upload_e.assert_called_once()
+        upload_d.assert_called_once()
+        self.assertEqual(connection.execute.call_args_list[0].args[0], "BEGIN TRANSACTION")
+        self.assertEqual(connection.execute.call_args_list[-1].args[0], "COMMIT")
+        self.assertEqual((result.earnings_rows, result.dividend_rows), (1, 1))
+        self.assertTrue(result.succeeded)
+
+    def test_sync_with_no_targets_returns_empty_without_writing(self):
+        connection = Mock()
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[]),
+            patch.object(market_data, "get_shared_connection", return_value=connection),
+        ):
+            result = market_data.sync_earnings_dividends(
+                earnings_fetcher=Mock(), dividends_fetcher=Mock()
+            )
+
+        self.assertEqual((result.tickers, result.earnings_rows, result.dividend_rows), (0, 0, 0))
+        connection.execute.assert_not_called()
+
+    def test_sync_skip_flags_bypass_the_respective_fetcher(self):
+        connection = Mock()
+        earnings_fetcher = Mock(return_value=self._earnings_frame())
+        dividends_fetcher = Mock(return_value=self._dividend_frame())
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[self.target]),
+            patch.object(market_data, "get_shared_connection", return_value=connection),
+            patch.object(market_data, "upload_earnings_events", return_value=1),
+            patch.object(market_data, "upload_dividend_events", return_value=1) as upload_d,
+        ):
+            market_data.sync_earnings_dividends(
+                earnings_fetcher=earnings_fetcher,
+                dividends_fetcher=dividends_fetcher,
+                skip_dividends=True,
+            )
+
+        earnings_fetcher.assert_called_once_with(["AAPL"])
+        dividends_fetcher.assert_not_called()
+        upload_d.assert_not_called()
+
+    def test_sync_fetch_failure_reports_error(self):
+        connection = Mock()
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[self.target]),
+            patch.object(market_data, "get_shared_connection", return_value=connection),
+            patch.object(market_data, "upload_earnings_events"),
+            patch.object(market_data, "upload_dividend_events"),
+        ):
+            result = market_data.sync_earnings_dividends(
+                earnings_fetcher=Mock(side_effect=RuntimeError("provider failed")),
+                dividends_fetcher=Mock(return_value=self._dividend_frame()),
+            )
+
+        self.assertFalse(result.succeeded)
+        self.assertIn("provider failed", result.error)
+        connection.execute.assert_not_called()
+
+    def test_sync_write_failure_rolls_back(self):
+        connection = Mock()
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[self.target]),
+            patch.object(market_data, "get_shared_connection", return_value=connection),
+            patch.object(market_data, "upload_earnings_events", side_effect=ValueError("bad row")),
+            patch.object(market_data, "upload_dividend_events", return_value=1),
+        ):
+            result = market_data.sync_earnings_dividends(
+                earnings_fetcher=Mock(return_value=self._earnings_frame()),
+                dividends_fetcher=Mock(return_value=self._dividend_frame()),
+            )
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(connection.execute.call_args_list[-1].args[0], "ROLLBACK")
+
+
+class FinancialSnapshotsSyncTest(unittest.TestCase):
+    def setUp(self):
+        self.target = market_data.MarketTarget(
+            ticker_id=7,
+            symbol="AAPL",
+            provider_symbol="AAPL",
+            currency="USD",
+            security_name="Apple Inc.",
+            first_owned_date=date(2025, 1, 2),
+            latest_market_date=None,
+        )
+
+    def _snapshots_frame(self):
+        return pd.DataFrame([{
+            "Ticker": "AAPL", "ProviderSymbol": "AAPL", "PeriodEndDate": "2026-03-31",
+            "Revenue": 1000.0, "NetIncome": 200.0, "Eps": 1.5, "GrossMargin": 0.4,
+            "OperatingMargin": 0.3, "DebtToEquity": 2.0, "CurrentRatio": 1.8,
+            "FreeCashFlow": 150.0, "Extra": {},
+        }])
+
+    def test_sync_fetches_owned_scope_and_writes_in_one_transaction(self):
+        connection = Mock()
+        snapshots_fetcher = Mock(return_value=self._snapshots_frame())
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[self.target]),
+            patch.object(market_data, "get_shared_connection", return_value=connection),
+            patch.object(market_data, "upload_financial_snapshots", return_value=1) as upload,
+        ):
+            result = market_data.sync_financial_snapshots(
+                "portfolio.duckdb", snapshots_fetcher=snapshots_fetcher,
+            )
+
+        snapshots_fetcher.assert_called_once_with(["AAPL"])
+        upload.assert_called_once()
+        self.assertEqual(connection.execute.call_args_list[0].args[0], "BEGIN TRANSACTION")
+        self.assertEqual(connection.execute.call_args_list[-1].args[0], "COMMIT")
+        self.assertEqual(result.snapshot_rows, 1)
+        self.assertTrue(result.succeeded)
+
+    def test_sync_with_no_targets_returns_empty_without_writing(self):
+        connection = Mock()
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[]),
+            patch.object(market_data, "get_shared_connection", return_value=connection),
+        ):
+            result = market_data.sync_financial_snapshots(snapshots_fetcher=Mock())
+
+        self.assertEqual((result.tickers, result.snapshot_rows), (0, 0))
+        connection.execute.assert_not_called()
+
+    def test_sync_fetch_failure_reports_error_and_isolates_per_ticker(self):
+        connection = Mock()
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[self.target]),
+            patch.object(market_data, "get_shared_connection", return_value=connection),
+            patch.object(market_data, "upload_financial_snapshots"),
+        ):
+            result = market_data.sync_financial_snapshots(
+                snapshots_fetcher=Mock(side_effect=RuntimeError("provider failed")),
+            )
+
+        self.assertFalse(result.succeeded)
+        self.assertIn("provider failed", result.error)
+        connection.execute.assert_not_called()
+
+    def test_sync_write_failure_rolls_back(self):
+        connection = Mock()
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[self.target]),
+            patch.object(market_data, "get_shared_connection", return_value=connection),
+            patch.object(market_data, "upload_financial_snapshots", side_effect=ValueError("bad row")),
+        ):
+            result = market_data.sync_financial_snapshots(
+                snapshots_fetcher=Mock(return_value=self._snapshots_frame()),
+            )
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(connection.execute.call_args_list[-1].args[0], "ROLLBACK")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -88,6 +88,58 @@ class ValidateMetaTest(unittest.TestCase):
         errors = kb_pages.validate_meta(meta)
         self.assertTrue(any("updated" in err for err in errors))
 
+    def test_competitor_note_type_accepted(self):
+        meta, _ = kb_pages.parse_page(STOCK_PAGE)
+        meta["type"] = "competitor-note"
+        meta["status"] = "draft"
+        self.assertEqual(kb_pages.validate_meta(meta), [])
+
+    def test_valid_section_updated_map_has_no_errors(self):
+        meta, _ = kb_pages.parse_page(STOCK_PAGE)
+        meta["section_updated"] = {"status": "2026-07-14", "market_sentiment": "2026-07-10"}
+        self.assertEqual(kb_pages.validate_meta(meta), [])
+
+    def test_section_updated_bad_date_rejected(self):
+        meta, _ = kb_pages.parse_page(STOCK_PAGE)
+        meta["section_updated"] = {"status": "07/14/2026"}
+        errors = kb_pages.validate_meta(meta)
+        self.assertTrue(any("section_updated" in err for err in errors))
+
+    def test_section_updated_non_mapping_rejected(self):
+        meta, _ = kb_pages.parse_page(STOCK_PAGE)
+        meta["section_updated"] = ["status", "market_sentiment"]
+        errors = kb_pages.validate_meta(meta)
+        self.assertTrue(any("section_updated" in err for err in errors))
+
+
+class StampSectionsUpdatedTest(unittest.TestCase):
+    def test_stamps_only_gated_headers(self):
+        meta = {"updated": "2026-07-01"}
+        out = kb_pages.stamp_sections_updated(
+            meta,
+            ["Status", "Market Sentiment", "Original Thesis", "Financial Analysis"],
+            on="2026-07-21",
+        )
+        # Status + Market Sentiment are gated; Original Thesis / Financial
+        # Analysis are not and must not appear.
+        self.assertEqual(
+            out["section_updated"],
+            {"status": "2026-07-21", "market_sentiment": "2026-07-21"},
+        )
+
+    def test_merges_onto_existing_keys(self):
+        meta = {"section_updated": {"analyst_view": "2026-06-01"}}
+        out = kb_pages.stamp_sections_updated(meta, ["Status"], on="2026-07-21")
+        self.assertEqual(
+            out["section_updated"],
+            {"analyst_view": "2026-06-01", "status": "2026-07-21"},
+        )
+
+    def test_no_gated_headers_leaves_meta_untouched(self):
+        meta = {"updated": "2026-07-01"}
+        out = kb_pages.stamp_sections_updated(meta, ["Original Thesis"], on="2026-07-21")
+        self.assertNotIn("section_updated", out)
+
 
 class IndexRowTest(unittest.TestCase):
     def test_row_format(self):

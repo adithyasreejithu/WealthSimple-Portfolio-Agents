@@ -40,6 +40,9 @@ REQUIRED_TABLES = frozenset(
         "position_snapshots",
         "position_engine_meta",
         "statement_balances",
+        "earnings_events",
+        "dividend_events",
+        "financial_snapshots",
     }
 )
 TRADE_EVENTS_VIEW = "v_trade_events"
@@ -224,6 +227,91 @@ def _create_statement_balances_table(connection: duckdb.DuckDBPyConnection) -> N
             transaction_type VARCHAR NOT NULL,
             balance DECIMAL(20, 4) NOT NULL,
             UNIQUE (transaction_date, transaction_type, balance)
+        )
+        """
+    )
+
+
+def _create_earnings_dividends_tables(connection: duckdb.DuckDBPyConnection) -> None:
+    """Create the earnings_events/dividend_events market-data tables.
+
+    Shared between `_deploy_schema` (fresh installs) and the v11->v12
+    migration so both paths stay in lockstep. These record company-declared
+    market data (earnings calendar, dividend schedule), distinct from
+    `cash_transactions`/`transactions`, which record the user's own received
+    dividend cash from brokerage statements -- never join or conflate them.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS earnings_events (
+            ticker_id BIGINT NOT NULL,
+            report_date DATE NOT NULL,
+            period VARCHAR,
+            eps_estimate DOUBLE,
+            eps_actual DOUBLE,
+            revenue_estimate DECIMAL(20, 2),
+            revenue_actual DECIMAL(20, 2),
+            surprise_pct DOUBLE,
+            fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ticker_id, report_date),
+            FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dividend_events (
+            ticker_id BIGINT NOT NULL,
+            ex_dividend_date DATE NOT NULL,
+            pay_date DATE,
+            declared_amount DECIMAL(18, 8) NOT NULL,
+            frequency VARCHAR,
+            fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ticker_id, ex_dividend_date),
+            FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
+        )
+        """
+    )
+
+
+def _create_financial_snapshots_table(connection: duckdb.DuckDBPyConnection) -> None:
+    """Create the financial_snapshots table (per-quarter statement data).
+
+    Shared between `_deploy_schema` (fresh installs) and the v12->v13
+    migration so both paths stay in lockstep. Hybrid schema: named columns
+    for the fields decision-rubric.yml's derived:* metrics actually score
+    against today, plus one JSON `extra` column for every other line item
+    yfinance's quarterly income statement/balance sheet/cash flow return, so
+    a new ratio never requires its own migration. Figures are stored exactly
+    as yfinance reports them in the ticker's financial_currency -- no FX
+    conversion here (see analytics/portfolio_metrics for that).
+
+    Unlike dividend_events/earnings_events, a row here can legitimately be
+    overwritten in place on re-sync: quarterly figures can restate after the
+    fact (reclassifications, discontinued-operations restatement, vendor
+    data corrections), so ON CONFLICT DO UPDATE is the correct and desired
+    behavior, not a bug -- a period_end_date is never a forward-looking or
+    speculative row (a snapshot cannot exist before its period has ended and
+    been reported), so there is nothing to retire the way
+    upload_earnings_events retires abandoned speculative report dates.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS financial_snapshots (
+            ticker_id BIGINT NOT NULL,
+            period_end_date DATE NOT NULL,
+            revenue DECIMAL(24, 2),
+            net_income DECIMAL(24, 2),
+            eps DOUBLE,
+            gross_margin DOUBLE,
+            operating_margin DOUBLE,
+            debt_to_equity DOUBLE,
+            current_ratio DOUBLE,
+            free_cash_flow DECIMAL(24, 2),
+            extra JSON,
+            fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ticker_id, period_end_date),
+            FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
         )
         """
     )
@@ -712,6 +800,8 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
         )
         _create_position_engine_tables(connection)
         _create_statement_balances_table(connection)
+        _create_earnings_dividends_tables(connection)
+        _create_financial_snapshots_table(connection)
         connection.execute(
             """
             INSERT INTO schema_metadata (component, schema_version)
@@ -1048,14 +1138,44 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
                     _create_statement_balances_table(connection)
                     connection.execute(
                         "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
-                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                        [11, SCHEMA_COMPONENT],
                     )
                     connection.execute("COMMIT")
                 except Exception:
                     connection.execute("ROLLBACK")
                     logger.exception("Database migration from version 10 failed")
                     raise
-                logger.info("Database migrated from schema version 10 to %d", DATABASE_SCHEMA_VERSION)
+                logger.info("Database migrated from schema version 10 to 11")
+                row = (11,)
+            if row and row[0] == 11:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    _create_earnings_dividends_tables(connection)
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [12, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 11 failed")
+                    raise
+                logger.info("Database migrated from schema version 11 to 12")
+                row = (12,)
+            if row and row[0] == 12:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    _create_financial_snapshots_table(connection)
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 12 failed")
+                    raise
+                logger.info("Database migrated from schema version 12 to %d", DATABASE_SCHEMA_VERSION)
                 _create_trade_events_view(connection)
                 return False
         if existing_tables:

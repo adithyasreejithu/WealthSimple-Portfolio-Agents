@@ -14,6 +14,7 @@ from database_command import (
     normalize_ticker_dataframe,
     update_email_checkpoint,
     upload_email_transactions,
+    upload_financial_snapshots,
     upload_portfolio_classifications,
     upload_statement_transactions,
     reconcile_email_transactions,
@@ -695,6 +696,95 @@ class DatabaseCommandTest(unittest.TestCase):
         self.assertTrue(
             any("Skipping classification upload for unresolved ticker" in line for line in captured.output)
         )
+
+
+class FinancialSnapshotsUploadTest(unittest.TestCase):
+    def setUp(self):
+        database.close_connection()
+        self.temp_dir = tempfile.TemporaryDirectory(
+            dir=Path(__file__).resolve().parent
+        )
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
+        self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        self.ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('NVDA', 'NASDAQ', 'USD', 'NVIDIA Corporation', 'stock') RETURNING ticker_id""",
+        ).fetchone()[0]
+        self.ticker_ids = {"NVDA": self.ticker_id}
+
+    def _row(self, **overrides):
+        row = {
+            "Ticker": "NVDA", "ProviderSymbol": "NVDA", "PeriodEndDate": "2026-03-31",
+            "Revenue": 1000.0, "NetIncome": 200.0, "Eps": 1.5, "GrossMargin": 0.4,
+            "OperatingMargin": 0.3, "DebtToEquity": 2.0, "CurrentRatio": 1.8,
+            "FreeCashFlow": 150.0, "Extra": {"income_statement": {"Research Development": 50.0}},
+        }
+        row.update(overrides)
+        return row
+
+    def test_upsert_inserts_new_snapshot_row(self):
+        written = upload_financial_snapshots(pd.DataFrame([self._row()]), self.ticker_ids, self.db_path)
+
+        self.assertEqual(written, 1)
+        row = database.get_shared_connection(self.db_path).execute(
+            "SELECT revenue, net_income, eps, gross_margin, operating_margin, "
+            "debt_to_equity, current_ratio, free_cash_flow, extra FROM financial_snapshots"
+        ).fetchone()
+        self.assertEqual(row[0], Decimal("1000.00"))
+        self.assertEqual(row[1], Decimal("200.00"))
+        self.assertAlmostEqual(float(row[2]), 1.5)
+        self.assertAlmostEqual(float(row[3]), 0.4)
+        self.assertAlmostEqual(float(row[4]), 0.3)
+        self.assertAlmostEqual(float(row[5]), 2.0)
+        self.assertAlmostEqual(float(row[6]), 1.8)
+        self.assertEqual(row[7], Decimal("150.00"))
+        self.assertEqual(json.loads(row[8]), {"income_statement": {"Research Development": 50.0}})
+
+    def test_reupload_same_period_updates_in_place_simulating_restatement(self):
+        upload_financial_snapshots(pd.DataFrame([self._row()]), self.ticker_ids, self.db_path)
+
+        written = upload_financial_snapshots(
+            pd.DataFrame([self._row(Revenue=1100.0, NetIncome=250.0)]), self.ticker_ids, self.db_path
+        )
+
+        self.assertEqual(written, 1)
+        connection = database.get_shared_connection(self.db_path)
+        count = connection.execute("SELECT COUNT(*) FROM financial_snapshots").fetchone()[0]
+        revenue, net_income = connection.execute(
+            "SELECT revenue, net_income FROM financial_snapshots"
+        ).fetchone()
+        self.assertEqual(count, 1)
+        self.assertEqual(revenue, Decimal("1100.00"))
+        self.assertEqual(net_income, Decimal("250.00"))
+
+    def test_missing_ticker_id_mapping_raises(self):
+        with self.assertRaises(ValueError):
+            upload_financial_snapshots(pd.DataFrame([self._row()]), {}, self.db_path)
+
+    def test_missing_period_end_date_raises(self):
+        with self.assertRaises(ValueError):
+            upload_financial_snapshots(
+                pd.DataFrame([self._row(PeriodEndDate=None)]), self.ticker_ids, self.db_path
+            )
+
+    def test_nullable_named_columns_accept_none(self):
+        written = upload_financial_snapshots(
+            pd.DataFrame([self._row(
+                Revenue=None, NetIncome=None, Eps=None, GrossMargin=None,
+                OperatingMargin=None, DebtToEquity=None, CurrentRatio=None,
+                FreeCashFlow=None, Extra={},
+            )]),
+            self.ticker_ids, self.db_path,
+        )
+
+        self.assertEqual(written, 1)
+        row = database.get_shared_connection(self.db_path).execute(
+            "SELECT revenue, net_income, current_ratio FROM financial_snapshots"
+        ).fetchone()
+        self.assertEqual(row, (None, None, None))
 
 
 if __name__ == "__main__":

@@ -153,11 +153,12 @@ Return a concise summary with risks, affected files, and recommended tests.
 
 ### Handoffs between agents
 
-No agent in this repo holds the `Task` tool, so agents cannot invoke each
-other directly. When an agent's work is meant to continue in another agent
-(e.g. `stock-data-prep` finishing a worksheet that `stock-analyst` must
-score), document that as a `## Handoffs` section in the agent's body, placed
-after `## Guardrails` and before `## Output Format`:
+With one deliberate exception (`kb-orchestrator`, below), no agent in this
+repo holds the `Task` tool, so agents cannot invoke each other directly. When
+an agent's work is meant to continue in another agent (e.g. `stock-data-prep`
+finishing a worksheet that `stock-analyst` must score), document that as a
+`## Handoffs` section in the agent's body, placed after `## Guardrails` and
+before `## Output Format`:
 
 | Label | Agent | Prompt |
 | --- | --- | --- |
@@ -170,6 +171,18 @@ is prose read by the orchestrating Claude session or the user, not an
 executable mechanism. Agents with no downstream handoff should state that
 explicitly (e.g. "None -- this agent's output is terminal.") rather than
 omitting the section, so its absence is never ambiguous with an oversight.
+
+**The `Task`-holder exception: `kb-orchestrator`.** The KB population workflow
+(`docs/plans/kb-population-agent-rebuild.md`) needs one agent that runs a fixed
+fetch → score → commit sequence per due ticker on demand, rather than relying
+on a human or a scheduled top-level prompt to drive the fan-out. That agent,
+`.claude/agents/kb-orchestrator.md`, is granted `Task` deliberately and is the
+**only** agent in this repo that holds it. Its `Task` use is confined to
+dispatching the fixed sequence (`stock-data-prep`, `stock-analyst`, one
+`kb-intake`); it carries no judgment of its own. This is a narrow,
+explicitly-authorized exception (Adithya's direction), **not** a precedent for
+granting other agents `Task` — the Handoffs-table convention above remains the
+default for every other agent.
 
 ### `.claude/skills/*/SKILL.md`
 

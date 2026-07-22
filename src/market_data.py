@@ -11,7 +11,15 @@ import pandas as pd
 
 from config import BENCHMARK_TICKERS, DATABASE_PATH, FX_PAIR_SYMBOL
 from database import get_shared_connection, initialize_database
-from database_command import upload_security_history, upload_security_metadata
+from database_command import (
+    upload_dividend_events,
+    upload_earnings_events,
+    upload_financial_snapshots,
+    upload_security_history,
+    upload_security_metadata,
+)
+from earnings_dividends_extractor import fetch_dividend_events, fetch_earnings_events
+from financial_snapshots_extractor import fetch_financial_snapshots
 from system_logger import get_logger
 from yfinance_extractor import fetch_security_history, fetch_security_info
 
@@ -51,6 +59,31 @@ class MarketSyncResult:
     tickers: int
     rows: int
     skipped: int = 0
+    error: str | None = None
+    failed_symbols: tuple[str, ...] = ()
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error is None
+
+
+@dataclass(frozen=True)
+class EarningsDividendsSyncResult:
+    tickers: int
+    earnings_rows: int
+    dividend_rows: int
+    error: str | None = None
+    failed_symbols: tuple[str, ...] = ()
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error is None
+
+
+@dataclass(frozen=True)
+class FinancialSnapshotsSyncResult:
+    tickers: int
+    snapshot_rows: int
     error: str | None = None
     failed_symbols: tuple[str, ...] = ()
 
@@ -378,3 +411,124 @@ def sync_market_data(
     if failed_symbols:
         error = "history fetch failed for: " + ", ".join(failed_symbols)
     return MarketSyncResult(len(targets), rows, skipped, error, tuple(failed_symbols))
+
+
+def sync_earnings_dividends(
+    db_path: Path | str = DATABASE_PATH,
+    symbols: Iterable[str] | None = None,
+    *,
+    earnings_fetcher: Callable[[Iterable[str]], pd.DataFrame] = fetch_earnings_events,
+    dividends_fetcher: Callable[[Iterable[str]], pd.DataFrame] = fetch_dividend_events,
+    skip_earnings: bool = False,
+    skip_dividends: bool = False,
+) -> EarningsDividendsSyncResult:
+    """Fetch and atomically persist company-declared earnings/dividend calendars.
+
+    Scoped to owned tickers with a verified Yahoo mapping (reuses
+    `get_market_targets`, the same scope as `sync_market_data`). This is
+    company-declared market data, distinct from the user's own received
+    dividend cash in `cash_transactions`/`transactions` -- the two are never
+    joined or conflated. Runs on demand only; unlike OHLCV it is not part of
+    the automatic post-email sync.
+    """
+    initialize_database(db_path)
+    targets = get_market_targets(db_path, symbols)
+    if not targets:
+        return EarningsDividendsSyncResult(0, 0, 0)
+
+    provider_symbols = [target.provider_symbol for target in targets]
+    ticker_ids = {target.provider_symbol.upper(): target.ticker_id for target in targets}
+
+    earnings = pd.DataFrame()
+    dividends = pd.DataFrame()
+    try:
+        if not skip_earnings:
+            earnings = earnings_fetcher(provider_symbols)
+        if not skip_dividends:
+            dividends = dividends_fetcher(provider_symbols)
+    except Exception as exc:
+        logger.exception("Earnings/dividends synchronization fetch failed")
+        return EarningsDividendsSyncResult(
+            len(targets), 0, 0, str(exc),
+            failed_symbols=tuple(target.symbol for target in targets),
+        )
+
+    connection = get_shared_connection(db_path)
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        earnings_rows = (
+            upload_earnings_events(earnings, ticker_ids, db_path) if not earnings.empty else 0
+        )
+        dividend_rows = (
+            upload_dividend_events(dividends, ticker_ids, db_path) if not dividends.empty else 0
+        )
+        connection.execute("COMMIT")
+    except Exception as exc:
+        connection.execute("ROLLBACK")
+        logger.exception("Earnings/dividends synchronization database write failed")
+        return EarningsDividendsSyncResult(
+            len(targets), 0, 0, str(exc),
+            failed_symbols=tuple(target.symbol for target in targets),
+        )
+
+    logger.info(
+        "Earnings/dividends synchronization complete | tickers=%d | earnings=%d | dividends=%d",
+        len(targets), earnings_rows, dividend_rows,
+    )
+    return EarningsDividendsSyncResult(len(targets), earnings_rows, dividend_rows)
+
+
+def sync_financial_snapshots(
+    db_path: Path | str = DATABASE_PATH,
+    symbols: Iterable[str] | None = None,
+    *,
+    snapshots_fetcher: Callable[[Iterable[str]], pd.DataFrame] = fetch_financial_snapshots,
+) -> FinancialSnapshotsSyncResult:
+    """Fetch and atomically persist per-quarter company financial statement data.
+
+    Scoped to owned tickers with a verified Yahoo mapping (reuses
+    `get_market_targets`, the same scope as `sync_market_data`/
+    `sync_earnings_dividends`). Not date-windowed: every run re-fetches each
+    ticker's currently-available quarterly window and upserts it against
+    what's already stored -- yfinance's own quarterly statement endpoints
+    only ever return a shallow trailing window, so accumulated depth comes
+    from repeated syncs over time, not a single backfill. Runs on demand
+    only; unlike OHLCV it is not part of the automatic post-email sync.
+    """
+    initialize_database(db_path)
+    targets = get_market_targets(db_path, symbols)
+    if not targets:
+        return FinancialSnapshotsSyncResult(0, 0)
+
+    provider_symbols = [target.provider_symbol for target in targets]
+    ticker_ids = {target.provider_symbol.upper(): target.ticker_id for target in targets}
+
+    try:
+        snapshots = snapshots_fetcher(provider_symbols)
+    except Exception as exc:
+        logger.exception("Financial snapshots synchronization fetch failed")
+        return FinancialSnapshotsSyncResult(
+            len(targets), 0, str(exc),
+            failed_symbols=tuple(target.symbol for target in targets),
+        )
+
+    connection = get_shared_connection(db_path)
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        snapshot_rows = (
+            upload_financial_snapshots(snapshots, ticker_ids, db_path) if not snapshots.empty else 0
+        )
+        connection.execute("COMMIT")
+    except Exception as exc:
+        connection.execute("ROLLBACK")
+        logger.exception("Financial snapshots synchronization database write failed")
+        return FinancialSnapshotsSyncResult(
+            len(targets), 0, str(exc),
+            failed_symbols=tuple(target.symbol for target in targets),
+        )
+
+    logger.info(
+        "Financial snapshots synchronization complete | tickers=%d | rows=%d",
+        len(targets), snapshot_rows,
+    )
+    return FinancialSnapshotsSyncResult(len(targets), snapshot_rows)

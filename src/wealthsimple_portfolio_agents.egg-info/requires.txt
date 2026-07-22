@@ -1,0 +1,15 @@
+pandas
+pdfplumber
+camelot-py
+opencv-python
+keyring
+pyotp
+python-dotenv
+imap-tools
+PyYAML
+yfinance
+curl_cffi
+duckdb
+markitdown[docx,pdf,pptx,xlsx]
+fastapi>=0.139.2
+uvicorn[standard]>=0.51.0

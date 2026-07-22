@@ -66,6 +66,32 @@ skills:
 6. It reports a Wiki Update Summary (pages touched, thesis verdict, log
    entries, what to monitor next).
 
+## KB-population additions (decisions #7, #16, #17)
+
+- **`section_updated` bookkeeping (decision #16).** `ingest_recommendation.py`
+  now stamps `section_updated[<key>] = today` for every gated stock-page section
+  it rewrites, using `kb_pages.stamp_sections_updated` /
+  `kb_pages.SECTION_KEY_BY_HEADER`. This is what the `kb-staleness-gate` skill
+  reads to decide what to reprocess. When the agent hand-edits a gated section's
+  prose outside the ingest script, it stamps that section the same way. Editing
+  non-gated sections (Original Thesis, Decision History, Sources, or a DB-backed
+  section) records nothing — correct, since those are never gated.
+- **Halt-on-failure in batch commits (decision #17).** When looping
+  `ingest_recommendation.py` over N artifacts and one commit fails, the agent
+  stops immediately (does not attempt the rest) and reports how many committed,
+  which ticker failed, and the error. `kb-orchestrator` — not this agent — halts
+  the overall run on that signal.
+- **New market-research page types (decision #7).** Peer/competitor comparisons
+  file as a `competitor-note` under `market-research/competitor-notes/`;
+  social-sentiment content files as a `sentiment-note` under
+  `market-research/sentiment-notes/`. Neither is duplicated into
+  `stocks/TICKER.md`; a stock page's Market Sentiment section is a synthesis
+  pointer to the dated sentiment notes.
+- **DB-backed sections are off-limits to hand edits.** Financial Analysis,
+  Earnings and Catalysts, and Dividend Analysis carry
+  `<!-- kb-db-section:begin -->`/`<!-- kb-db-section:end -->` markers and are
+  regenerated from the pipeline tables, not authored here.
+
 ## Guardrails
 
 - Writes only inside `Knowledge-Base/`, only in the subfolders each skill

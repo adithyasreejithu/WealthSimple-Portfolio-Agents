@@ -32,6 +32,7 @@ PAGE_TYPES = (
     "sector-note",
     "macro-note",
     "sentiment-note",
+    "competitor-note",
     "options-note",
     "source-document",
     "portfolio-page",
@@ -55,6 +56,7 @@ STATUS_VALUES: dict[str, tuple[str, ...]] = {
     "sector-note": NOTE_STATUSES,
     "macro-note": NOTE_STATUSES,
     "sentiment-note": NOTE_STATUSES,
+    "competitor-note": NOTE_STATUSES,
     "options-note": NOTE_STATUSES,
     "source-document": NOTE_STATUSES,
     "portfolio-page": ("generated",) + NOTE_STATUSES,
@@ -66,7 +68,7 @@ STATUS_VALUES: dict[str, tuple[str, ...]] = {
 }
 
 REQUIRED_FIELDS = ("title", "type", "tickers", "tags", "status", "created", "updated", "summary")
-OPTIONAL_FIELDS = ("related", "sources", "generated_at")
+OPTIONAL_FIELDS = ("related", "sources", "section_updated", "generated_at")
 FIELD_ORDER = REQUIRED_FIELDS + OPTIONAL_FIELDS
 
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -180,6 +182,17 @@ def validate_meta(meta: dict, *, source: str = "<page>") -> list[str]:
             for entry in sources:
                 if not isinstance(entry, dict) or "title" not in entry or "ref" not in entry:
                     errors.append(f"{source}: each source needs 'title' and 'ref'")
+    section_updated = meta.get("section_updated")
+    if section_updated is not None:
+        if not isinstance(section_updated, dict):
+            errors.append(f"{source}: 'section_updated' must be a mapping of section-key to date")
+        else:
+            for key, value in section_updated.items():
+                text = value.isoformat() if isinstance(value, date) else str(value)
+                if not DATE_PATTERN.match(text):
+                    errors.append(
+                        f"{source}: section_updated['{key}'] must be YYYY-MM-DD, got '{value}'"
+                    )
     return errors
 
 
@@ -449,9 +462,74 @@ def rebuild_thesis_views(kb_root: Path) -> list[str]:
     return errors
 
 
+# Gated stock-page sections and their `section_updated` keys (decision #16).
+# Weekly tier goes stale in 7 days (market-driven); monthly tier in 30
+# (fundamentals/judgment). DB-backed sections (Financial Analysis, Earnings and
+# Catalysts, Dividend Analysis) and event-driven sections (Original Thesis,
+# Decision History, Sources) are deliberately absent -- they are never gated.
+# `technical_analysis` joins the weekly tier only once that phase ships.
+WEEKLY_SECTIONS: tuple[str, ...] = ("status", "market_sentiment", "options_activity")
+MONTHLY_SECTIONS: tuple[str, ...] = (
+    "valuation_analysis",
+    "company_overview",
+    "bull_case",
+    "bear_case",
+    "key_risks",
+    "open_questions",
+    "monitoring_checklist",
+    "portfolio_fit",
+    "updated_thesis",
+    "analyst_view",
+    "insider_activity",
+)
+GATED_SECTIONS: tuple[str, ...] = WEEKLY_SECTIONS + MONTHLY_SECTIONS
+
+# Map a gated section's markdown `## header` to its `section_updated` key, so
+# the writer can stamp the right key after rewriting a section. Only gated
+# sections appear here; rewriting a non-gated section (e.g. Original Thesis,
+# Financial Analysis) records nothing.
+SECTION_KEY_BY_HEADER: dict[str, str] = {
+    "Status": "status",
+    "Market Sentiment": "market_sentiment",
+    "Options Activity": "options_activity",
+    "Valuation Analysis": "valuation_analysis",
+    "Company Overview": "company_overview",
+    "Bull Case": "bull_case",
+    "Bear Case": "bear_case",
+    "Key Risks": "key_risks",
+    "Open Questions": "open_questions",
+    "Monitoring Checklist": "monitoring_checklist",
+    "Portfolio Fit": "portfolio_fit",
+    "Updated Thesis": "updated_thesis",
+    "Analyst View": "analyst_view",
+    "Insider Activity": "insider_activity",
+}
+
+
 def touch_updated(meta: dict, on: str | None = None) -> dict:
     meta = dict(meta)
     meta["updated"] = on or today()
+    return meta
+
+
+def stamp_sections_updated(meta: dict, headers, *, on: str | None = None) -> dict:
+    """Record that the given gated sections were rewritten today (decision #16).
+
+    `headers` is an iterable of markdown section header names (e.g.
+    "Market Sentiment"); only those in `SECTION_KEY_BY_HEADER` are stamped, so
+    passing a non-gated header (Original Thesis, a DB-backed section) is a
+    harmless no-op. Returns a copy with an updated `section_updated` map,
+    merged onto any keys already present.
+    """
+    on = on or today()
+    meta = dict(meta)
+    section_map = dict(meta.get("section_updated") or {})
+    for header in headers:
+        key = SECTION_KEY_BY_HEADER.get(header)
+        if key is not None:
+            section_map[key] = on
+    if section_map:
+        meta["section_updated"] = section_map
     return meta
 
 

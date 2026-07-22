@@ -28,6 +28,7 @@ forms no opinions and writes nothing to the wiki.
 skills:
   - kb-search
   - fetch-stock-research-data
+  - bootstrap-stock-research
   - evaluate-stock-decision
 ```
 
@@ -35,7 +36,24 @@ skills:
 |---|---|
 | `kb-search` | Check whether `stocks/TICKER.md` exists (page content is not read here). |
 | `fetch-stock-research-data` | Pull the 12 yfinance research groups (incl. fund-only `funds`) into JSON. |
+| `bootstrap-stock-research` | First-run only: fetch ephemeral annual financial context (decision #9). |
 | `evaluate-stock-decision` | Build the scoring worksheet (`scoring_worksheet.py`). |
+
+## KB-population inputs (from `kb-orchestrator`)
+
+When dispatched by `kb-orchestrator`, the prompt carries two extra inputs from
+the staleness gate:
+
+- **`first_run`** — no `stocks/TICKER.md` yet. The agent additionally invokes
+  `bootstrap-stock-research` (`annual-financial-context --ticker <TICKER>`) and
+  hands the resulting `annual-financial-context.v1` JSON to the analyst as
+  one-time narrative context for the initial Company Overview / Original Thesis
+  (decision #9). This context is ephemeral — never written to `Knowledge-Base/`,
+  never persisted, never re-fetched on an incremental run.
+- **`due_sections`** — on an incremental run, the agent fetches/prepares only
+  data relevant to the stale sections, avoiding wasted fetches. On a first run
+  every section is due, so `due_sections` is ignored and the full worksheet is
+  prepared.
 
 ## Workflow
 

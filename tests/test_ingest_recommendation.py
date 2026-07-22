@@ -217,6 +217,28 @@ class IngestTest(IngestFixture):
         self.assertIn("Hand-written original thesis.", after)
         self.assertNotIn("Apple designs and sells consumer electronics", after)
 
+    def test_section_updated_stamped_for_rewritten_gated_sections(self):
+        # On create+ingest this artifact rewrites Status, Updated Thesis,
+        # Valuation Analysis, Bull/Bear/Key Risks, Monitoring, Analyst View, and
+        # (on creation) Company Overview -- each must land in section_updated
+        # keyed by its section key, dated today. Non-rewritten gated sections
+        # (Market Sentiment, Options Activity, Insider Activity, Portfolio Fit)
+        # and non-gated sections (Original Thesis) must be absent.
+        ingest_mod.ingest(self._write_artifact())
+        meta, _ = kb_pages.parse_page_file(self.kb_root / "stocks" / "AAPL.md")
+        section_updated = meta.get("section_updated") or {}
+        today = kb_pages.today()
+        expected_keys = {
+            "status", "updated_thesis", "valuation_analysis", "bull_case",
+            "bear_case", "key_risks", "monitoring_checklist", "analyst_view",
+            "company_overview",
+        }
+        self.assertEqual(set(section_updated), expected_keys)
+        self.assertTrue(all(v == today for v in section_updated.values()))
+        # Not rewritten this run:
+        self.assertNotIn("market_sentiment", section_updated)
+        self.assertNotIn("options_activity", section_updated)
+
     def test_same_date_duplicate_refused(self):
         self._create_page()
         ingest_mod.ingest(self._write_artifact(name="first.json", generated="2026-07-13"))
