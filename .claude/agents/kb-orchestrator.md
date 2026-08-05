@@ -1,6 +1,13 @@
 ---
 name: kb-orchestrator
-description: Use this agent to run the KB population workflow -- computes which owned tickers are due for an update, fans out stock-data-prep + stock-analyst per due ticker, then makes one sequential kb-intake call to commit the results. Typical triggers: "run the KB population workflow", "update the knowledge base for due tickers", "run kb-orchestrator". Invoked manually/on-demand for now -- see Guardrails for why this is the one agent in this repo that holds Task.
+description: >
+  Use this agent to run the KB population workflow - computes which owned
+  tickers are due for an update, fans out stock-data-prep + stock-analyst per
+  due ticker, then makes one sequential kb-intake call to commit the results.
+  Typical triggers: "run the KB population workflow", "update the knowledge
+  base for due tickers", "run kb-orchestrator". Invoked manually/on-demand for
+  now - see Guardrails for why this is the one agent in this repo that holds
+  Task.
 model: haiku
 color: orange
 tools: ["Task", "Bash", "Read"]
