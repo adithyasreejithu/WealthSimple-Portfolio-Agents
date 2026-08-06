@@ -140,6 +140,65 @@ def latest_fx_rate(connection: Any, currency: str) -> tuple[Decimal, str | None]
     return Decimal("1"), "fx_unavailable"
 
 
+def read_live_position_values(connection: Any, ticker_ids: list[int] | None = None) -> list[dict[str, Any]]:
+    """Stored position state joined to the latest ingested close per ticker.
+
+    Plain `SELECT`s only -- safe on a read-only connection. This is the one
+    place "what is this position worth right now" is queried; both the
+    write path (`analytics.py::_get_net_positions`, after
+    `ensure_positions_fresh` self-heals `position_snapshots`) and read-only
+    callers (e.g. investment-analyst-resources, which cannot take the write
+    lock to self-heal) share it, so there is exactly one query for the
+    underlying facts even though the two paths differ in whether they
+    refresh `position_snapshots` first.
+    """
+    filter_clause = ""
+    params: list[Any] = []
+    if ticker_ids is not None:
+        placeholders = ",".join("?" for _ in ticker_ids)
+        filter_clause = f"AND s.ticker_id IN ({placeholders})"
+        params = list(ticker_ids)
+    rows = connection.execute(
+        f"""
+        WITH latest_prices AS (
+            SELECT DISTINCT ON (ticker_id)
+                ticker_id,
+                record_date,
+                close
+            FROM historical_records
+            ORDER BY ticker_id, record_date DESC
+        )
+        SELECT
+            t.ticker_id,
+            t.ticker_symbol,
+            t.exchange,
+            t.security_name,
+            t.security_type,
+            t.currency,
+            s.quantity,
+            s.book_value_cad,
+            s.book_value_mkt,
+            s.provisional_quantity,
+            s.realized_gain_cad,
+            s.data_quality_flags,
+            lp.record_date,
+            lp.close
+        FROM position_snapshots s
+        JOIN tickers t ON t.ticker_id = s.ticker_id
+        LEFT JOIN latest_prices lp ON lp.ticker_id = s.ticker_id
+        WHERE (s.quantity <> 0 OR s.data_quality_flags IS NOT NULL) {filter_clause}
+        ORDER BY t.ticker_symbol, t.exchange
+        """,
+        params,
+    ).fetchall()
+    columns = [
+        "ticker_id", "ticker_symbol", "exchange", "security_name", "security_type", "currency",
+        "quantity", "book_value_cad", "book_value_mkt", "provisional_quantity", "realized_gain_cad",
+        "data_quality_flags", "last_price_date", "last_price",
+    ]
+    return [dict(zip(columns, row)) for row in rows]
+
+
 def _fx_on_or_before(series: dict[date, Decimal], event_date: date) -> Decimal | None:
     for lag in range(_FX_MAX_LAG_DAYS + 1):
         candidate = series.get(event_date - timedelta(days=lag))

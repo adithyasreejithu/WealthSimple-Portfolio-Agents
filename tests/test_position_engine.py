@@ -399,6 +399,35 @@ class PositionEngineTest(unittest.TestCase):
         quantity = self._snapshot(ticker_id)[0]
         self.assertEqual(quantity, Decimal("2.00000000"))
 
+    def test_read_live_position_values_scoped_matches_unscoped(self):
+        # Shared by analytics.py's write path and investment-analyst-resources'
+        # read-only path -- one query, filterable to specific tickers or all.
+        aapl = self._ticker("AAPL", currency="USD")
+        msft = self._ticker("MSFT", currency="USD")
+        self._buy(aapl, date(2025, 1, 1), Decimal("1"), Decimal("100"))
+        self._buy(msft, date(2025, 1, 1), Decimal("1"), Decimal("200"))
+        self.connection.execute(
+            "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [aapl, date(2025, 1, 2), 150.0, 150.0, 150.0, 150.0, 150.0, 100],
+        )
+        self.connection.execute(
+            "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [msft, date(2025, 1, 2), 250.0, 250.0, 250.0, 250.0, 250.0, 100],
+        )
+        position_engine.recompute_positions(self.connection)
+
+        all_rows = position_engine.read_live_position_values(self.connection)
+        self.assertEqual({row["ticker_id"] for row in all_rows}, {aapl, msft})
+
+        scoped_rows = position_engine.read_live_position_values(self.connection, ticker_ids=[aapl])
+        self.assertEqual(len(scoped_rows), 1)
+        scoped = scoped_rows[0]
+        self.assertEqual(scoped["ticker_id"], aapl)
+        self.assertEqual(float(scoped["last_price"]), 150.0)
+
+        unscoped = next(row for row in all_rows if row["ticker_id"] == aapl)
+        self.assertEqual(unscoped, scoped)
+
 
 if __name__ == "__main__":
     unittest.main()

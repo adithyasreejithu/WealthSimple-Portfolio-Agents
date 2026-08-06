@@ -25,7 +25,13 @@ from config import (
     WEALTHSIMPLE_FX_FEE_RATE,
 )
 from database import get_shared_connection
-from position_engine import _build_fx_series, _resolve_fx, ensure_positions_fresh, latest_fx_rate
+from position_engine import (
+    _build_fx_series,
+    _resolve_fx,
+    ensure_positions_fresh,
+    latest_fx_rate,
+    read_live_position_values,
+)
 from portfolio_metrics import (
     calculate_adjusted_daily_returns,
     calculate_adjusted_sharpe_ratio,
@@ -125,47 +131,25 @@ def _get_net_positions(db_path: str = DATABASE_PATH) -> list[Holding]:
     connection = get_shared_connection(db_path)
     ensure_positions_fresh(connection)
 
-    rows = connection.execute(
-        """
-        WITH latest_prices AS (
-            SELECT DISTINCT ON (ticker_id)
-                ticker_id,
-                record_date,
-                close
-            FROM historical_records
-            ORDER BY ticker_id, record_date DESC
-        )
-        SELECT
-            t.ticker_id,
-            t.ticker_symbol,
-            t.exchange,
-            t.security_name,
-            t.security_type,
-            t.currency,
-            s.quantity,
-            s.book_value_cad,
-            s.book_value_mkt,
-            s.provisional_quantity,
-            s.realized_gain_cad,
-            s.data_quality_flags,
-            lp.record_date,
-            lp.close
-        FROM position_snapshots s
-        JOIN tickers t ON t.ticker_id = s.ticker_id
-        LEFT JOIN latest_prices lp ON lp.ticker_id = s.ticker_id
-        WHERE s.quantity <> 0 OR s.data_quality_flags IS NOT NULL
-        ORDER BY t.ticker_symbol, t.exchange
-        """
-    ).fetchall()
+    rows = read_live_position_values(connection)
 
     fx_cache: dict[str, Decimal] = {}
     holdings: list[Holding] = []
     for row in rows:
-        (
-            ticker_id, symbol, exchange, name, security_type, currency,
-            quantity, book_cad, book_mkt, provisional, realized_cad, flags_json,
-            price_date, close,
-        ) = row
+        ticker_id = row["ticker_id"]
+        symbol = row["ticker_symbol"]
+        exchange = row["exchange"]
+        name = row["security_name"]
+        security_type = row["security_type"]
+        currency = row["currency"]
+        quantity = row["quantity"]
+        book_cad = row["book_value_cad"]
+        book_mkt = row["book_value_mkt"]
+        provisional = row["provisional_quantity"]
+        realized_cad = row["realized_gain_cad"]
+        flags_json = row["data_quality_flags"]
+        price_date = row["last_price_date"]
+        close = row["last_price"]
         quantity_value = _decimal(quantity)
         last_price = _decimal(close) if close is not None else None
         if currency not in fx_cache:
