@@ -33,9 +33,12 @@ sys.path.insert(0, str(ROOT / ".claude" / "skills" / "fetch-stock-research-data"
 import db_resources  # noqa: E402
 import derived_metrics  # noqa: E402
 import freshness_gate  # noqa: E402
+import skill_trace  # noqa: E402
 from config import DATABASE_PATH  # noqa: E402
 from fetch_stock_research_data import fetch_stock_research_data  # noqa: E402
 from yfinance_extractor import _build_session, _create_ticker, _require_yfinance  # noqa: E402
+
+SKILL_NAME = "investment-analyst-resources"
 
 SCHEMA = "investment-analyst-resources.v1"
 
@@ -49,7 +52,6 @@ LIVE_TOP_UP_GROUPS = (
 )
 
 DEFAULT_OUTPUT_DIR = ROOT / "exports" / "investment-analyst-resources"
-DEFAULT_TRACE_LOG_PATH = ROOT / "logs" / "InvestmentAnalystResourcesTrace.txt"
 DIGEST_SOFT_LIMIT_BYTES = 8192
 
 
@@ -274,7 +276,7 @@ def build_bundle(
 def _write_bundle(ticker: str, bundle: dict[str, Any], output: Path | None, today: date, pretty: bool) -> Path:
     path = output or (DEFAULT_OUTPUT_DIR / f"{ticker}-{today.isoformat()}-resources.json")
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(db_resources.to_json_safe(bundle), indent=2 if pretty else None)
+    text = json.dumps(db_resources.to_json_safe(bundle), indent=2)
     path.write_text(text, encoding="utf-8")
     return path
 
@@ -293,47 +295,133 @@ def _is_stock(gate_result: dict[str, Any]) -> bool:
     return gate_result.get("asset_class") == "stock"
 
 
-# Field-level manifest, one entry per digest domain. `container` extracts
-# the sub-dict to check fields against (None means "domain absent this
-# run"); `empty_expected` tells the difference between an absent domain
-# that's normal (an ETF's financials, a watchlist ticker's position) and one
-# that's a genuine gap -- generalizing `scoring_worksheet.py`'s
-# `_groups_ok_count` emptiness rule from "live groups only" to every domain.
+def _live_group_ok(digest: dict[str, Any], group: str) -> bool:
+    """Did this live group come back with anything at all on this run?
+
+    Coarse -- the digest only carries per-group status. Enough for the
+    `live.*` domain itself, but not for the derived metrics: yfinance reports
+    an `options` group for a ticker whose chain list is empty, so this returns
+    True in cases where there is still nothing to compute from. The
+    `_has_*` predicates below check the actual inputs instead.
+    """
+    live = digest.get("live") or {}
+    if live.get("skipped"):
+        return False
+    return (live.get(group) or {}).get("status") == "ok"
+
+
+# Applicability for derived metrics is decided against the *exact inputs the
+# formula reads*, by calling `derived_metrics`' own accessors. Anything looser
+# (such as the group's status) misclassifies a present-but-empty group -- the
+# case that made a healthy TSX run report eleven phantom gaps -- and anything
+# hand-rolled here could drift from the metric it is meant to describe.
+
+def _has_options_chain(live_data: dict[str, Any]) -> bool:
+    return derived_metrics._nearest_chain(live_data or {}) is not None
+
+
+def _has_analyst_actions(live_data: dict[str, Any]) -> bool:
+    return bool(derived_metrics._analyst_actions(live_data or {}))
+
+
+def _has_insider_purchases(live_data: dict[str, Any]) -> bool:
+    purchases = ((live_data or {}).get("insider") or {}).get("purchases")
+    return isinstance(purchases, dict) and bool(purchases)
+
+
+def _has_valuation(live_data: dict[str, Any]) -> bool:
+    return bool((live_data or {}).get("valuation"))
+
+
+def _price_span_days(digest: dict[str, Any]) -> int:
+    """Calendar days covered by the DB price series, or 0 if unknown.
+
+    A return window longer than the available history is not a data failure --
+    a security listed six months ago has no 365-day return to fetch.
+    """
+    prices = digest.get("prices") or {}
+    start, end = prices.get("start"), prices.get("end")
+    if not start or not end:
+        return 0
+    try:
+        start_date = date.fromisoformat(str(start)[:10])
+        end_date = date.fromisoformat(str(end)[:10])
+    except ValueError:
+        return 0
+    return max((end_date - start_date).days, 0)
+
+
+def _has_financials(digest: dict[str, Any]) -> bool:
+    return bool((digest.get("financials") or {}).get("periods"))
+
+
+# Derived metrics are grouped by the source they are computed from, because
+# applicability is a property of that source: with no options chain there is
+# nothing for the seven options metrics to be missing from. Grouping also
+# keeps the trace line readable -- `derived.options[7]` instead of seven
+# spelled-out field paths.
+_DERIVED_OPTIONS = ("put_call_oi_ratio", "put_call_volume_ratio", "atm_iv_near",
+                    "atm_iv_far", "iv_skew", "max_oi_call_strike", "max_oi_put_strike")
+_DERIVED_ANALYST = ("upgrades_90d", "downgrades_90d", "net_revisions_365d")
+_DERIVED_INSIDER = ("net_insider_shares",)
+_DERIVED_VALUATION = ("fcf_yield",)
+_DERIVED_FINANCIALS = ("debt_to_equity", "current_ratio",
+                       "net_income_latest_quarter", "revenue_growth_yoy")
+_DERIVED_RETURNS = {"return_30d": 30, "return_90d": 90, "return_365d": 365}
+
+# Field-level manifest, one entry per digest domain. `container` extracts the
+# sub-dict to check fields against (None means "domain absent this run").
+# `applicable(gate, digest, live_data)` decides whether this domain could have
+# had data at all for this subject: when it returns False every field is
+# reported as not-applicable and excluded from the completeness denominator,
+# rather than counted as a gap. That distinction is the whole point -- an ETF
+# has no balance sheet to be missing, and grading it against one produced a
+# misleading score.
 DOMAIN_MANIFEST: list[dict[str, Any]] = [
     {"name": "position", "fields": ["quantity", "book_value_cad", "realized_gain_cad", "computed_at"],
-     "container": lambda d: d.get("position"), "empty_expected": lambda g: not _owned(g)},
+     "container": lambda d: d.get("position"), "applicable": lambda g, d, ld: _owned(g)},
     {"name": "ledger_summary",
      "fields": ["first_purchase_date", "latest_purchase_date", "number_of_buys", "number_of_sells"],
-     "container": lambda d: d.get("ledger_summary"), "empty_expected": lambda g: not _owned(g)},
+     "container": lambda d: d.get("ledger_summary"), "applicable": lambda g, d, ld: _owned(g)},
     {"name": "portfolio_context",
      "fields": ["role", "weight_pct", "position_market_value", "cost_basis_cad", "unrealized_gain_cad", "account_type"],
-     "container": lambda d: d.get("portfolio_context"), "empty_expected": lambda g: not _owned(g)},
+     "container": lambda d: d.get("portfolio_context"), "applicable": lambda g, d, ld: _owned(g)},
     {"name": "prices", "fields": ["latest_close", "period_return_pct", "week52_low", "week52_high"],
      "container": lambda d: d.get("prices") if (d.get("prices") or {}).get("count") else None,
-     "empty_expected": lambda g: not _owned(g)},
+     "applicable": lambda g, d, ld: _owned(g)},
     {"name": "financials", "fields": ["latest_period_end", "latest_revenue", "latest_net_income", "latest_eps"],
      "container": lambda d: d.get("financials") if (d.get("financials") or {}).get("periods") else None,
-     "empty_expected": lambda g: not _owned(g) or _is_etf(g)},
+     "applicable": lambda g, d, ld: _owned(g) and not _is_etf(g)},
     {"name": "earnings", "fields": ["last_reported"],
      "container": lambda d: d.get("earnings") if (d.get("earnings") or {}).get("events") else None,
-     "empty_expected": lambda g: not _owned(g) or _is_etf(g)},
+     "applicable": lambda g, d, ld: _owned(g) and not _is_etf(g)},
     {"name": "dividends", "fields": ["declared_count", "total_received_cad"],
-     "container": lambda d: d.get("dividends"), "empty_expected": lambda g: False},
+     "container": lambda d: d.get("dividends"), "applicable": lambda g, d, ld: True},
     {"name": "classification", "fields": ["primary_group", "confidence", "generated_at"],
-     "container": lambda d: d.get("classification"), "empty_expected": lambda g: not _owned(g)},
+     "container": lambda d: d.get("classification"), "applicable": lambda g, d, ld: _owned(g)},
     {"name": "stock_details", "fields": ["sector", "industry"],
-     "container": lambda d: d.get("stock_details"), "empty_expected": lambda g: not _owned(g) or _is_etf(g)},
+     "container": lambda d: d.get("stock_details"), "applicable": lambda g, d, ld: _owned(g) and not _is_etf(g)},
     {"name": "etf_details", "fields": ["fund_family", "yield", "expense_ratio", "aum", "nav"],
-     "container": lambda d: d.get("etf_details"), "empty_expected": lambda g: not _owned(g) or _is_stock(g)},
-    {"name": "derived", "fields": list(derived_metrics.LIVE_METRICS) + list(derived_metrics.DB_METRICS),
-     "container": lambda d: d.get("derived"), "empty_expected": lambda g: False},
+     "container": lambda d: d.get("etf_details"), "applicable": lambda g, d, ld: _owned(g) and not _is_stock(g)},
+    {"name": "derived.options", "fields": list(_DERIVED_OPTIONS),
+     "container": lambda d: d.get("derived"), "applicable": lambda g, d, ld: _has_options_chain(ld)},
+    {"name": "derived.analyst", "fields": list(_DERIVED_ANALYST),
+     "container": lambda d: d.get("derived"), "applicable": lambda g, d, ld: _has_analyst_actions(ld)},
+    {"name": "derived.insider", "fields": list(_DERIVED_INSIDER),
+     "container": lambda d: d.get("derived"), "applicable": lambda g, d, ld: _has_insider_purchases(ld)},
+    {"name": "derived.valuation", "fields": list(_DERIVED_VALUATION),
+     "container": lambda d: d.get("derived"),
+     "applicable": lambda g, d, ld: not _is_etf(g) and _has_valuation(ld)},
+    {"name": "derived.financials", "fields": list(_DERIVED_FINANCIALS),
+     "container": lambda d: d.get("derived"),
+     "applicable": lambda g, d, ld: not _is_etf(g) and _has_financials(d)},
 ]
 
 # `funds` structurally errors for every stock (get_funds_data() raises for
 # equities -- see fetch_stock_research_data.py's _fetch_funds), so it is
-# excluded from the denominator for stocks the same way v1's
-# yfinance-research-contract.md documents it as expected, not a failure.
-LIVE_GROUP_EMPTY_EXPECTED: dict[str, Callable[[dict[str, Any]], bool]] = {"funds": _is_stock}
+# not-applicable there, exactly as v1's yfinance-research-contract.md
+# documents it: expected, not a failure.
+LIVE_GROUP_NOT_APPLICABLE: dict[str, Callable[[dict[str, Any]], bool]] = {"funds": _is_stock}
 
 
 def _field_ok(value: Any) -> bool:
@@ -346,103 +434,138 @@ def _field_ok(value: Any) -> bool:
     return True
 
 
-def compute_completeness_trace(digest: dict[str, Any], gate_result: dict[str, Any]) -> dict[str, Any]:
-    """Field- and domain-level completeness for this run's digest.
+def _add_return_metrics(trace: skill_trace.Trace, digest: dict[str, Any]) -> None:
+    """Price returns, graded only against windows the history actually covers."""
+    derived = digest.get("derived") or {}
+    span = _price_span_days(digest)
+    domain = trace.add("derived.prices")
+    for name, window in _DERIVED_RETURNS.items():
+        if span < window:
+            domain.not_applicable.append(name)
+        elif _field_ok(derived.get(name)):
+            domain.ok.append(name)
+        else:
+            domain.missing.append(name)
 
-    Two levels: domain-level ok/empty-expected/failed (was this section of
-    the bundle even attempted and, if not, was that normal for this
-    ticker's asset class/ownership), and field-level counts within each
-    attempted domain (the literal "how many fields were successfully
-    populated" count). An empty-expected domain is excluded from the
-    denominator entirely so it never drags down a healthy run's score.
+
+def build_trace(
+    digest: dict[str, Any],
+    gate_result: dict[str, Any],
+    ticker: str,
+    live_data: dict[str, Any] | None = None,
+) -> skill_trace.Trace:
+    """Classify every field of this run's digest as ok / missing / N-A.
+
+    Completeness is measured against what was *obtainable* for this subject,
+    not against the full manifest: a domain that could not apply is reported
+    separately and kept out of the denominator. See `src/skill_trace.py` for
+    why that distinction matters.
+
+    `live_data` is the raw live top-up, needed because the digest carries only
+    per-group status -- and a group can be present but empty, which is the
+    difference between "no options chain exists" and "the options fetch
+    failed".
     """
-    fields_ok = 0
-    fields_total = 0
-    domains_ok = 0
-    domains_empty = 0
-    domains_failed = 0
-    missing: list[str] = []
+    live_data = live_data or {}
+    trace = skill_trace.Trace(
+        skill=SKILL_NAME, subject=ticker, kind=gate_result.get("asset_class")
+    )
 
     for spec in DOMAIN_MANIFEST:
+        fields = spec["fields"]
+        if not spec["applicable"](gate_result, digest, live_data):
+            trace.add(spec["name"], not_applicable=fields)
+            continue
         container = spec["container"](digest)
         if not container:
-            if spec["empty_expected"](gate_result):
-                domains_empty += 1
-            else:
-                domains_failed += 1
-                fields_total += len(spec["fields"])
-                missing.extend(f"{spec['name']}.{field}" for field in spec["fields"])
+            # Applicable but absent: a real gap, not an expected emptiness.
+            trace.add(spec["name"], missing=fields)
             continue
-        domains_ok += 1
-        for field in spec["fields"]:
-            fields_total += 1
-            if _field_ok(container.get(field)):
-                fields_ok += 1
-            else:
-                missing.append(f"{spec['name']}.{field}")
+        domain = trace.add(spec["name"])
+        for field_name in fields:
+            target = domain.ok if _field_ok(container.get(field_name)) else domain.missing
+            target.append(field_name)
+
+    _add_return_metrics(trace, digest)
 
     live = digest.get("live") or {}
-    if not live.get("skipped"):
+    live_domain = trace.add("live")
+    if live.get("skipped"):
+        # `--no-live` is a deliberate choice, not a failure to fetch.
+        live_domain.not_applicable.extend(LIVE_TOP_UP_GROUPS)
+    else:
         for group in LIVE_TOP_UP_GROUPS:
             status = (live.get(group) or {}).get("status")
+            not_applicable = LIVE_GROUP_NOT_APPLICABLE.get(group)
             if status == "ok":
-                domains_ok += 1
-                fields_total += 1
-                fields_ok += 1
+                live_domain.ok.append(group)
+            elif not_applicable and not_applicable(gate_result):
+                live_domain.not_applicable.append(group)
             elif status == "empty":
-                domains_empty += 1
+                # The source answered and had nothing -- no coverage exists to
+                # be missing (no analyst follows this name, no insider filings).
+                live_domain.not_applicable.append(group)
             else:
-                empty_expected = LIVE_GROUP_EMPTY_EXPECTED.get(group)
-                if empty_expected and empty_expected(gate_result):
-                    domains_empty += 1
-                else:
-                    domains_failed += 1
-                    fields_total += 1
-                    missing.append(f"live.{group}")
+                live_domain.missing.append(group)
 
-    # Mirrors the `live.get("skipped")` short-circuit above: `--no-quote`
-    # excludes the domain entirely (not even "empty"), rather than folding
-    # it into DOMAIN_MANIFEST's generic loop, which has no concept of a
-    # deliberately-skipped fetch distinct from a genuinely absent one.
     quote = digest.get("quote")
-    if quote is not None and not quote.get("skipped"):
-        domains_ok += 1
-        for field in ("price", "as_of"):
-            fields_total += 1
-            if _field_ok(quote.get(field)):
-                fields_ok += 1
-            else:
-                missing.append(f"quote.{field}")
+    quote_domain = trace.add("quote")
+    if quote is not None and quote.get("skipped"):
+        quote_domain.not_applicable.extend(["price", "as_of"])
     elif quote is None:
-        domains_failed += 1
-        fields_total += 2
-        missing.extend(["quote.price", "quote.as_of"])
+        quote_domain.missing.extend(["price", "as_of"])
+    else:
+        for field_name in ("price", "as_of"):
+            target = quote_domain.ok if _field_ok(quote.get(field_name)) else quote_domain.missing
+            target.append(field_name)
 
-    completeness_pct = (fields_ok / fields_total * 100) if fields_total else 100.0
-    return {
-        "fields_ok": fields_ok,
-        "fields_total": fields_total,
-        "completeness_pct": round(completeness_pct, 1),
-        "domains_ok": domains_ok,
-        "domains_empty": domains_empty,
-        "domains_failed": domains_failed,
-        "missing_fields": missing,
-    }
+    return trace
 
 
-def write_trace_log(ticker: str, gate_result: dict[str, Any], trace: dict[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    missing = ",".join(trace["missing_fields"]) or "-"
-    line = (
-        f"{timestamp} | TRACE | ticker={ticker} | asset_class={gate_result.get('asset_class')} | "
-        f"fields_ok={trace['fields_ok']} | fields_total={trace['fields_total']} | "
-        f"completeness_pct={trace['completeness_pct']} | domains_ok={trace['domains_ok']} | "
-        f"domains_empty={trace['domains_empty']} | domains_failed={trace['domains_failed']} | "
-        f"missing={missing}\n"
-    )
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(line)
+def _register_bundle_evidence(
+    run_dir: Path,
+    run_id: str,
+    ticker: str,
+    bundle_path: Path,
+    trace: skill_trace.Trace | None,
+) -> None:
+    """Record the bundle in the run's evidence registry.
+
+    Best-effort: a registry failure must not discard a data pull that
+    succeeded. The status reflects what was actually obtained -- `partial`
+    when the trace found real gaps -- so a downstream stage reading the
+    manifest is told the truth about this evidence rather than assuming
+    "present" means "complete".
+    """
+    try:
+        from workspace import audit as audit_module
+        from workspace import evidence as evidence_module
+
+        status = "available"
+        if trace is not None and trace.fields_missing:
+            status = "partial"
+
+        record = evidence_module.register(
+            run_dir,
+            run_id=run_id,
+            evidence_type="market_data_bundle",
+            source_name="duckdb+yfinance",
+            status=status,
+            artifact=bundle_path,
+            retrieved_at=datetime.now().isoformat(timespec="seconds"),
+            collection_method=SKILL_NAME,
+            notes=[f"ticker={ticker}"],
+        )
+        audit_module.append_event(
+            run_dir,
+            run_id=run_id,
+            event="evidence_registered",
+            actor=SKILL_NAME,
+            evidence_id=record.evidence_id,
+            details={"type": record.evidence_type, "status": status, "ticker": ticker},
+        )
+    except Exception as exc:  # noqa: BLE001 -- never sink a successful pull
+        print(f"# warning: could not register evidence for {ticker}: {exc}", file=sys.stderr)
 
 
 def process_ticker(
@@ -457,9 +580,13 @@ def process_ticker(
     no_quote: bool,
     output: Path | None,
     classification_json: Path,
-    trace_log_path: Path,
     today: date,
     pretty: bool,
+    run_dir: Path | None = None,
+    run_id: str | None = None,
+    trace_log_path: Path | None = None,
+    workspace_status: str | None = None,
+    skip_reason: str | None = None,
 ) -> dict[str, Any]:
     if not gate_result.get("resolved"):
         digest = {"schema": SCHEMA, "ticker": ticker, "resolved": False, "gaps": gate_result.get("gaps", [])}
@@ -493,10 +620,23 @@ def process_ticker(
         no_live=no_live, no_quote=no_quote, today=today,
     )
 
+    trace: skill_trace.Trace | None = None
     if not no_trace:
-        trace = compute_completeness_trace(digest, gate_result)
-        digest["trace"] = trace
-        write_trace_log(ticker, gate_result, trace, trace_log_path)
+        trace = build_trace(digest, gate_result, ticker, live_data)
+        # Set before either `to_dict()` call -- the digest's copy of the trace
+        # must carry the workspace outcome too, not just the log line.
+        if workspace_status is not None:
+            trace.workspace = skill_trace.WorkspaceOutcome(
+                status=workspace_status, run_id=run_id, skip_reason=skip_reason
+            )
+        digest["trace"] = trace.to_dict()
+        skill_trace.emit(
+            trace,
+            run_dir=run_dir,
+            run_id=run_id,
+            text_log_path=trace_log_path,
+            jsonl_log_path=trace_log_path.with_suffix(".jsonl") if trace_log_path else None,
+        )
 
     bundle_path = None
     if not no_bundle:
@@ -506,7 +646,14 @@ def process_ticker(
         )
         if not no_trace:
             bundle["trace"] = digest["trace"]
-        bundle_path = _write_bundle(ticker, bundle, output, today, pretty)
+        # Inside a run the bundle is that run's evidence, so it lands in the
+        # run directory and gets registered; outside one, nothing changes.
+        destination = output
+        if destination is None and run_dir is not None:
+            destination = run_dir / "evidence" / f"{ticker}-{today.isoformat()}-resources.json"
+        bundle_path = _write_bundle(ticker, bundle, destination, today, pretty)
+        if run_dir is not None and run_id is not None:
+            _register_bundle_evidence(run_dir, run_id, ticker, bundle_path, trace)
     return {"digest": digest, "bundle_path": str(bundle_path) if bundle_path else None}
 
 
@@ -539,13 +686,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override the classification export path (testing).",
     )
     parser.add_argument(
-        "--trace-log-path", type=Path, default=DEFAULT_TRACE_LOG_PATH,
-        help="Override the completeness-trace log path (testing).",
+        "--run-id",
+        help="Attach to this run workspace by name, creating it if it does not exist. "
+             "A run is opened by default for any evidence-producing pull (--mode read or "
+             "the default gate->refresh->read sequence) even without this flag -- pass it "
+             "to name the run explicitly, e.g. to group several tickers into one run. "
+             "See --no-run to opt out instead.",
+    )
+    parser.add_argument(
+        "--no-run", action="store_true",
+        help="Do not attach to or create a run workspace; write the bundle to exports/ "
+             "instead, as before this became the default. The opt-out is still recorded "
+             "in the completeness trace (workspace.skip_reason), so it stays auditable "
+             "rather than silent.",
+    )
+    parser.add_argument(
+        "--trace-log-path", type=Path, default=None,
+        help="Override the shared trace log path (testing). The .jsonl sidecar follows it.",
     )
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     args = parser.parse_args(argv)
     if args.output and len(args.ticker) > 1:
         parser.error("--output requires exactly one --ticker")
+    if args.no_run and args.run_id:
+        parser.error("--no-run and --run-id are contradictory: --run-id asks to attach to a run")
     return args
 
 
@@ -558,9 +722,80 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def _resolve_run(
+    args: argparse.Namespace, tickers: list[str], *, produces_evidence: bool
+) -> tuple[Path | None, str | None, str, str | None]:
+    """Attach this pull to a run workspace, creating one if it does not exist.
+
+    Returns `(run_dir, resolved_run_id, workspace_status, skip_reason)`.
+    `workspace_status` is one of `"created"` / `"attached"` / `"skipped"`;
+    `run_dir`/`resolved_run_id` are None exactly when it is `"skipped"`.
+
+    Attaching is **default-on** for any invocation that actually produces
+    evidence (`--mode read` or the default gate->refresh->read sequence).
+    Before this, a run only existed if whoever composed the command line
+    remembered to pass `--run-id` -- a judgment call an agent could skip on
+    any given invocation, and did: the old `SKILL.md` even said "omit for the
+    unchanged exports/ behavior." An audit trail cannot tolerate that: an
+    absent run looked identical to "no pull happened." Flipping the default
+    puts the decision inside the code, the same way the completeness trace
+    already does (`if not no_trace`) rather than leaving it to the caller.
+
+    Three things still skip the workspace, and each records *why* rather than
+    silently doing nothing:
+      - `--mode gate` / `--mode refresh` -- neither produces an evidence
+        artifact, so there is nothing to register.
+      - `--no-run` -- an explicit, recorded opt-out.
+      - a non-default `--db-path` -- the existing test/debug convention (see
+        the sibling market-analyst-resources skill's `is_default_db`), so the
+        test suite does not pollute `workspace/runs/`.
+    A skip is written into the trace's `workspace` field either way, so it is
+    a positive, greppable record in `logs/SkillTrace.jsonl` -- never a silent
+    gap indistinguishable from "nothing ran."
+
+    Creating on miss (an explicit `--run-id` that does not exist yet, or the
+    implicit default-on path) is what removes the `run create` ceremony. Its
+    cost: a mistyped `--run-id` becomes a new empty run rather than an error,
+    so creation always prints `note: created run workspace <id>` to stderr --
+    an unfamiliar ID scrolling past is the only cue a typo happened rather
+    than an attach. Never fall back to `exports/` once a run is decided: a
+    quietly unregistered file is the untracked handoff the workspace exists
+    to eliminate.
+    """
+    if not produces_evidence:
+        return None, None, "skipped", "read-only mode" if args.mode == "gate" else "no evidence produced"
+    if args.no_run:
+        return None, None, "skipped", "--no-run"
+    if args.db_path != DATABASE_PATH:
+        return None, None, "skipped", "non-default-db"
+
+    from workspace import run as run_module
+
+    resolved, directory, created = run_module.ensure_run(
+        args.run_id,
+        mode="data_pull",
+        subject_type="security",
+        # Only name a subject when there is exactly one -- a multi-ticker pull
+        # has no single subject, and picking the first would misdescribe it.
+        ticker=tickers[0] if len(tickers) == 1 else None,
+        question=(
+            f"Ad-hoc data pull for {', '.join(tickers)}; "
+            "no research question was recorded."
+        ),
+        trigger=SKILL_NAME,
+    )
+    if created:
+        print(f"note: created run workspace {resolved}", file=sys.stderr)
+    return directory, resolved, ("created" if created else "attached"), None
+
+
 def _dispatch(args: argparse.Namespace) -> int:
     today = date.today()
     tickers = [t.upper() for t in args.ticker]
+    produces_evidence = args.mode in (None, "read")
+    run_dir, run_id, workspace_status, skip_reason = _resolve_run(
+        args, tickers, produces_evidence=produces_evidence
+    )
 
     if args.mode == "gate":
         results = _run_gate(tickers, args.db_path, force=args.force_refresh, run_date=today)
@@ -581,6 +816,8 @@ def _dispatch(args: argparse.Namespace) -> int:
                 no_live=args.no_live, no_bundle=args.no_bundle, no_trace=args.no_trace, no_quote=args.no_quote,
                 output=args.output, classification_json=args.classification_json,
                 trace_log_path=args.trace_log_path, today=today, pretty=args.pretty,
+                run_dir=run_dir, run_id=run_id,
+                workspace_status=workspace_status, skip_reason=skip_reason,
             )
             for ticker, gate_result in zip(tickers, gate_results)
         ]
@@ -611,6 +848,8 @@ def _dispatch(args: argparse.Namespace) -> int:
             no_live=args.no_live, no_bundle=args.no_bundle, no_trace=args.no_trace, no_quote=args.no_quote,
             output=args.output, classification_json=args.classification_json,
             trace_log_path=args.trace_log_path, today=today, pretty=args.pretty,
+            run_dir=run_dir, run_id=run_id,
+            workspace_status=workspace_status, skip_reason=skip_reason,
         )
         digest_text = json.dumps(db_resources.to_json_safe(output["digest"]), indent=2 if args.pretty else None)
         print(digest_text)
