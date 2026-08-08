@@ -44,5 +44,12 @@ edit `ref/`**.
 writes it. Every tunable number (gate thresholds, weights, anchor cutoffs,
 bands) lives there for the portfolio owner to tune.
 
+| [market-indicators.yml](market-indicators.yml) | Hand-curated registry of macro/market indicators (rates, inflation, labour, policy, credit, breadth, volatility, sector/factor leadership, FX/commodities, events) the `market-analyst-resources` skill fetches, transforms, and diffs. Two tiers -- `indicators` (leaves, fetched from a named source) and `derived` (spread/ratio composites) -- plus a hand-maintained `events` calendar. Read by the skill and the future market-researcher agent, written only by the portfolio owner. |
+
+`market-indicators.yml` ships intentionally incomplete: `growth`,
+`inflation`, `labour`, `breadth`, and `positioning` are `<TBD>` stubs until a
+source is chosen for each. See
+`docs/plans/market-analyst-resources-skill.md`.
+
 Risk levels per group are defined inside `ref/policy_v1_1.yaml` (`risk_level`
 on each group) — no separate risk-levels file is needed.

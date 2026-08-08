@@ -46,3 +46,7 @@ One row per decision. `Action` is one of the decision-framework actions; `Verdic
 | 2026-07-16 | SCHD | Hold | unchanged | Rubric v1.3 score 3.61; SCHD scores 3.61/5 under rubric v1.3 (all seven fund-track dimensions resolved -- no unknowns) a |
 | 2026-07-16 | SMH | Hold | stronger | Rubric v1.3 score 2.91; SMH scores 2.91/5 under the ETF-track rubric (v1.3), mapping to Hold at High confidence -- up fr |
 | 2026-07-16 | IREN | Trim | new | Rubric v1.3 score 2.58; IREN is a Bitcoin miner rapidly pivoting to AI/HPC data-center hosting. Operationally it is exec |
+| 2026-07-21 | MDA | Hold | unchanged | Rubric v1.3 score 3.46; MDA remains a Hold. The company still screens as a high-growth Canadian aerospace and defense ho |
+| 2026-07-21 | OUST | Hold | new | Rubric v1.3 score 2.92; Ouster clears the hard gates because its cash burn is paired with low leverage, strong liquidity |
+| 2026-07-22 | T | Hold | stronger | Reaffirmed Hold after Q2 2026; stronger FCF/guidance/subscriber-fiber evidence supports holding, while debt and low growth keep add discipline. |
+| 2026-08-03 | PLTR | Hold | unchanged | Rubric v1.3 score 3.73; The rubric scores PLTR 3.73/5 with all three gates passing, producing a Hold at High confidence |

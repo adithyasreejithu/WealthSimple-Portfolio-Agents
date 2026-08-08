@@ -36,6 +36,7 @@ import db_resources  # noqa: E402
 import derived_metrics as dm  # noqa: E402
 import freshness_gate  # noqa: E402
 import investment_analyst_resources as iar  # noqa: E402
+import skill_trace  # noqa: E402
 import _decision_fixtures as fx  # noqa: E402
 
 TODAY = date(2026, 8, 4)  # a Tuesday
@@ -318,7 +319,7 @@ class DigestBundleShapeTest(FixtureDatabaseTest):
         digest = iar.build_digest(
             "PLTR", gate_result, {}, db_bundle, {}, {}, derived, None, no_live=True, no_quote=True, today=TODAY,
         )
-        digest["trace"] = iar.compute_completeness_trace(digest, gate_result)
+        digest["trace"] = iar.build_trace(digest, gate_result, "PLTR").to_dict()
         digest_text = json.dumps(db_resources.to_json_safe(digest))
         self.assertNotIn("rows", digest["prices"])
         self.assertLess(len(digest_text.encode("utf-8")), iar.DIGEST_SOFT_LIMIT_BYTES)
@@ -369,7 +370,10 @@ class OrchestratorModeTest(FixtureDatabaseTest):
         self.assertEqual(bundle["live"]["overview"]["longName"], "Watch Co")
         self.assertIn("trace", result["digest"])
         self.assertTrue(trace_log_path.exists())
-        self.assertIn("TRACE | ticker=WATCH", trace_log_path.read_text(encoding="utf-8"))
+        self.assertIn(
+            "TRACE | skill=investment-analyst-resources | subject=WATCH",
+            trace_log_path.read_text(encoding="utf-8"),
+        )
 
     def test_no_trace_skips_digest_key_and_log_write(self):
         self._seed_ticker("WATCH", owned=False)
@@ -390,6 +394,271 @@ class OrchestratorModeTest(FixtureDatabaseTest):
             )
         self.assertNotIn("trace", result["digest"])
         self.assertFalse(trace_log_path.exists())
+
+
+class RunWorkspaceIntegrationTest(FixtureDatabaseTest):
+    """`--run-id` routes the bundle into a run workspace instead of exports/.
+
+    The point of the migration: an artifact produced for a question belongs to
+    that question's run, registered as evidence, rather than accumulating in a
+    shared directory with nothing tying it to why it was fetched.
+    """
+
+    def _make_run(self):
+        import config as config_module
+        from workspace import run as run_module
+
+        base = Path(self.temp_dir.name) / "ws"
+        runs_root = base / "runs"
+        runs_root.mkdir(parents=True)
+        patcher = patch.multiple(
+            config_module, WORKSPACE_FOLDER=base, WORKSPACE_RUNS_FOLDER=runs_root,
+            WORKSPACE_ARCHIVE_FOLDER=base / "archive",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        request = base / "request.yaml"
+        request.write_text(
+            "schema_version: '1.0'\nmode: portfolio_check\n"
+            "subject: {type: security, identifiers: {ticker: PLTR}}\n"
+            "request: {question: 'Synthetic run for the migration test.'}\n",
+            encoding="utf-8",
+        )
+        return run_module.create_run(request)
+
+    def _gate(self, ticker="PLTR"):
+        database.close_connection()
+        connection = db_resources.connect_read_only(self.db_path)
+        try:
+            return freshness_gate.compute_freshness(connection, ticker, run_date=TODAY)
+        finally:
+            connection.close()
+
+    def test_run_id_writes_the_bundle_into_the_run_and_registers_evidence(self):
+        from workspace import audit, evidence as evidence_module
+
+        self._seed_ticker()
+        run_id, run_dir = self._make_run()
+        gate_result = self._gate()
+
+        with patch.object(iar, "fetch_stock_research_data", return_value=[
+            {"ticker": "PLTR", "provider_symbol": "PLTR", "data": {}, "errors": {}}
+        ]):
+            result = iar.process_ticker(
+                "PLTR", gate_result, {}, self.db_path,
+                no_live=True, no_bundle=False, no_trace=False, no_quote=True, output=None,
+                classification_json=Path("/nonexistent.json"),
+                trace_log_path=Path(self.temp_dir.name) / "trace.txt",
+                today=TODAY, pretty=False, run_dir=run_dir, run_id=run_id,
+            )
+
+        bundle_path = Path(result["bundle_path"])
+        self.assertEqual(bundle_path.parent, run_dir / "evidence")
+        self.assertTrue(bundle_path.is_file())
+
+        records = evidence_module.read_records(run_dir)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["evidence_type"], "market_data_bundle")
+        self.assertEqual(records[0]["artifact_path"], f"evidence/{bundle_path.name}")
+        self.assertEqual(
+            records[0]["content_hash"], evidence_module.content_hash(bundle_path)
+        )
+
+        kinds = [event["event"] for event in audit.read_events(run_dir)]
+        self.assertIn("trace_recorded", kinds)
+        self.assertIn("evidence_registered", kinds)
+
+    def test_run_stays_valid_after_the_skill_writes_into_it(self):
+        from workspace import run as run_module, validation
+
+        self._seed_ticker()
+        run_id, run_dir = self._make_run()
+        gate_result = self._gate()
+
+        with patch.object(iar, "fetch_stock_research_data", return_value=[
+            {"ticker": "PLTR", "provider_symbol": "PLTR", "data": {}, "errors": {}}
+        ]):
+            iar.process_ticker(
+                "PLTR", gate_result, {}, self.db_path,
+                no_live=True, no_bundle=False, no_trace=False, no_quote=True, output=None,
+                classification_json=Path("/nonexistent.json"),
+                trace_log_path=Path(self.temp_dir.name) / "trace.txt",
+                today=TODAY, pretty=False, run_dir=run_dir, run_id=run_id,
+            )
+        run_module.rebuild_manifest(run_dir)
+        result = validation.validate_run(run_dir)
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["counts"]["evidence"], 1)
+
+    def test_without_run_id_the_bundle_still_goes_to_the_supplied_output(self):
+        """The no-run path must be byte-for-byte unchanged, so every existing
+        agent instruction and script keeps working."""
+        self._seed_ticker()
+        gate_result = self._gate()
+        output_path = Path(self.temp_dir.name) / "legacy.json"
+
+        with patch.object(iar, "fetch_stock_research_data", return_value=[
+            {"ticker": "PLTR", "provider_symbol": "PLTR", "data": {}, "errors": {}}
+        ]):
+            result = iar.process_ticker(
+                "PLTR", gate_result, {}, self.db_path,
+                no_live=True, no_bundle=False, no_trace=True, no_quote=True, output=output_path,
+                classification_json=Path("/nonexistent.json"),
+                today=TODAY, pretty=False,
+            )
+        self.assertEqual(Path(result["bundle_path"]), output_path)
+        self.assertTrue(output_path.is_file())
+
+
+class DefaultOnRunCreationTest(FixtureDatabaseTest):
+    """A run must exist without anyone remembering to pass --run-id.
+
+    Before this, a run only existed if whoever composed the command line
+    chose to add --run-id -- a judgment call an LLM agent could skip, and the
+    old SKILL.md text ("Omit for the unchanged exports/ behavior") actively
+    encouraged skipping it. An audit trail cannot tolerate that: an absent run
+    looked identical to "no pull happened." These tests drive the real CLI
+    entry point (`iar.main`), not `process_ticker` directly, because the
+    decision under test lives in `_resolve_run`/`_dispatch`, not the plumbing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        base = Path(self.temp_dir.name) / "ws"
+        self.runs_root = base / "runs"
+        self.runs_root.mkdir(parents=True)
+        import config as config_module
+
+        patcher = patch.multiple(
+            config_module, WORKSPACE_FOLDER=base, WORKSPACE_RUNS_FOLDER=self.runs_root,
+            WORKSPACE_ARCHIVE_FOLDER=base / "archive",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Simulates an invocation with no --db-path override, the case that
+        # matters for real usage: omitting --db-path makes argparse's default
+        # equal this seeded db, so `args.db_path != DATABASE_PATH` is False
+        # and the workspace default-on path is exercised rather than skipped.
+        db_patcher = patch.object(iar, "DATABASE_PATH", self.db_path)
+        db_patcher.start()
+        self.addCleanup(db_patcher.stop)
+        self._fetch_patcher = patch.object(
+            iar, "fetch_stock_research_data",
+            return_value=[{"ticker": "PLTR", "provider_symbol": "PLTR", "data": {}, "errors": {}}],
+        )
+        self._fetch_patcher.start()
+        self.addCleanup(self._fetch_patcher.stop)
+
+    def _run_main(self, argv: list[str]) -> int:
+        import io
+        from contextlib import redirect_stdout
+
+        # The CLI opens its own connection(s) to self.db_path; the shared
+        # read-write connection FixtureDatabaseTest.setUp already holds must
+        # be released first or DuckDB refuses the second connection.
+        database.close_connection()
+        # Every default-on path emits a trace; without an explicit path it
+        # falls back to the real logs/SkillTrace.txt, which a test must never
+        # write into. Callers that care about trace content pass their own.
+        if "--trace-log-path" not in argv:
+            argv = argv + ["--trace-log-path", str(Path(self.temp_dir.name) / "default-trace.txt")]
+        with redirect_stdout(io.StringIO()):
+            return iar.main(argv)
+
+    def test_mode_read_with_no_run_id_still_opens_a_run(self):
+        self._seed_ticker()
+        exit_code = self._run_main([
+            "--ticker", "PLTR", "--mode", "read", "--no-live", "--no-quote",
+        ])
+        self.assertEqual(exit_code, 0)
+        created = list(self.runs_root.iterdir())
+        self.assertEqual(len(created), 1)
+        bundles = list((created[0] / "evidence").glob("PLTR-*-resources.json"))
+        self.assertEqual(len(bundles), 1)
+
+    def test_default_mode_with_no_run_id_still_opens_a_run(self):
+        self._seed_ticker()
+        exit_code = self._run_main([
+            "--ticker", "PLTR", "--no-live", "--no-quote", "--no-refresh",
+        ])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(list(self.runs_root.iterdir())), 1)
+
+    def test_gate_mode_opens_no_run(self):
+        self._seed_ticker()
+        self._run_main(["--ticker", "PLTR", "--mode", "gate"])
+        self.assertEqual(list(self.runs_root.iterdir()), [])
+
+    def test_refresh_mode_opens_no_run(self):
+        # Deliberately unseeded: an unresolved ticker short-circuits refresh
+        # before any real sync/network call, since only the workspace
+        # decision is under test here, not refresh's own behavior (covered
+        # elsewhere).
+        self._run_main(["--ticker", "PLTR", "--mode", "refresh"])
+        self.assertEqual(list(self.runs_root.iterdir()), [])
+
+    def test_no_run_flag_opts_out_and_writes_to_exports_instead(self):
+        self._seed_ticker()
+        output_path = Path(self.temp_dir.name) / "opted-out.json"
+        exit_code = self._run_main([
+            "--ticker", "PLTR", "--mode", "read", "--no-live", "--no-quote",
+            "--no-run", "--output", str(output_path),
+        ])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(list(self.runs_root.iterdir()), [])
+        self.assertTrue(output_path.is_file())
+
+    def test_no_run_opt_out_is_recorded_in_the_trace_not_silent(self):
+        """The whole point of recording a skip: an auditor greps
+        logs/SkillTrace.jsonl and sees exactly why no run exists for this
+        pull, instead of a gap that looks like nothing happened."""
+        self._seed_ticker()
+        trace_log_path = Path(self.temp_dir.name) / "trace.txt"
+        output_path = Path(self.temp_dir.name) / "skipped.json"
+        self._run_main([
+            "--ticker", "PLTR", "--mode", "read", "--no-live", "--no-quote",
+            "--no-run", "--trace-log-path", str(trace_log_path), "--output", str(output_path),
+        ])
+        line = trace_log_path.read_text(encoding="utf-8")
+        self.assertIn("run=skipped(--no-run)", line)
+        record = json.loads(trace_log_path.with_suffix(".jsonl").read_text(encoding="utf-8").strip())
+        self.assertEqual(record["workspace"], {"status": "skipped", "run_id": None, "skip_reason": "--no-run"})
+
+    def test_non_default_db_path_opts_out_and_is_recorded(self):
+        """The existing test/debug convention: pointing --db-path somewhere
+        else must not populate the real workspace/runs/ during a test run."""
+        other_db = Path(self.temp_dir.name) / "other.duckdb"
+        database.close_connection()
+        database.initialize_database(other_db)
+        connection = database.get_shared_connection(other_db)
+        connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, financial_currency, security_name, security_type)
+               VALUES ('PLTR', 'NASDAQ', 'USD', 'USD', 'Palantir', 'stock')"""
+        )
+        database.close_connection()
+
+        trace_log_path = Path(self.temp_dir.name) / "trace.txt"
+        output_path = Path(self.temp_dir.name) / "other-db.json"
+        self._run_main([
+            "--ticker", "PLTR", "--mode", "read", "--no-live", "--no-quote",
+            "--db-path", str(other_db), "--trace-log-path", str(trace_log_path),
+            "--output", str(output_path),
+        ])
+        self.assertEqual(list(self.runs_root.iterdir()), [])
+        record = json.loads(trace_log_path.with_suffix(".jsonl").read_text(encoding="utf-8").strip())
+        self.assertEqual(record["workspace"]["skip_reason"], "non-default-db")
+
+    def test_run_id_and_no_run_together_is_a_usage_error(self):
+        with self.assertRaises(SystemExit):
+            iar.parse_args(["--ticker", "PLTR", "--run-id", "x", "--no-run"])
+
+    def test_explicit_run_id_still_names_the_run(self):
+        self._seed_ticker()
+        self._run_main([
+            "--ticker", "PLTR", "--mode", "read", "--no-live", "--no-quote", "--run-id", "named-run",
+        ])
+        self.assertTrue((self.runs_root / "named-run").is_dir())
 
 
 class DerivedLiveMetricsTest(unittest.TestCase):
@@ -521,73 +790,136 @@ class CompletenessTraceTest(FixtureDatabaseTest):
         )
         return digest, gate_result
 
-    def test_not_owned_ticker_excludes_position_domains_from_denominator(self):
+    def test_not_owned_ticker_reports_position_domains_as_not_applicable(self):
         ticker_id = self._seed_ticker("WATCH", owned=False)
         connection = self._reopen_read_only()
         digest, gate_result = self._digest_for(connection, ticker_id, "WATCH")
-        trace = iar.compute_completeness_trace(digest, gate_result)
-        self.assertNotIn("position.quantity", trace["missing_fields"])
-        self.assertNotIn("ledger_summary.number_of_buys", trace["missing_fields"])
-        self.assertGreater(trace["domains_empty"], 0)
+        trace = iar.build_trace(digest, gate_result, "WATCH")
+        self.assertNotIn("position.quantity", trace.missing_fields())
+        self.assertNotIn("ledger_summary.number_of_buys", trace.missing_fields())
+        # Not a gap: an unheld ticker has no position to be missing.
+        self.assertIn("position.quantity", trace.not_applicable_fields())
+        self.assertGreater(trace.domains_not_applicable, 0)
 
     def test_owned_ticker_with_full_position_scores_full_completeness_for_those_domains(self):
         ticker_id = self._seed_ticker()  # owned, position_snapshots populated
         connection = self._reopen_read_only()
         digest, gate_result = self._digest_for(connection, ticker_id, "PLTR")
-        trace = iar.compute_completeness_trace(digest, gate_result)
-        self.assertNotIn("position.quantity", trace["missing_fields"])
-        self.assertNotIn("position.computed_at", trace["missing_fields"])
+        trace = iar.build_trace(digest, gate_result, "PLTR")
+        self.assertNotIn("position.quantity", trace.missing_fields())
+        self.assertNotIn("position.computed_at", trace.missing_fields())
 
-    def test_etf_missing_financials_is_empty_expected_not_failed(self):
+    def test_etf_financials_and_earnings_are_not_applicable(self):
         ticker_id = self._seed_ticker("VFV", security_type="etf")
         connection = self._reopen_read_only()
         digest, gate_result = self._digest_for(connection, ticker_id, "VFV")
-        trace = iar.compute_completeness_trace(digest, gate_result)
-        self.assertFalse(any(m.startswith("financials.") for m in trace["missing_fields"]))
-        self.assertFalse(any(m.startswith("earnings.") for m in trace["missing_fields"]))
+        trace = iar.build_trace(digest, gate_result, "VFV")
+        self.assertFalse(any(m.startswith("financials.") for m in trace.missing_fields()))
+        self.assertFalse(any(m.startswith("earnings.") for m in trace.missing_fields()))
+        # A fund has no balance sheet, so equity metrics must not be graded.
+        self.assertFalse(any(m.startswith("derived.financials.") for m in trace.missing_fields()))
+        self.assertTrue(any(n.startswith("derived.financials.") for n in trace.not_applicable_fields()))
 
     def test_live_group_failed_counts_against_completeness(self):
         ticker_id = self._seed_ticker()
         connection = self._reopen_read_only()
+        live_data = {"overview": {"longName": "Palantir"}}
         digest, gate_result = self._digest_for(
-            connection, ticker_id, "PLTR", no_live=False,
-            live_data={"overview": {"longName": "Palantir"}},
+            connection, ticker_id, "PLTR", no_live=False, live_data=live_data,
             live_errors={"valuation": "RuntimeError: blocked"},
         )
-        trace = iar.compute_completeness_trace(digest, gate_result)
-        self.assertIn("live.valuation", trace["missing_fields"])
-        self.assertGreater(trace["domains_failed"], 0)
+        trace = iar.build_trace(digest, gate_result, "PLTR", live_data)
+        self.assertIn("live.valuation", trace.missing_fields())
+        self.assertGreater(trace.domains_failed, 0)
 
-    def test_stock_funds_group_failure_is_empty_expected(self):
+    def test_stock_funds_group_failure_is_not_applicable(self):
         ticker_id = self._seed_ticker()
         connection = self._reopen_read_only()
+        live_data = {"overview": {"longName": "Palantir"}}
         digest, gate_result = self._digest_for(
-            connection, ticker_id, "PLTR", no_live=False,
-            live_data={"overview": {"longName": "Palantir"}},
+            connection, ticker_id, "PLTR", no_live=False, live_data=live_data,
             live_errors={"funds": "TypeError: get_funds_data() raised for equity"},
         )
-        trace = iar.compute_completeness_trace(digest, gate_result)
-        self.assertNotIn("live.funds", trace["missing_fields"])
+        trace = iar.build_trace(digest, gate_result, "PLTR", live_data)
+        self.assertNotIn("live.funds", trace.missing_fields())
+        self.assertIn("live.funds", trace.not_applicable_fields())
+
+    def test_derived_options_metrics_are_not_applicable_without_a_chain(self):
+        """The regression this split exists for: a ticker with no options chain
+        used to report eleven 'missing' derived metrics and ~81% completeness on
+        a run that obtained everything obtainable."""
+        ticker_id = self._seed_ticker()
+        connection = self._reopen_read_only()
+        live_data = {"overview": {"longName": "Palantir"}}  # no options group
+        digest, gate_result = self._digest_for(
+            connection, ticker_id, "PLTR", no_live=False, live_data=live_data,
+        )
+        trace = iar.build_trace(digest, gate_result, "PLTR", live_data)
+        self.assertFalse(any(m.startswith("derived.options.") for m in trace.missing_fields()))
+        self.assertIn("derived.options.iv_skew", trace.not_applicable_fields())
+        self.assertFalse(any(m.startswith("derived.analyst.") for m in trace.missing_fields()))
+
+    def test_present_but_empty_live_groups_are_still_not_applicable(self):
+        """yfinance returns an `options` group for tickers with no tradable
+        chain, and an `analyst` group with no grade actions. Grading on group
+        *status* misread both as real gaps -- the live-run bug that made TSX
+        ticker L report 81.4% while having fetched everything available."""
+        ticker_id = self._seed_ticker()
+        connection = self._reopen_read_only()
+        live_data = {
+            "options": {"expirations": []},          # present, no chain_* keys
+            "analyst": {"upgrades_downgrades": {}},  # present, no actions
+            "insider": {"purchases": {}},            # present, no rows
+        }
+        digest, gate_result = self._digest_for(
+            connection, ticker_id, "PLTR", no_live=False, live_data=live_data,
+        )
+        trace = iar.build_trace(digest, gate_result, "PLTR", live_data)
+        for group in ("derived.options.", "derived.analyst.", "derived.insider."):
+            self.assertFalse(
+                any(m.startswith(group) for m in trace.missing_fields()),
+                f"{group} must not be graded when its source came back empty",
+            )
+        self.assertIn("derived.insider.net_insider_shares", trace.not_applicable_fields())
+
+    def test_populated_options_chain_is_graded_not_excused(self):
+        """The inverse guard: when a chain really is present, its metrics are
+        graded, so N/A cannot become a way to hide genuine fetch failures."""
+        ticker_id = self._seed_ticker()
+        connection = self._reopen_read_only()
+        live_data = {"options": {"chain_2026-09-18": {"calls": {}, "puts": {}}}}
+        digest, gate_result = self._digest_for(
+            connection, ticker_id, "PLTR", no_live=False, live_data=live_data,
+        )
+        trace = iar.build_trace(digest, gate_result, "PLTR", live_data)
+        self.assertIn("derived.options.put_call_oi_ratio", trace.missing_fields())
 
     def test_never_divides_by_zero_on_a_degenerate_digest(self):
-        # An all-empty-expected digest (not owned, no dividends key either) must
-        # still produce a valid percentage, never a ZeroDivisionError.
-        trace = iar.compute_completeness_trace({"live": {"skipped": True}}, {"owned": False, "asset_class": "stock"})
-        self.assertIsInstance(trace["completeness_pct"], float)
-        self.assertGreaterEqual(trace["completeness_pct"], 0.0)
+        # An all-not-applicable digest must still produce a valid percentage,
+        # never a ZeroDivisionError.
+        trace = iar.build_trace(
+            {"live": {"skipped": True}}, {"owned": False, "asset_class": "stock"}, "NONE"
+        )
+        self.assertIsInstance(trace.completeness_pct, float)
+        self.assertGreaterEqual(trace.completeness_pct, 0.0)
 
-    def test_write_trace_log_appends_pipe_delimited_line(self):
+    def test_emit_appends_pipe_delimited_line_and_jsonl_sidecar(self):
         ticker_id = self._seed_ticker()
         connection = self._reopen_read_only()
         digest, gate_result = self._digest_for(connection, ticker_id, "PLTR")
-        trace = iar.compute_completeness_trace(digest, gate_result)
+        trace = iar.build_trace(digest, gate_result, "PLTR")
         log_path = Path(self.temp_dir.name) / "trace.txt"
-        iar.write_trace_log("PLTR", gate_result, trace, log_path)
-        iar.write_trace_log("PLTR", gate_result, trace, log_path)
+        jsonl_path = log_path.with_suffix(".jsonl")
+        skill_trace.emit(trace, text_log_path=log_path, jsonl_log_path=jsonl_path)
+        skill_trace.emit(trace, text_log_path=log_path, jsonl_log_path=jsonl_path)
         lines = log_path.read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(len(lines), 2)
-        self.assertIn("| TRACE | ticker=PLTR | asset_class=stock |", lines[0])
-        self.assertIn(f"completeness_pct={trace['completeness_pct']}", lines[0])
+        self.assertIn("| TRACE | skill=investment-analyst-resources | subject=PLTR |", lines[0])
+        self.assertIn(f"pct={trace.completeness_pct}", lines[0])
+        sidecar = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(sidecar), 2)
+        self.assertEqual(sidecar[0]["subject"], "PLTR")
+        self.assertIn("domains", sidecar[0])
 
     def test_connect_read_only_reports_actionable_message_while_write_lock_held(self):
         self._seed_ticker()  # holds the read-write shared connection open
@@ -718,24 +1050,32 @@ class CompletenessTraceQuoteTest(unittest.TestCase):
 
     def test_quote_ok_counts_toward_completeness(self):
         digest = {"live": {"skipped": True}, "quote": {"price": 100.0, "as_of": datetime(2026, 8, 4)}}
-        trace = iar.compute_completeness_trace(digest, self.GATE_RESULT)
-        self.assertNotIn("quote.price", trace["missing_fields"])
-        self.assertGreater(trace["domains_ok"], 0)
+        trace = iar.build_trace(digest, self.GATE_RESULT, "PLTR")
+        self.assertNotIn("quote.price", trace.missing_fields())
+        self.assertGreater(trace.domains_ok, 0)
 
     def test_quote_skipped_excluded_from_denominator(self):
         digest_with = {"live": {"skipped": True}, "quote": {"price": 100.0, "as_of": datetime(2026, 8, 4)}}
         digest_without = {"live": {"skipped": True}, "quote": {"skipped": True}}
-        trace_with = iar.compute_completeness_trace(digest_with, self.GATE_RESULT)
-        trace_without = iar.compute_completeness_trace(digest_without, self.GATE_RESULT)
-        self.assertEqual(trace_without["fields_total"], trace_with["fields_total"] - 2)
-        self.assertNotIn("quote.price", trace_without["missing_fields"])
+        trace_with = iar.build_trace(digest_with, self.GATE_RESULT, "PLTR")
+        trace_without = iar.build_trace(digest_without, self.GATE_RESULT, "PLTR")
+        self.assertEqual(trace_without.fields_graded, trace_with.fields_graded - 2)
+        self.assertNotIn("quote.price", trace_without.missing_fields())
+        # A deliberate --no-quote is not-applicable, never a gap.
+        self.assertIn("quote.price", trace_without.not_applicable_fields())
 
     def test_quote_none_counts_as_a_failed_domain(self):
         digest = {"live": {"skipped": True}, "quote": None}
-        trace = iar.compute_completeness_trace(digest, self.GATE_RESULT)
-        self.assertIn("quote.price", trace["missing_fields"])
-        self.assertIn("quote.as_of", trace["missing_fields"])
-        self.assertGreater(trace["domains_failed"], 0)
+        trace = iar.build_trace(digest, self.GATE_RESULT, "PLTR")
+        self.assertIn("quote.price", trace.missing_fields())
+        self.assertIn("quote.as_of", trace.missing_fields())
+        self.assertGreater(trace.domains_failed, 0)
+
+    def test_no_live_run_reports_live_groups_as_not_applicable(self):
+        digest = {"live": {"skipped": True}, "quote": {"skipped": True}}
+        trace = iar.build_trace(digest, self.GATE_RESULT, "PLTR")
+        self.assertFalse(any(m.startswith("live.") for m in trace.missing_fields()))
+        self.assertIn("live.valuation", trace.not_applicable_fields())
 
 
 class ProcessTickerQuoteTest(FixtureDatabaseTest):

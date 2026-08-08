@@ -6,10 +6,15 @@ tickers:
 tags: []
 status: active
 created: '2026-07-14'
-updated: '2026-07-14'
+updated: '2026-07-22'
 summary: Research page for T, created 2026-07-14.
 related: []
 sources: []
+section_updated:
+  status: '2026-07-22'
+  updated_thesis: '2026-07-22'
+  analyst_view: '2026-07-22'
+  monitoring_checklist: '2026-07-22'
 ---
 # T — AT&T Inc.
 
@@ -20,7 +25,7 @@ sources: []
 - Decision: Hold
 - Confidence: High
 - Time Horizon: Long-term
-- Last Updated: 2026-07-14
+- Last Updated: 2026-07-22
 
 ## Company Overview
 
@@ -31,7 +36,9 @@ sources: []
 
 ## Updated Thesis
 
-New page. Cheap, cash-generative telecom with a covered dividend; Hold pending momentum/deleveraging turn.
+AT&T's thesis is modestly stronger after Q2 2026. The core case remains a cheap, cash-generative telecom with a covered dividend and a useful income/value role in the portfolio. Strong free cash flow, maintained guidance, and solid subscriber/fiber additions support holding rather than selling today.
+
+This is still a debt-heavy, capital-intensive, low-growth business, so I would not add aggressively. Hold while dividend coverage and deleveraging remain on track. Use $28 as a soft trim zone and $30 as a stronger exit review level unless the business quality materially improves.
 
 ## Financial Analysis
 
@@ -79,7 +86,9 @@ Quality/Income-adjacent telecom at ~1.9% weight; a high-yield diversifier below 
 
 ## Analyst View
 
-I agree with Hold and lean value-constructive. On fundamentals this is inexpensive with a well-covered dividend and real free cash flow; the market's negative momentum reflects debt and competitive worries more than deteriorating cash generation. The prior dividend rebasing keeps me from calling it a slam-dunk income name, but the valuation and FCF yield provide downside support. Hold for yield and value; the re-rating catalyst is deleveraging progress.
+I agree with Hold at High confidence. Q2 2026 strengthens the income/value case because free cash flow, guidance durability, and customer/fiber momentum all support the dividend and the deleveraging path. The position still fits as a cash-generative telecom holding rather than a growth compounder.
+
+I would not add heavily unless debt metrics and business quality improve faster than expected. The practical stance is to collect the dividend while monitoring FCF coverage and leverage, then review trims if the price approaches $28 and reassess more seriously near $30.
 ## Key Risks
 
 - Debt refinancing at higher rates
@@ -95,13 +104,16 @@ I agree with Hold and lean value-constructive. On fundamentals this is inexpensi
 | Date | Action | Verdict | Note |
 |---|---|---|---|
 | 2026-07-14 | Hold | new | Rubric v1.1 score 3.76; AT&T (T) is a cheap (forward P/E ~8.5, ~5.9% FCF yield), high-yield (~5.25%) telecom trading ~26 |
+| 2026-07-22 | Hold | stronger | Q2 2026 modestly strengthens the thesis: FCF, maintained guidance, subscriber/fiber additions, and dividend coverage support holding while debt and low growth limit adding. |
 
 
 ## Monitoring Checklist
 
-- [ ] Net debt/EBITDA trajectory
-- [ ] Free cash flow guidance
-- [ ] Subscriber and ARPU trends
+- [ ] Free cash flow guidance and full-year FCF delivery
+- [ ] Net debt/EBITDA progress toward deleveraging targets
+- [ ] Wireless subscriber additions and fiber net adds
+- [ ] Dividend coverage from free cash flow after capex
+- [ ] Price action near the $28-30 review zone
 
 ## Sources
 

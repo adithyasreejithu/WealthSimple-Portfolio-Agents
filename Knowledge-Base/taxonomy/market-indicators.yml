@@ -1,0 +1,546 @@
+# Market indicator registry for the market-analyst-resources skill.
+#
+# Hand-curated, owner-authored configuration -- read by the skill and by the
+# (not-yet-built) market-researcher agent, never written by either. See
+# docs/plans/market-analyst-resources-skill.md.
+#
+# Two tiers:
+#   indicators -- leaves. Fetched from a named source. `series_id` (the `id`
+#                 below) is the RAW, as-published series and is the
+#                 permanent storage key in macro_observations -- renaming an
+#                 id orphans its history. `transform` is applied at READ
+#                 time, never at storage time, so changing a transform here
+#                 never requires a backfill.
+#   derived    -- composites (`spread`/`ratio` over exactly two leaf
+#                 indicator ids). Depth is capped at 1: a derived entry may
+#                 not reference another derived entry.
+#   events     -- hand-maintained calendar (central bank meetings, major
+#                 releases). Paste in the year's dates once from the
+#                 official BoC/Fed schedules -- do not guess dates.
+#
+# Day-one coverage uses only free, no-key sources: Bank of Canada Valet
+# (boc_valet) and yfinance. Domains that need a source with a key or a
+# source not yet chosen are left as explicit <TBD> stubs at the bottom --
+# they are skipped by the gate and refresh (registry.Indicator.is_configured
+# is False), not treated as errors.
+#
+# VERIFY BEFORE FIRST LIVE RUN: entries below marked "verify:" carry an
+# assumption (typically a yfinance scale convention) I could not fully
+# confirm while authoring this file. Check the first live pull's raw value
+# against a known-good source before trusting the transformed output.
+
+version: 1
+updated: 2026-08-05
+
+sources:
+  boc_valet:
+    adapter: boc_valet
+  yfinance:
+    adapter: yfinance
+
+indicators:
+  # ---- policy ---------------------------------------------------------
+  - id: BOC_POLICY_RATE
+    domain: policy
+    kind: statistical
+    source: boc_valet
+    series_ref: V39079          # Bank of Canada overnight rate target
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 5
+    units: percent
+
+  - id: FED_FUNDS_PROXY
+    domain: policy
+    kind: priced
+    source: yfinance
+    series_ref: "^IRX"          # 13-week T-bill discount rate, as a Fed policy proxy
+    value_field: close
+    scale: 1.0                  # verify: ^IRX is believed to already read in percent
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: percent
+
+  # ---- rates ------------------------------------------------------------
+  - id: UST10Y
+    domain: rates
+    kind: priced
+    source: yfinance
+    series_ref: "^TNX"          # CBOE 10-Year Treasury Note yield index
+    value_field: close
+    scale: 0.1                  # verify: ^TNX has historically quoted yield x10
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: percent
+
+  - id: UST3M
+    domain: rates
+    kind: priced
+    source: yfinance
+    series_ref: "^IRX"          # 13-week T-bill discount rate
+    value_field: close
+    scale: 1.0                  # verify: ^IRX is believed to already read in percent
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: percent
+
+  # ---- fx_commodities -----------------------------------------------------
+  - id: USDCAD
+    domain: fx_commodities
+    kind: statistical
+    source: boc_valet
+    series_ref: FXUSDCAD        # daily USD/CAD exchange rate
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 5
+    units: cad_per_usd
+
+  - id: OIL_WTI
+    domain: fx_commodities
+    kind: priced
+    source: yfinance
+    series_ref: "CL=F"          # WTI crude futures (continuous)
+    value_field: close
+    scale: 1.0
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd_per_barrel
+
+  - id: GOLD
+    domain: fx_commodities
+    kind: priced
+    source: yfinance
+    series_ref: "GC=F"          # gold futures (continuous)
+    value_field: close
+    scale: 1.0
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd_per_oz
+
+  - id: COPPER
+    domain: fx_commodities
+    kind: priced
+    source: yfinance
+    series_ref: "HG=F"          # copper futures (continuous)
+    value_field: close
+    scale: 1.0
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd_per_lb
+
+  - id: NATGAS
+    domain: fx_commodities
+    kind: priced
+    source: yfinance
+    series_ref: "NG=F"          # natural gas futures (continuous)
+    value_field: close
+    scale: 1.0
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd_per_mmbtu
+
+  - id: DXY
+    domain: fx_commodities
+    kind: priced
+    source: yfinance
+    series_ref: "DX-Y.NYB"      # ICE US Dollar Index
+    value_field: close
+    scale: 1.0
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: index
+
+  # ---- volatility ---------------------------------------------------------
+  - id: VIX
+    domain: volatility
+    kind: priced
+    source: yfinance
+    series_ref: "^VIX"          # CBOE Volatility Index
+    value_field: close
+    scale: 1.0
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: index
+
+  - id: VIX3M
+    domain: volatility
+    kind: priced
+    source: yfinance
+    series_ref: "^VIX3M"        # CBOE 3-Month Volatility Index
+    value_field: close
+    scale: 1.0
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: index
+
+  # ---- sectors (US SPDR sector ETFs, 1-month rolling return) --------------
+  - id: SECTOR_XLK
+    output_id: SECTOR_XLK_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLK              # Technology
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"  # ~1 trading month
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: SECTOR_XLF
+    output_id: SECTOR_XLF_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLF               # Financials
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: SECTOR_XLE
+    output_id: SECTOR_XLE_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLE                # Energy
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: SECTOR_XLV
+    output_id: SECTOR_XLV_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLV                # Health Care
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: SECTOR_XLY
+    output_id: SECTOR_XLY_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLY                # Consumer Discretionary
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: SECTOR_XLP
+    output_id: SECTOR_XLP_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLP                # Consumer Staples
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: SECTOR_XLI
+    output_id: SECTOR_XLI_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLI                # Industrials
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: SECTOR_XLB
+    output_id: SECTOR_XLB_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLB                # Materials
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: SECTOR_XLU
+    output_id: SECTOR_XLU_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLU                # Utilities
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: SECTOR_XLRE
+    output_id: SECTOR_XLRE_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLRE                # Real Estate
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: SECTOR_XLC
+    output_id: SECTOR_XLC_1M_RETURN
+    domain: sectors
+    kind: priced
+    source: yfinance
+    series_ref: XLC                # Communication Services
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  # ---- factors (iShares MSCI USA factor ETFs, 1-month rolling return) ----
+  - id: FACTOR_MTUM
+    output_id: FACTOR_MTUM_1M_RETURN
+    domain: factors
+    kind: priced
+    source: yfinance
+    series_ref: MTUM                # Momentum
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: FACTOR_QUAL
+    output_id: FACTOR_QUAL_1M_RETURN
+    domain: factors
+    kind: priced
+    source: yfinance
+    series_ref: QUAL                # Quality
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: FACTOR_VLUE
+    output_id: FACTOR_VLUE_1M_RETURN
+    domain: factors
+    kind: priced
+    source: yfinance
+    series_ref: VLUE                # Value
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: FACTOR_USMV
+    output_id: FACTOR_USMV_1M_RETURN
+    domain: factors
+    kind: priced
+    source: yfinance
+    series_ref: USMV                # Minimum Volatility
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: FACTOR_SIZE
+    output_id: FACTOR_SIZE_1M_RETURN
+    domain: factors
+    kind: priced
+    source: yfinance
+    series_ref: SIZE                # Size (small-cap tilt)
+    value_field: close
+    scale: 1.0
+    transform: "pct_change(21)"
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  # ---- credit -------------------------------------------------------------
+  - id: CREDIT_HYG
+    domain: credit
+    kind: priced
+    source: yfinance
+    series_ref: HYG                 # iShares iBoxx High Yield Corporate Bond ETF
+    value_field: close
+    scale: 1.0
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  - id: CREDIT_LQD
+    domain: credit
+    kind: priced
+    source: yfinance
+    series_ref: LQD                 # iShares iBoxx Investment Grade Corporate Bond ETF
+    value_field: close
+    scale: 1.0
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: usd
+
+  # ---- <TBD> domains: growth, inflation, labour, breadth, positioning ----
+  # Structure only -- source/series_ref left as the literal string <TBD>.
+  # registry.Indicator.is_configured is False for these, so the gate and
+  # refresh skip them without treating them as errors. Fill in `source` and
+  # `series_ref` (adding a new sources: entry + sources.py adapter if the
+  # chosen source isn't boc_valet or yfinance) when a source is identified.
+
+  - id: US_GDP_QOQ
+    domain: growth
+    kind: statistical
+    source: "<TBD>"
+    series_ref: "<TBD>"
+    transform: none
+    cadence: quarterly
+    publication_lag_days: 30
+    backfill_years: 5
+    units: percent
+
+  - id: US_CPI_YOY
+    domain: inflation
+    kind: statistical
+    source: "<TBD>"
+    series_ref: "<TBD>"
+    transform: none
+    cadence: monthly
+    publication_lag_days: 14
+    backfill_years: 5
+    units: percent
+
+  - id: US_UNEMPLOYMENT_RATE
+    domain: labour
+    kind: statistical
+    source: "<TBD>"
+    series_ref: "<TBD>"
+    transform: none
+    cadence: monthly
+    publication_lag_days: 7
+    backfill_years: 5
+    units: percent
+
+  - id: US_BREADTH_ABOVE_200DMA
+    domain: breadth
+    kind: statistical
+    source: "<TBD>"
+    series_ref: "<TBD>"
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: percent
+
+  - id: US_PUT_CALL_RATIO
+    domain: positioning
+    kind: statistical
+    source: "<TBD>"
+    series_ref: "<TBD>"
+    transform: none
+    cadence: daily
+    publication_lag_days: 0
+    backfill_years: 2
+    units: ratio
+
+derived:
+  - id: CURVE_US_10Y3M
+    domain: rates
+    op: spread
+    inputs: [UST10Y, UST3M]
+    align: locf
+    max_carry_days: 5
+    units: percent
+    # Preferred 2s10s curve needs a genuine 2-year yield series, which
+    # neither boc_valet nor a standard yfinance ticker confidently provides
+    # -- add it (e.g. via FRED's DGS2) when a source is identified, and add
+    # CURVE_US_2S10S alongside this one rather than replacing it.
+
+  - id: VIX_TERM_STRUCTURE
+    domain: volatility
+    op: ratio
+    inputs: [VIX, VIX3M]
+    align: locf
+    max_carry_days: 3
+    units: ratio
+
+  - id: CREDIT_HY_IG_RATIO
+    domain: credit
+    op: ratio
+    inputs: [CREDIT_HYG, CREDIT_LQD]
+    align: locf
+    max_carry_days: 3
+    units: ratio
+
+# Hand-maintained event calendar. Paste in confirmed dates from the official
+# Bank of Canada (bankofcanada.ca/press/press-conferences) and Federal
+# Reserve (federalreserve.gov/newsevents/calendar.htm) schedules -- left
+# empty here rather than guessing dates.
+events: []

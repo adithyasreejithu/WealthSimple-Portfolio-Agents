@@ -503,6 +503,103 @@ change. This is the tool the holdings/P&L root-cause investigation
 - `--report PATH` selects the broker holdings CSV (required).
 - `--database PATH` selects the DuckDB database.
 
+## Run Workspace
+
+```powershell
+uv run python src/app.py run create --request tests/fixtures/synthetic_request.yaml
+uv run python src/app.py run list
+uv run python src/app.py run show --run-id <run-id>
+uv run python src/app.py run register-evidence --run-id <run-id> --file workspace/runs/<run-id>/evidence/bundle.json --type market_data_bundle --source yfinance
+uv run python src/app.py run register-evidence --run-id <run-id> --missing --type price_quote --source yfinance --status missing
+uv run python src/app.py run build-manifest --run-id <run-id> --target-stage investment_analyst
+uv run python src/app.py run validate --run-id <run-id>
+uv run python src/app.py run set-status --run-id <run-id> --status in_progress
+uv run python src/app.py run archive --run-id <run-id>
+```
+
+Creates and manages **run workspaces** — one directory per investment-research
+request, holding that request's inputs, evidence, calculations, agent outputs,
+and an append-only audit log, so an answer is reproducible and auditable as a
+unit. Full design in `docs/architecture/run_workspace.md`.
+
+Every subcommand prints JSON to stdout. This command group only creates,
+reads, and validates files: it never invokes an agent, and it can never place
+a trade.
+
+### `run create`
+
+Creates one run atomically under `workspace/runs/<run-id>/`. Assembles the
+directory under a hidden temporary name and moves it into place only once
+every required file exists, so a failure leaves no partial run. An existing
+run directory is **never** overwritten.
+
+This is the explicit path, for a run that answers a written question. A
+data-collection skill (`investment-analyst-resources`,
+`market-analyst-resources`) opens a run implicitly and by default, with no
+flag required — see "Two ways a run begins" in
+`docs/architecture/run_workspace.md`.
+
+- `--request PATH` — request YAML or JSON (required). Validated against the
+  request schema; a request that tries to enable `execute_trades` or disable
+  `human_review_required` is rejected.
+- `--trigger TEXT` — what initiated this run (default `cli`).
+
+### `run list` / `run show`
+
+`list` summarizes every active run (ID, mode, status, creation time, evidence
+count), newest first. `show --run-id <id>` prints that run's full metadata and
+evidence registry.
+
+### `run register-evidence`
+
+Appends one row to the run's `evidence/sources.jsonl`. Supply **either**
+`--file` (an artifact already inside the run directory) **or** `--missing`.
+
+Registering a gap is a first-class operation: a downstream stage must be able
+to tell "we looked and it wasn't there" from "nobody looked." Never invent a
+value for missing evidence.
+
+- `--run-id ID` (required), `--type TEXT` (required), `--source TEXT` (required)
+- `--file PATH` — artifact inside the run; its sha256 is computed and stored
+- `--missing` — register an explicit gap instead of a file
+- `--status {pending,available,partial,missing,stale,invalid}` (default `available`)
+- `--url`, `--method`, `--note` (repeatable)
+
+### `run build-manifest`
+
+Regenerates `context_manifest.yaml` from what the run currently holds — the
+contract naming what a receiving stage may use and what is absent. Always
+regenerated, never hand-edited.
+
+- `--target-stage TEXT` — which stage will consume it.
+- `--prior-thesis PATH` — run-relative path to a prior thesis, if any.
+
+### `run validate`
+
+Checks files, schemas, and cross-references: evidence citations resolve to
+registered IDs, referenced paths stay inside the run, artifact hashes still
+match, no trade-execution fields appear anywhere, and neither append-only log
+has malformed lines. Prints `{ok, errors, warnings, counts}` and **exits 1**
+when not ok, so it works as a gate.
+
+### `run set-status`
+
+Moves a run through `created → in_progress → awaiting_input |
+awaiting_human_review → completed | failed → archived`. Transitions outside
+that model are refused with an error naming the legal alternatives.
+
+- `--status STATUS` (required), `--note TEXT` — recorded as a warning, or as
+  an error when failing the run.
+
+### `run archive`
+
+Moves the run into `workspace/archive/<YYYY-MM>/<run-id>/`, structure intact.
+**Runs are never deleted**; only `tmp/` contents are discarded, and an
+occupied archive slot is refused. Validates first by default.
+
+- `--no-validate` — archive without validating, for retaining an abandoned or
+  failed run.
+
 ## Compatibility Commands
 
 Existing direct commands remain available for scripts and local workflows:

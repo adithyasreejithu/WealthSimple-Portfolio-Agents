@@ -1,0 +1,20 @@
+# Clearly synthetic. Not a real position, not real market data, not advice.
+schema_version: "1.0"
+mode: "portfolio_check"
+subject:
+  type: "security"
+  identifiers:
+    ticker: "SYNTH"
+    name: "Synthetic Test Security"
+request:
+  question: "Should this synthetic position be held, trimmed, or exited?"
+  context: "Fixture used by tests and documentation. No real data."
+required_analysis:
+  - business_quality
+  - valuation
+  - portfolio_impact
+restrictions:
+  research_only: true
+  execute_trades: false
+  do_not_invent_data: true
+  human_review_required: true

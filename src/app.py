@@ -760,6 +760,12 @@ def _print_root_help() -> None:
         "reconcile-holdings",
         help="Compare computed holdings against a broker holdings CSV export.",
     )
+    commands.add_parser(
+        "run",
+        help="Create and manage investment-research run workspaces "
+             "(create, show, list, register-evidence, build-manifest, validate, "
+             "set-status, archive).",
+    )
     parser.print_help()
 
 
@@ -1220,6 +1226,17 @@ def _run_reconcile_holdings_command(argv: list[str]) -> int:
     return 0 if result.ok else 1
 
 
+def _run_workspace_command(argv: list[str]) -> int:
+    """Create and manage run workspaces (`docs/architecture/run_workspace.md`).
+
+    Imported lazily so the rest of the CLI does not pay for pydantic on every
+    invocation, matching how the other delegated commands stay self-contained.
+    """
+    from workspace.cli import main as workspace_main
+
+    return workspace_main(argv)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Dispatch every user-facing command from the canonical application entry point."""
     raw_args = list(sys.argv[1:] if argv is None else argv)
@@ -1244,6 +1261,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_recompute_positions_command(raw_args[1:])
     if raw_args and raw_args[0] == "reconcile-holdings":
         return _run_reconcile_holdings_command(raw_args[1:])
+    if raw_args and raw_args[0] == "run":
+        return _run_workspace_command(raw_args[1:])
 
     # Delegate to module entry points so each command keeps one argument contract.
     delegated_commands = {

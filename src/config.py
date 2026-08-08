@@ -18,6 +18,18 @@ PORTFOLIO_GROUPING_FOLDER = KNOWLEDGE_BASE_FOLDER / "ref"
 DEFAULT_DATA_FOLDER = DATA_FOLDER
 DEFAULT_EXPORT_FOLDER = EXPORT_FOLDER
 LOG_FOLDER = BASE_DIR / "logs"
+"""
+Run workspace: one directory per research/portfolio request, holding that
+request's inputs, evidence, calculations, agent outputs, and audit log. This is
+the working state for a single question, distinct from `EXPORT_FOLDER` (data
+exported out of the pipeline for human consumption) and `KNOWLEDGE_BASE_FOLDER`
+(durable curated research). Consumers must import these constants rather than
+rebuilding the path from their own root, so there is one definition to change.
+See `docs/architecture/run_workspace.md`.
+"""
+WORKSPACE_FOLDER = BASE_DIR / "workspace"
+WORKSPACE_RUNS_FOLDER = WORKSPACE_FOLDER / "runs"
+WORKSPACE_ARCHIVE_FOLDER = WORKSPACE_FOLDER / "archive"
 DATABASE_PATH = Path(
     os.getenv("DB_PATH", str(DATA_FOLDER / "PRD_WealthSimple.duckdb"))
 ).expanduser()

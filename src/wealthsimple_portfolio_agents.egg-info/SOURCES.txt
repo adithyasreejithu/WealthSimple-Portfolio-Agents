@@ -9,6 +9,7 @@ src/database_command.py
 src/database_test_main.py
 src/earnings_dividends_extractor.py
 src/email_extractor.py
+src/financial_snapshots_extractor.py
 src/holdings_reconciler.py
 src/kb_pages.py
 src/manual_overrides.py
@@ -28,6 +29,7 @@ src/wealthsimple_portfolio_agents.egg-info/requires.txt
 src/wealthsimple_portfolio_agents.egg-info/top_level.txt
 tests/test_analytics.py
 tests/test_app.py
+tests/test_bootstrap_annual_context.py
 tests/test_classification_workflow.py
 tests/test_config.py
 tests/test_dashboard_api.py
@@ -38,9 +40,11 @@ tests/test_decision_rubric.py
 tests/test_earnings_dividends_extractor.py
 tests/test_email_extractor.py
 tests/test_fetch_stock_research_data.py
+tests/test_financial_snapshots_extractor.py
 tests/test_generate_reconciliation_report.py
 tests/test_holdings_reconciler.py
 tests/test_ingest_recommendation.py
+tests/test_investment_analyst_resources.py
 tests/test_jobs.py
 tests/test_kb_intake_document.py
 tests/test_kb_pages.py
@@ -48,12 +52,14 @@ tests/test_kb_search.py
 tests/test_kb_sync_portfolio.py
 tests/test_kb_thesis_scripts.py
 tests/test_manual_overrides.py
+tests/test_market_analyst_resources.py
 tests/test_market_data.py
 tests/test_portfolio_classifier.py
 tests/test_portfolio_metrics.py
 tests/test_position_engine.py
 tests/test_scoring_worksheet.py
 tests/test_staging.py
+tests/test_staleness_gate.py
 tests/test_statement_extractor.py
 tests/test_ticker_mapping.py
 tests/test_usage_tracker.py

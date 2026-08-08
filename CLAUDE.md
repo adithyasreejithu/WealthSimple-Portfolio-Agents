@@ -9,6 +9,7 @@ This repository is a Python data pipeline for Wealthsimple exports, statements, 
 - `src/` contains the application code, including pipeline orchestration (`app.py`), extraction logic (`email_extractor.py`, `statement_extractor.py`, `yfinance_extractor.py`), storage (`database.py`, `database_command.py`), and utilities (`data_sorter.py`, `staging.py`, `system_logger.py`).
 - `tests/` contains `unittest` test cases that mirror the main modules.
 - `docs/` contains design notes, handover material, and success criteria.
+- `src/workspace/` is the run-workspace package: one directory per investment-research request (`workspace/runs/<run_id>/`) holding that request's inputs, evidence, calculations, agent outputs, and audit log. Exposed as `python src/app.py run <subcommand>`. See `docs/architecture/run_workspace.md`.
 - `dashboard/api/` is the read-only FastAPI backend that serves already-computed pipeline output (DuckDB reads via `src/analytics.py`) to the dashboard frontend. See `docs/architecture/dashboard_api.md`.
 - `dashboard/web/` is the Next.js + shadcn/ui dashboard frontend (App Router). Server components fetch the API; charts/tables/price-explorer are client components. It only formats API values and does presentation-layer derivations (`src/lib/derive.ts`) — never portfolio math. See `docs/architecture/dashboard_api.md` (Frontend section) and `dashboard/web/README.md`.
 - `requirements.txt` lists runtime dependencies.
@@ -22,7 +23,7 @@ Claude Code agents live in `.claude/agents/*.md` and skills live in `.claude/ski
 - Put Python that is used only by one agent/skill beside that skill in its `scripts/` directory, not in `src/`. `src/` is for general pipeline code that is not owned by a single agent. For example, the classifier workflow modules live in `.claude/skills/classify-portfolio/scripts/`.
 - Document each agent's purpose, runtime settings, skill dependencies, workflow, and guardrails under `docs/agents/<agent>/`, and keep it aligned with the actual agent config and skills.
 - See `docs/architecture/claude_agent_skill_structure.md` for the full recommended layout.
-- Agent and skill invocations (with per-subagent token usage and session separators) are logged by the `.claude/hooks/usage_tracker.py` hook to `logs/AgentSkillUsage.txt`, separate from the pipeline log `logs/SystemLogs.txt`. See `docs/architecture/usage_tracking.md`.
+- Agent and skill invocations (with per-subagent token usage and session separators) are logged by the `.claude/hooks/usage_tracker.py` hook to `logs/AgentSkillUsage.txt`, separate from the pipeline log `logs/SystemLogs.txt`. Data-collecting skills additionally emit a completeness trace to `logs/SkillTrace.txt`/`.jsonl` via the shared `src/skill_trace.py` writer — one format across skills, grading only what was *obtainable* for the subject so a not-applicable field is never reported as a gap. See `docs/architecture/usage_tracking.md`.
 
 ### Research Knowledge Base
 

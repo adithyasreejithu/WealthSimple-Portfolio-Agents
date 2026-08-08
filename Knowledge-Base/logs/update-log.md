@@ -75,3 +75,8 @@ The research wiki's own change log — every page mutation lands here. (Classifi
 | 2026-07-16 | recommendation-ingested | stocks/SMH.md | Hold/High/Medium-term from SMH-2026-07-16.json |
 | 2026-07-16 | created | stocks/IREN.md | New stock page, status=active. |
 | 2026-07-16 | recommendation-ingested | stocks/IREN.md | Trim/High/Long-term from IREN-2026-07-16.json |
+| 2026-07-21 | recommendation-ingested | stocks/MDA.md | Hold/Medium/Long-term from MDA-2026-07-22.json |
+| 2026-07-21 | created | stocks/OUST.md | New stock page, status=research. |
+| 2026-07-21 | recommendation-ingested | stocks/OUST.md | Hold/High/Medium-term from OUST-2026-07-21.json |
+| 2026-07-22 | thesis-updated | stocks/T.md | Updated shorter Q2 2026 thesis, Analyst View, monitoring checklist, status date, and Decision History. |
+| 2026-08-03 | recommendation-ingested | stocks/PLTR.md | Hold/High/Medium-term from PLTR-2026-08-03.json |

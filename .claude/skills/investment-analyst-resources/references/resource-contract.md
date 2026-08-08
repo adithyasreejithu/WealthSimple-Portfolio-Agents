@@ -162,37 +162,111 @@ this is a normal, expected outcome for many tickers, not a data failure.
 ## Completeness trace (`trace`, in digest + bundle, plus a log line)
 
 Not analytical signal -- observability on whether this run's data pull was
-any good, so degradation is visible over time. Computed by
-`compute_completeness_trace` in `investment_analyst_resources.py` from the
-digest that was just built (no separate fetch, no shadow copy of the data).
+any good, so degradation is visible over time. Built by `build_trace` in
+`investment_analyst_resources.py` from the digest that was just built (no
+separate fetch, no shadow copy of the data), then written through the shared
+`src/skill_trace.py` writer this skill and `market-analyst-resources` both
+use. See `docs/architecture/usage_tracking.md`.
 
-Two levels:
-- **Domain-level tri-state** (ok / empty-expected / failed) across every
-  digest domain, generalizing `scoring_worksheet.py`'s `_groups_ok_count`
-  emptiness rule from "live groups only" to everything. Asset-class- and
-  ownership-aware: an ETF's `financials`/`earnings`, a stock's `etf_details`/
-  `funds`, and a not-owned ticker's `position`/`ledger_summary`/
-  `portfolio_context`/`classification`/`prices` count as **empty-expected**
-  and are excluded from the denominator -- they must never drag down a
-  healthy run's score.
-- **Field-level count** within each attempted domain, against a small
-  hand-authored manifest (`DOMAIN_MANIFEST`) of that domain's known digest
-  keys -- the literal "how many fields were successfully populated" count.
+Every field is classified **ok / missing / not-applicable**, and only
+`ok + missing` forms the completeness denominator. Not-applicable is decided
+per field group against *this run's* data, not just asset class:
 
-`trace` shape: `{fields_ok, fields_total, completeness_pct, domains_ok,
-domains_empty, domains_failed, missing_fields: [...]}`.
+| Group | Applicable when |
+|---|---|
+| `position`, `ledger_summary`, `portfolio_context`, `prices`, `classification` | the ticker is owned |
+| `financials`, `earnings`, `stock_details`, `derived.financials` | owned and not an ETF |
+| `etf_details` | owned and not a stock |
+| `derived.options` (7 fields) | the `options` live group returned a chain |
+| `derived.analyst` (3 fields) | the `analyst` live group returned coverage |
+| `derived.insider` (1 field) | the `insider` live group returned filings |
+| `derived.valuation` (`fcf_yield`) | not an ETF and `valuation` came back |
+| `derived.prices` (`return_30d/90d/365d`) | the DB series spans that window |
+| `live.*` | `--no-live` not set; `funds` is never applicable to a stock |
+| `quote` | `--no-quote` not set |
 
-Also appended as one line per ticker-run to
-`logs/InvestmentAnalystResourcesTrace.txt` (git-ignored, matching
-`logs/AgentSkillUsage.txt`/`SystemLogs.txt`'s pipe-delimited convention,
-`docs/architecture/usage_tracking.md`):
+This is why a TSX name with no options chain and no analyst coverage now
+reports `pct=100.0` on a run that obtained everything obtainable, instead of
+81.4% with eleven phantom gaps.
+
+`trace` shape: `{skill, subject, kind, completeness_pct, fields_ok,
+fields_missing, fields_graded, fields_not_applicable, domains_ok,
+domains_partial, domains_failed, domains_not_applicable, missing: [...],
+not_applicable: [...], domains: {name: {ok, missing, not_applicable}}}`.
+
+Written to `logs/SkillTrace.txt` (one scannable line, groups collapsed to
+counts) and `logs/SkillTrace.jsonl` (full field names), both git-ignored:
 
 ```
-2026-08-04 22:15:03 | TRACE | ticker=PLTR | asset_class=stock | fields_ok=41 | fields_total=45 | completeness_pct=91.1 | domains_ok=9 | domains_empty=1 | domains_failed=0 | missing=live.funds,dividends.declared_count
+2026-08-05 21:25:04 | TRACE | skill=investment-analyst-resources | subject=L | kind=stock | pct=100.0 | ok=48 | graded=48 | failed=0 | missing=- | n_a=derived.options[7],derived.analyst[3],derived.insider[1]
 ```
 
-`--no-trace` skips both the digest key and the log append. `--trace-log-path`
-overrides the log path (testing only).
+With `--run-id`, the trace is additionally appended to that run's
+`audit_log.jsonl` as a `trace_recorded` event. `--no-trace` skips the digest
+key and every write. `--trace-log-path` overrides the log path (testing only);
+the `.jsonl` sidecar follows it.
+
+## Run workspace (default-on)
+
+Any invocation that produces a bundle -- `--mode read`, or the default
+gate→refresh→read sequence -- **attaches to a run workspace automatically**,
+via the shared `workspace.run.ensure_run`. This is deliberate, not
+incidental: before it, a run only existed if the command line happened to
+carry `--run-id`, a judgment call that could be skipped on any given
+invocation. An audit trail cannot tolerate that -- an absent run looked
+identical to "no pull happened." `--mode gate` and `--mode refresh` never
+attach; neither produces a bundle to register.
+
+`_resolve_run` in `investment_analyst_resources.py` decides `run_dir`/
+`run_id`/`workspace_status`/`skip_reason` for the invocation, in this order:
+
+| Condition | Outcome |
+|---|---|
+| `--mode gate` / `--mode refresh` | skipped -- no bundle to register |
+| `--no-run` | skipped -- explicit opt-out |
+| `--db-path` overridden (testing convention) | skipped -- so the test suite never populates the real `workspace/runs/` |
+| otherwise | `ensure_run(args.run_id, ...)` -- created or attached |
+
+Skips are not silent: `workspace_status="skipped"` and a `skip_reason` are
+threaded into the completeness trace (`skill_trace.WorkspaceOutcome`), so
+`logs/SkillTrace.jsonl` always carries a positive record of what happened to
+the workspace, never an absence indistinguishable from "nothing ran."
+
+`--run-id` names the run instead of letting one be auto-generated:
+
+| Value | Behavior |
+|---|---|
+| omitted (still default-on) | Open a fresh run; the generated ID is printed to stderr |
+| `<id>` that exists | Attach to it |
+| `<id>` that does not exist | Create it under that exact name |
+
+The third row is what makes fan-out work: an orchestrator hands the same
+`--run-id` to every ticker's invocation, the first creates it, the rest attach,
+and all their bundles land in one run with one audit log. The cost is that a
+mistyped ID becomes a new empty run rather than an error — hence the
+`note: created run workspace <id>` line on stderr whenever creation happens.
+An ID that could traverse a path, or a directory that exists but is half-built,
+is still a hard error. Two concurrent processes racing to create the *same*
+explicit ID is handled too: `ensure_run` catches the loser's `RunExistsError`
+and re-attaches to the winner's run instead of failing.
+
+With a run attached (`docs/architecture/run_workspace.md`):
+
+- the bundle is written to `workspace/runs/<id>/evidence/<TICKER>-<date>-resources.json`
+- an `EvidenceRecord` is appended to that run's `evidence/sources.jsonl`
+  (`evidence_type: market_data_bundle`, `source_name: duckdb+yfinance`, sha256
+  content hash, `retrieved_at`) with status `available`, or **`partial` when
+  the trace found real gaps** -- so a downstream stage reading the manifest is
+  told the truth rather than assuming "present" means "complete"
+- `evidence_registered` and `trace_recorded` events are appended to the run's
+  audit log
+
+`--no-run` opts out: the bundle goes to
+`exports/investment-analyst-resources/<TICKER>-<date>-resources.json`, exactly
+the pre-default-on behavior, and the trace records why no run exists for this
+pull. `--no-run` together with `--run-id` is a usage error -- naming a run and
+refusing to attach to one are contradictory. Registry failures after a
+successful pull are warned about on stderr, never fatal.
 
 ## Bundle (on disk, `exports/investment-analyst-resources/<TICKER>-<date>-resources.json`)
 

@@ -1,0 +1,373 @@
+# Run workspace
+
+A **run** is one directory owning one investment-research question: the
+request, its inputs, the evidence gathered for it, deterministic
+calculations, agent outputs, and an append-only audit log. The point is that
+an answer is reproducible and auditable *as a unit* — you can look at a run
+months later and see what was asked, what was found, what was missing, and
+what was concluded.
+
+Implemented in `src/workspace/`. CLI: `python src/app.py run <subcommand>`
+(see `docs/reference/cli.md`).
+
+## Why this exists
+
+Before it, artifacts from different stages accumulated in shared directories
+under `exports/` with nothing tying an artifact to the question that produced
+it. That made three things impossible: telling which pull backed which
+decision, replaying a run, and knowing whether a gap in the data was noticed
+or silently filled. It also turned `exports/` into an inter-agent message
+queue, which is not what a directory named "exports" should be.
+
+## Three directories, three jobs
+
+| Directory | Holds | Lifetime |
+|---|---|---|
+| `workspace/` | Working state for one request | Per run; archived, never deleted |
+| `Knowledge-Base/` | Durable curated research the owner maintains | Permanent |
+| `exports/` | Data exported out of the pipeline for humans and downstream scripts | Regenerated |
+
+A run is *not* a knowledge base. Promotion from one to the other is a
+deliberate, reviewed step — see [Knowledge-base promotion](#knowledge-base-promotion).
+
+## Layout
+
+```text
+workspace/
+├── runs/
+│   └── 2026-08-08T020013Z_portfolio_check_SYNTH_d1124c/
+│       ├── request.yaml            what was asked
+│       ├── run_metadata.json       status, timestamps, component availability
+│       ├── context_manifest.yaml   the contract handed to the next stage
+│       ├── inputs/                 user-supplied files
+│       ├── evidence/
+│       │   ├── sources.jsonl       the evidence registry (append-only)
+│       │   └── <artifacts>         what was actually fetched
+│       ├── calculations/           deterministic computed output
+│       ├── agent_outputs/          one envelope per specialist stage
+│       ├── final/                  decision proposals
+│       ├── tmp/                    the only disposable content
+│       └── audit_log.jsonl         append-only event history
+└── archive/
+    └── 2026-08/<run_id>/
+```
+
+`workspace/` is covered by `.gitignore`'s leading `*`, same as `exports/` and
+`logs/` — local, not versioned.
+
+**Run ID:** `YYYY-MM-DDTHHMMSSZ_<mode>_<subject>_<short>`. The timestamp sorts
+lexicographically, mode and subject make a directory listing readable, and a
+random suffix prevents same-second collisions. Caller-supplied mode and
+subject are sanitized to `[A-Za-z0-9._-]`, so nothing in a run ID can traverse
+a path. A caller may also supply its own ID (`q3-review`), which is what makes
+the fan-out below work.
+
+## Two ways a run begins
+
+**Explicitly**, from a written request — `run create --request <path>`. This is
+the real workflow: a human (or an orchestrator) states a question, and the run
+exists to answer it.
+
+**Implicitly and by default**, from a data-collection skill. Any invocation of
+`investment-analyst-resources` or `market-analyst-resources` that actually
+produces evidence (`--mode read`, or the default gate→refresh→read /
+refresh→read sequence) attaches to a run workspace automatically, **creating
+it if it does not exist**, with no flag required:
+
+```powershell
+# no --run-id, no setup step -- a run still exists after this
+... investment_analyst_resources.py --ticker PLTR --mode read
+# note: created run workspace 2026-08-08T025918Z_data_pull_PLTR_4108db
+```
+
+This is default-on, not opt-in, and that was a deliberate correction. It
+started as an opt-in `--run-id` flag; that failed for exactly the reason an
+audit trail cannot tolerate: whether a run existed depended on whether
+whoever composed the command line remembered to pass it, and the first
+version of this document's skill guidance ("omit for the unchanged `exports/`
+behavior") actively invited skipping it. An absent run looked identical to
+"no pull happened." Flipping the default moved the decision out of the
+command line and into the code that always runs — the same way the
+completeness trace already behaves (`if not no_trace`, not `if trace`).
+
+Read-only or write-only invocations that produce no evidence artifact never
+attach: `--mode gate` (a freshness verdict, nothing to register) and
+`--mode refresh` (writes to the DB, not to a run). Two more cases opt out
+explicitly, and **both are recorded, not silent** — the trace's `workspace`
+field always says what happened, so a skip is a positive line in
+`logs/SkillTrace.jsonl` rather than an absence indistinguishable from nothing
+having run:
+
+| Skip reason | When |
+|---|---|
+| `"--no-run"` | the caller passed `--no-run` |
+| `"non-default-db"` | `--db-path` points somewhere other than the configured database -- the existing test/debug convention, reused so the test suite never populates the real `workspace/runs/` |
+
+`--no-run` and `--run-id` together is a usage error — naming a run and
+refusing to attach to one are contradictory.
+
+All of this goes through **one function**, `workspace.run.ensure_run` —
+attach if the run exists, create if it does not. Neither skill reimplements
+it, so there is a single definition of what an auto-created run looks like no
+matter which producer opens it, and a single place a create/attach race is
+handled (below).
+
+### Why an explicit ID matters: fan-out
+
+`ensure_run` is idempotent on the ID, so an orchestrator can hand the same ID
+to N skill invocations without caring which lands first — the first creates,
+the rest attach:
+
+```powershell
+... --ticker PLTR --run-id q3-review   # note: created run workspace q3-review
+... --ticker RTX  --run-id q3-review   # (silent -- attached)
+```
+
+One run, one audit log, two evidence records.
+
+### What an auto-created run says about itself
+
+A run opened this way has no stated question, and its stored `request.yaml`
+says exactly that rather than inventing one:
+
+```yaml
+mode: data_pull
+request:
+  question: Ad-hoc data pull for PLTR; no research question was recorded.
+  context: This run was opened by a data-collection skill rather than from a
+    submitted request. Evidence here is not yet tied to a stated question.
+```
+
+Fabricating a plausible-sounding question here would be worse than useless — a
+later reader would take it for the owner's actual intent. The restrictions
+block is unchanged and still un-weakenable.
+
+### The cost of create-on-miss
+
+A **mistyped ID silently becomes a new empty run** instead of erroring. That is
+the deliberate trade for removing the setup step. The mitigation is that
+creation always prints `note: created run workspace <id>` to stderr — an
+unfamiliar ID scrolling past is the only signal that a typo happened rather
+than an attach. Two things are still hard errors: an ID that could traverse a
+path, and a directory that exists but is half-built (missing metadata), which
+is never attached to as though it were a usable run.
+
+### The cost of default-on: run sprawl
+
+Every evidence-producing pull now makes a directory, tagged `mode: data_pull`
+and `trigger: <skill-name>`. A daily portfolio-wide pull adds on the order of
+250 run directories a year. Runs are never deleted (below), so this is
+accepted, not incidental — audit completeness was judged worth the sprawl.
+One `--run-id` shared across a coordinated multi-ticker pull keeps that pull
+to one directory instead of N; a prune policy for `mode: data_pull` runs, if
+sprawl becomes a real problem, can be added later without re-tagging anything
+already on disk.
+
+### Concurrent writers to one run
+
+`ensure_run` itself handles the *create* race: two invocations sharing one
+explicit `--run-id` can both see the directory missing and both attempt to
+create it; the loser catches the winner's `RunExistsError` and attaches
+instead of failing. What is **not** handled is concurrent *writes* once
+attached — parallel processes appending to the same run's
+`evidence/sources.jsonl` do so without a lock. This follows the precedent
+already set for `kb-intake` in `CLAUDE.md` ("the wiki helpers are not
+concurrency-safe" → serialize the commit step) rather than adding locking: a
+single invocation with multiple `--ticker` arguments is unaffected, since it
+appends sequentially within one process.
+
+## Two rules that hold everywhere
+
+**Never invent.** Missing evidence is *registered*, with status `missing` and
+a note saying why. That is the whole reason `register-evidence --missing`
+exists: a downstream stage must be able to tell "we looked and it wasn't
+there" from "nobody looked." No stage substitutes a value it could not
+obtain.
+
+**Never execute.** `Restrictions` refuses to let a request enable
+`execute_trades` or disable `human_review_required`; `DecisionProposal` pins
+`trade_executed` to `False` at the type level; and `validate` scans every
+agent output and proposal at any nesting depth for order/fill/broker fields,
+failing the run if it finds one. This is decision support, not trading.
+
+## How information moves
+
+```text
+request.yaml
+    ↓  create-run
+run_metadata.json + empty registry + audit log
+    ↓  scripts collect data
+evidence/<artifacts> + sources.jsonl rows (present AND missing)
+    ↓  build-manifest
+context_manifest.yaml   ← the contract: what may be used, what is absent
+    ↓  (deferred) specialist stages
+agent_outputs/*.json    ← must cite registered evidence IDs
+    ↓  (deferred) portfolio stage
+final/*.json            ← a proposal, never an order
+    ↓  human review
+completed → archive
+```
+
+The manifest is **regenerated, never hand-edited**. A manifest that drifted
+from the registry would be worse than none, because a stage would trust it.
+
+## Lifecycle
+
+```text
+created ──→ in_progress ──→ awaiting_input ──→ in_progress
+                        └─→ awaiting_human_review ──→ completed | failed
+        completed | failed ──→ archived
+```
+
+`src/workspace/state.py` holds this as data. Any transition not in the table
+raises `InvalidTransitionError` — a run cannot skip from `created` straight to
+`completed`. `archived` is terminal.
+
+## Evidence
+
+One JSONL row per piece of evidence in `evidence/sources.jsonl`.
+
+| Status | Meaning |
+|---|---|
+| `pending` | Expected, not yet collected |
+| `available` | Collected, artifact on disk |
+| `partial` | Collected, but with known gaps |
+| `missing` | Looked for, not obtainable |
+| `stale` | Present but past its freshness window |
+| `invalid` | Present but failed validation |
+
+`artifact_path` is stored **run-relative** so a record survives archiving, and
+a sha256 `content_hash` is computed by the registry itself — never trusted
+from the caller. `validate` re-hashes every artifact, so a tampered or
+truncated file is detected.
+
+Registering the same evidence ID twice, or the same artifact twice, is
+refused: two rows claiming the same bytes would let a manifest cite either.
+
+## Validation
+
+`python src/app.py run validate --run-id <id>` returns
+`{ok, errors, warnings, counts}`. pydantic checks each document's shape;
+`src/workspace/validation.py` checks what a single schema cannot see:
+
+- run ID consistency between request and metadata
+- every manifest and agent-output evidence citation resolves to a registered ID
+- every referenced path stays inside the run (no traversal)
+- artifact content hashes still match
+- no trade-execution fields anywhere
+- malformed JSONL lines in either append-only log
+
+Errors mean the run is not trustworthy. Warnings mean it is incomplete but
+coherent — a fresh run legitimately has no agent outputs yet.
+
+## Retention and archiving
+
+```text
+active run → validation → human review → completion
+           → optional knowledge-base promotion → archive
+```
+
+**Runs are never deleted.** `archive-run` moves the directory, with its
+structure intact, into `workspace/archive/<YYYY-MM>/<run_id>/`. Only `tmp/` is
+discarded. An existing archive slot is never overwritten.
+
+A run that fails validation is refused by default, so archiving cannot be used
+to hide a broken run — but `--no-validate` archives it anyway, because an
+abandoned or failed run must still be *retained*. There is no automatic
+deletion in this phase.
+
+## Knowledge-base promotion
+
+**Deferred, deliberately.** The boundary is defined here so it is not
+improvised later. Only these should ever be promoted from a run into
+`Knowledge-Base/`, and only after human review:
+
+- validated durable facts
+- an updated investment thesis
+- a final reviewed decision
+- source references
+- historical reports
+
+Everything else — raw pulls, intermediate calculations, superseded drafts —
+stays in the run. Nothing is copied automatically, and no duplicate
+knowledge-base structure is created inside `workspace/`.
+
+## What is implemented today
+
+**Working:** run creation with rollback, the state machine, the evidence
+registry, manifest generation, full validation, the audit log, archiving, the
+CLI, and `investment-analyst-resources` writing into a run via `--run-id`.
+
+**Contracts only, no reasoning behind them:** `AgentOutput` and
+`DecisionProposal`. They exist so the stages built later have a target, and so
+validation can already enforce evidence citation and the no-trade rule.
+
+**Deferred:** market-researcher / investment-analyst / portfolio-manager
+agents; the policy engine (runs record it as `unavailable`); knowledge-base
+promotion; migrating the `stock-data-prep → stock-analyst → kb-intake` chain.
+
+`run_metadata.available_components` records which of these were reachable for
+each run, so a reader can always tell "not run" from "ran and found nothing".
+
+## Worked example (synthetic)
+
+> The values below are a fixture — ticker `SYNTH` is not a real security and
+> no market data is involved.
+
+`tests/fixtures/synthetic_request.yaml`:
+
+```yaml
+schema_version: "1.0"
+mode: "portfolio_check"
+subject:
+  type: "security"
+  identifiers:
+    ticker: "SYNTH"
+request:
+  question: "Should this synthetic position be held, trimmed, or exited?"
+required_analysis: [business_quality, valuation, portfolio_impact]
+restrictions:
+  research_only: true
+  execute_trades: false
+  do_not_invent_data: true
+  human_review_required: true
+```
+
+```powershell
+uv run python src/app.py run create --request tests/fixtures/synthetic_request.yaml
+# -> {"run_id": "2026-08-08T020013Z_portfolio_check_SYNTH_d1124c", ...}
+
+# Record a gap rather than inventing a price:
+uv run python src/app.py run register-evidence --run-id <id> `
+    --missing --type price_quote --source synthetic --status missing `
+    --note "no live pull in this fixture"
+
+uv run python src/app.py run build-manifest --run-id <id> --target-stage investment_analyst
+uv run python src/app.py run validate --run-id <id>
+uv run python src/app.py run set-status --run-id <id> --status in_progress
+uv run python src/app.py run archive --run-id <id>
+```
+
+The resulting manifest carries the gap forward explicitly:
+
+```yaml
+evidence:
+- evidence_id: ev_2acc684e9b5d
+  evidence_type: price_quote
+  status: missing
+  path: null
+missing_information:
+- 'price_quote from synthetic: missing'
+validation_status: incomplete
+```
+
+`validation_status: incomplete` is the manifest refusing to claim readiness it
+cannot demonstrate — which is exactly what a downstream stage needs in order
+not to guess.
+
+## Related
+
+- `docs/architecture/usage_tracking.md` — the shared skill trace written
+  alongside run audit events
+- `docs/architecture/knowledge_base.md` — the durable side of the boundary
+- `docs/reference/cli.md` — the `run` command reference

@@ -25,6 +25,7 @@ dependencies = [
     "markitdown[pdf,docx,pptx,xlsx]",
     "fastapi>=0.139.2",
     "uvicorn[standard]>=0.51.0",
+    "pydantic>=2.0",
 ]
 
 [build-system]

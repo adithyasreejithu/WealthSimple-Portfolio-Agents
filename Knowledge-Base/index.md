@@ -33,6 +33,8 @@ the `kb-discovery` agent searches it, the `kb-intake` agent writes to it.
 <!-- kb-index:begin -->
 | Page | Type | Tickers | Status | Updated | Summary |
 |---|---|---|---|---|---|
+| [MDA Space Ltd. (MDA) — Stock Page](stocks/MDA.md) | stock-page | MDA | active | 2026-07-21 | Research page for MDA, created 2026-07-14. |
+| [Ouster, Inc. (OUST) — Stock Page](stocks/OUST.md) | stock-page | OUST | research | 2026-07-21 | Research page for OUST, created 2026-07-21. |
 | [iShares Core Dividend Growth ETF (DGRO) — Stock Page](stocks/DGRO.md) | stock-page | DGRO | active | 2026-07-16 | Research page for DGRO, created 2026-07-14. |
 | [iShares MSCI India ETF (INDA) — Stock Page](stocks/INDA.md) | stock-page | INDA | active | 2026-07-16 | Research page for INDA, created 2026-07-14. |
 | [IREN — Stock Page](stocks/IREN.md) | stock-page | IREN | active | 2026-07-16 | Research page for IREN, created 2026-07-16. |
@@ -45,7 +47,5 @@ the `kb-discovery` agent searches it, the `kb-intake` agent writes to it.
 | [Enbridge Inc. (ENB) — Stock Page](stocks/ENB.md) | stock-page | ENB | active | 2026-07-14 | Research page for ENB, created 2026-07-14. |
 | [Hims & Hers Health, Inc. (HIMS) — Stock Page](stocks/HIMS.md) | stock-page | HIMS | active | 2026-07-14 | Research page for HIMS, created 2026-07-14. |
 | [Loblaw Companies Limited (L) — Stock Page](stocks/L.md) | stock-page | L | active | 2026-07-14 | Research page for L, created 2026-07-14. |
-| [MDA Space Ltd. (MDA) — Stock Page](stocks/MDA.md) | stock-page | MDA | active | 2026-07-14 | Research page for MDA, created 2026-07-14. |
 | [Meta Platforms, Inc. (META) — Stock Page](stocks/META.md) | stock-page | META | active | 2026-07-14 | Research page for META, created 2026-07-14. |
-| [ServiceNow, Inc. (NOW) — Stock Page](stocks/NOW.md) | stock-page | NOW | active | 2026-07-14 | Research page for NOW, created 2026-07-14. |
 <!-- kb-index:end -->

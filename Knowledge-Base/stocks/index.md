@@ -23,7 +23,6 @@ One canonical page per ticker (`TICKER.md`). The page's front-matter `status` (`
 | [Enbridge Inc. (ENB) — Stock Page](ENB.md) | stock-page | ENB | active | 2026-07-14 | Research page for ENB, created 2026-07-14. |
 | [Hims & Hers Health, Inc. (HIMS) — Stock Page](HIMS.md) | stock-page | HIMS | active | 2026-07-14 | Research page for HIMS, created 2026-07-14. |
 | [Loblaw Companies Limited (L) — Stock Page](L.md) | stock-page | L | active | 2026-07-14 | Research page for L, created 2026-07-14. |
-| [MDA Space Ltd. (MDA) — Stock Page](MDA.md) | stock-page | MDA | active | 2026-07-14 | Research page for MDA, created 2026-07-14. |
 | [Meta Platforms, Inc. (META) — Stock Page](META.md) | stock-page | META | active | 2026-07-14 | Research page for META, created 2026-07-14. |
 | [ServiceNow, Inc. (NOW) — Stock Page](NOW.md) | stock-page | NOW | active | 2026-07-14 | Research page for NOW, created 2026-07-14. |
 | [NVIDIA Corporation (NVDA) — Stock Page](NVDA.md) | stock-page | NVDA | active | 2026-07-14 | Research page for NVDA, created 2026-07-14. |
@@ -40,4 +39,6 @@ One canonical page per ticker (`TICKER.md`). The page's front-matter `status` (`
 | [IREN — Stock Page](IREN.md) | stock-page | IREN | active | 2026-07-16 | Research page for IREN, created 2026-07-16. |
 | [Schwab U.S. Dividend Equity ETF (SCHD) — Stock Page](SCHD.md) | stock-page | SCHD | active | 2026-07-16 | Research page for SCHD, created 2026-07-14. |
 | [VanEck Semiconductor ETF (SMH) — Stock Page](SMH.md) | stock-page | SMH | active | 2026-07-16 | Research page for SMH, created 2026-07-14. |
+| [MDA Space Ltd. (MDA) — Stock Page](MDA.md) | stock-page | MDA | active | 2026-07-21 | Research page for MDA, created 2026-07-14. |
+| [Ouster, Inc. (OUST) — Stock Page](OUST.md) | stock-page | OUST | research | 2026-07-21 | Research page for OUST, created 2026-07-21. |
 <!-- kb-index:end -->

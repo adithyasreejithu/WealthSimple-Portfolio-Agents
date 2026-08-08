@@ -108,6 +108,16 @@ Reused as-is, not reimplemented, from day one:
 
 ## 6. Directory layout
 
+> **Superseded (2026-08-08).** The `research-v2/` tree below was never built.
+> The run workspace at `workspace/runs/<run_id>/` replaces it and covers the
+> same ground more rigorously — per-request isolation, an explicit evidence
+> registry that records gaps instead of omitting them, schema validation, an
+> append-only audit log, and archiving. See
+> `docs/architecture/run_workspace.md`. Read this section as the historical
+> rationale; build against the run workspace instead. (Plans are not updated
+> after the fact; this note exists only to stop a reader implementing a
+> directory tree that has been replaced.)
+
 Agent and skill *definitions* must live where Claude Code auto-discovers
 them (`.claude/agents/`, `.claude/skills/`) — that's not negotiable. Their
 *data* (evidence, theses, market notes) gets a fully separate top-level

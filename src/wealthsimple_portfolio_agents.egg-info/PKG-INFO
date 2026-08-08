@@ -21,6 +21,7 @@ Requires-Dist: duckdb
 Requires-Dist: markitdown[docx,pdf,pptx,xlsx]
 Requires-Dist: fastapi>=0.139.2
 Requires-Dist: uvicorn[standard]>=0.51.0
+Requires-Dist: pydantic>=2.0
 
 # WealthSimple-Portfolio-Agents
 

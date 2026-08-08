@@ -14,9 +14,8 @@ Run `uv run python .claude/skills/investment-analyst-resources/scripts/investmen
 - `--ticker TICKER [TICKER ...]` — one or more pipeline ticker symbols.
 - Default (no `--mode`): gate → refresh → read in one process. Refreshes
   only the domains that are actually stale for the given ticker(s), then
-  reads the database and tops up live, then prints a **digest** to stdout
-  and writes a **bundle** JSON to
-  `exports/investment-analyst-resources/<TICKER>-<date>-resources.json`.
+  reads the database and tops up live, then prints a **digest** to stdout.
+  The bundle JSON is written to a **run workspace** — see below.
 - `--mode gate` — read-only freshness verdict per ticker, JSON to stdout, no
   writes, no fetch. Safe to run in parallel with anything.
 - `--mode refresh` — the **only** write path: batch-refreshes every due
@@ -29,6 +28,38 @@ Run `uv run python .claude/skills/investment-analyst-resources/scripts/investmen
   see `references/resource-contract.md`. `--no-quote` is independent of
   `--no-live`: omitting it keeps the live current-price quote even in a
   `--no-live` (DB-only) run, since that's the case it matters most for.
+
+## Run workspace: default-on
+
+Any invocation that produces a bundle (`--mode read` or the default
+gate→refresh→read sequence) **attaches to a run workspace automatically** —
+the bundle lands in that run's `evidence/`, is registered in its evidence
+registry, and the completeness trace is appended to its audit log. **The run
+is created if it does not exist**, so no `run create` step is needed first.
+`--mode gate`/`--mode refresh` never open one; they produce nothing to
+register.
+
+This is deliberately not opt-in. A run only existed before if whoever
+composed the command line remembered to pass `--run-id` — a judgment call
+that could be skipped on any given invocation, and the old wording here
+("omit for the unchanged `exports/` behavior") actively invited skipping it.
+An audit trail cannot tolerate that: an absent run looked identical to "no
+pull happened." Flipping the default moved the decision into the code, the
+same way the completeness trace already runs unless `--no-trace` is passed.
+
+- `--run-id ID` — name the run explicitly rather than letting one be
+  generated. Attaches if it exists, creates it under that exact name if not.
+  Passing the same ID to several invocations puts them all in one run — the
+  fan-out pattern.
+- `--no-run` — opt out; the bundle goes to `exports/` as before this became
+  the default. The opt-out is itself recorded in the completeness trace
+  (`workspace.skip_reason`), so it stays a visible, greppable fact in
+  `logs/SkillTrace.jsonl` rather than a silent gap.
+- A non-default `--db-path` also skips workspace attachment (the existing
+  test/debug convention), so the test suite never populates the real
+  `workspace/runs/`.
+
+See `docs/architecture/run_workspace.md`.
 
 ## Why three modes
 
@@ -92,11 +123,13 @@ Full cadence rules, refresh commands, and field-level detail are in
   `stock_details`/`etf_details`, which this skill already reads.
 - Computes deterministic derived metrics (`derived_metrics.py`: FCF yield,
   options positioning, price returns, analyst revision counts, net insider
-  shares) and a completeness trace (`compute_completeness_trace`) — both are
-  pure math over data already fetched, not judgment. It still does not
-  judge, score, or write to `Knowledge-Base/`. It has no rubric and forms no
-  opinion — narrative thesis-writing and any Buy/Sell-style verdict remain
-  the (deferred) `investment-analyst` agent's job.
+  shares) and a completeness trace (`build_trace`, emitted through the shared
+  `src/skill_trace.py`) — both are pure math over data already fetched, not
+  judgment. It still does not judge, score, or write to `Knowledge-Base/`. It
+  has no rubric and forms no opinion — narrative thesis-writing and any
+  Buy/Sell-style verdict remain the (deferred) `investment-analyst` agent's
+  job. The trace grades only what was *obtainable* for the ticker: a name with
+  no options chain is not penalized for lacking options metrics.
 - Does not run a portfolio-wide classification or position recompute itself
   -- `classification` and `positions` are report-only domains; a stale
   verdict there names the portfolio-wide command to run instead.
