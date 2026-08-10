@@ -76,6 +76,8 @@ see `docs/architecture/decision_support_flow.md`).
 | `src/system_logger.py` | Provides shared file-backed logging. | Mention in `CLAUDE.md` so future runtime code uses it. |
 | `.claude/skills/classify-portfolio/scripts/` | Holds the classification workflow modules (`classification_workflow.py`, `portfolio_classifier.py`) used only by the classifier agent. | Keep agent-only Python beside its skill, not in `src/`. |
 | `.claude/skills/reconcile-holdings-report/scripts/` | Holds `generate_reconciliation_report.py`, the deterministic markdown-report renderer used only by the `holdings-reconciliation` agent (see `docs/agents/holdings-reconciliation/`). Calls existing `src/holdings_reconciler.py`/`src/analytics.py` functions rather than reimplementing reconciliation logic. | Keep agent-only Python beside its skill, not in `src/`. |
+| `.claude/skills/security-technicals/scripts/` | Holds `security_technicals_cli.py`, the agent-invoked orchestrator for per-security price technicals. Imports the pure math from `src/security_technicals.py` rather than vendoring it, because that math has non-skill consumers too. | A skill may wrap `src/` code it does not own; the wrapper (CLI, run attachment, evidence/audit/trace) is what belongs beside the skill. |
+| `.claude/skills/read-security-price-history/scripts/` | Holds `read_price_history.py`, the read-only DuckDB boundary for the security-technicals workflow, including the repository's canonical benchmark price-series reader. | Dependency-only skill; same shape as `read-portfolio-classification-data`. |
 | `tests/` | Verifies config, extraction, and classification behavior. | Mention the test command in `CLAUDE.md`. |
 | `.env` | Local runtime secrets and environment-specific values. | Do not move secrets into `CLAUDE.md` or `src/config.py`. |
 
@@ -203,6 +205,20 @@ Required `SKILL.md` front matter:
 | `description` | Third-person trigger condition that tells Claude when to use the skill. |
 
 Python that only the skill uses lives in that skill's `scripts/` directory. For example, the `classify-portfolio` skill keeps `classification_workflow.py` and `portfolio_classifier.py` in its own `scripts/` folder; the dependency skills import that shared module by adding the folder to `sys.path`.
+
+#### Two kinds of skill
+
+- **Agent-invoked** (`classify-portfolio`, `investment-analyst-resources`, `security-technicals`, most of them): Claude reads the `SKILL.md` and follows its workflow, running the scripts via `Bash`.
+- **Dependency-only** (`read-portfolio-classification-data`, `fetch-yfinance-classification-data`, `read-security-price-history`): never invoked directly. Their `SKILL.md` is a few lines whose `description` ends "Use only as an internal dependency of X, never for arbitrary SQL or database paths", and a `references/*-contract.md` states the executable boundary. Another skill's scripts import them via `sys.path`.
+
+#### Skill-owned code vs. wrapped `src/` code
+
+"Python used exclusively by a skill lives beside that skill" is about **ownership**, not about whether a skill exists. A skill may wrap `src/` code it does not own, and should when that code has other consumers:
+
+- `security-technicals` imports `src/security_technicals.py`. The math has non-skill consumers (the Phase 3 worksheet builder, potentially a dashboard route), so it stays in `src/` — while the CLI, run-workspace attachment, evidence/audit registration, and completeness trace, which only this skill needs, live in the skill.
+- `reconcile-holdings-report` does the same with `src/holdings_reconciler.py`.
+
+The invariant to preserve: **skills import `src/`; `src/` never imports `.claude/`.** Moving multi-consumer math into a skill would force a `src/` module to import from `.claude/`, which is the dependency direction this layout exists to prevent. See `docs/plans/implementation/phase-2/design-decisions.md` (Decision 4) for a worked example.
 
 Example `.claude/skills/email-extraction/SKILL.md`:
 

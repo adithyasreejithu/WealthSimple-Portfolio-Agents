@@ -25,6 +25,15 @@ here fetches data. Every function returns `None` (or an all-`None` dict) on
 insufficient input rather than raising -- short history, no overlap with the
 benchmark series, and non-positive prices are normal, expected conditions for
 many tickers, not data failures.
+
+**Runnable entry point:** the `security-technicals` skill
+(`.claude/skills/security-technicals/`) wraps these functions with a CLI, the
+DuckDB read, run-workspace attachment, evidence/audit registration, and a
+completeness trace. That is how an agent invokes this; importing this module
+directly is for other Python (the Phase 3 worksheet builder, a future
+dashboard route). The math stays here rather than inside the skill precisely
+so those `src/` consumers never have to import from `.claude/` -- see
+docs/plans/implementation/phase-2/design-decisions.md, Decision 4.
 """
 
 from __future__ import annotations

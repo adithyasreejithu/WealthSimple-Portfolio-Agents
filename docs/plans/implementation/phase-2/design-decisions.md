@@ -196,6 +196,74 @@ number. This touches no dashboard code and no `src/` module.
 
 ---
 
+## Decision 4 — Reversal: technicals becomes a skill after all (2026-08-10)
+
+**Decisions 1-3 stand. This one supersedes Decision 1's Option C rejection only.**
+
+Phase 2 shipped `src/security_technicals.py` as a plain importable module. The owner's
+objection afterward was correct and this decision records the reversal: the module was
+not runnable by an agent, and nothing it computed was traceable — no `SKILL.md`, no CLI,
+no run attachment, no evidence entry, no audit event, no log line.
+
+### What Option C got wrong
+
+Decision 1 rejected "put the technicals beside the skill" partly on the grounds that
+Phase 3's `src/workspace/investment_worksheet.py` "would then have to import
+skill-private scripts — the dependency runs backwards." That reasoning was sound but the
+conclusion drawn from it was too broad: it conflated **where the math lives** with
+**whether a skill exists**. Those are independent. The math can stay in `src/` (so no
+dependency runs backwards) *and* a skill can wrap it (so an agent can invoke it with full
+traceability). That is what was built.
+
+### Two findings that changed the analysis
+
+1. **`calculations/` exists, is wired, and had no producer.** `src/workspace/paths.py:23`
+   creates a `calculations/` directory in every run and `src/workspace/manifest.py:75`
+   already surfaces its contents as `calculation_paths` in `context_manifest.yaml` — but
+   nothing in the repository wrote there. The workspace schema distinguishes `evidence/`
+   (facts obtained from outside, carrying provenance) from `calculations/` (deterministic
+   arithmetic over data the run already holds). Technicals is the second kind. This skill
+   is that directory's first producer.
+2. **No canonical benchmark price reader existed.** `src/analytics.py:689` runs an ad-hoc
+   inline query inside `get_trend_overlays`, `analytics.get_benchmark_returns` fetches
+   live from yfinance and never persists, `market_data.ensure_benchmark_history` only
+   writes, and `db_resources.read_price_history` was never called with a benchmark
+   ticker. `security_technicals.py`'s own `benchmark_rows` parameter was supplied by
+   **tests only**. Beta, alpha, and relative strength all need that series.
+
+### What was built
+
+- **`.claude/skills/read-security-price-history/`** — a dependency-only skill following the
+  `read-portfolio-classification-data` template (9-line `SKILL.md`, a
+  `references/database-contract.md`, one script, no argparse). Provides
+  `read_security_prices` and the previously-missing `read_benchmark_prices`. Its
+  connect/validate helpers duplicate `db_resources.py`'s — the same duplication
+  `db_resources.py`'s own docstring already blesses, for the same reason.
+- **`.claude/skills/security-technicals/`** — the agent-invoked skill: `SKILL.md` with a
+  workflow and guardrails, `references/technicals-contract.md`, and a CLI that attaches to
+  a run by default, writes the artifact to `calculations/`, registers it as
+  `derived_calculation` evidence, appends a `calculation_written` audit event, and emits a
+  completeness trace.
+- **`src/security_technicals.py` — unmoved and unchanged.** All 16 existing tests pass
+  untouched, which is the proof the math did not move.
+
+### The trace rule that mattered most
+
+Insufficient history grades as **`not_applicable`, never `missing`**. A 60-day-old holding
+genuinely cannot have an SMA-200; grading that as a gap would report a healthy run as
+incomplete and bury real gaps in noise — the exact failure `src/skill_trace.py`'s module
+docstring documents (a healthy run reading 81% complete with eleven bogus "missing"
+fields). Only real absences — a resolvable ticker with no stored rows, or a benchmark with
+no history — grade as `missing`.
+
+### What this does *not* change
+
+Decision 1's core rule holds: **`src/portfolio_metrics.py` and `src/analytics.py` remain
+untouched**, and `beta_alpha` still delegates to `calculate_benchmark_stats` by import.
+The `ddof` asymmetry recorded in `HANDOFF.md` is still unfixed, still deliberately.
+
+---
+
 ## Summary of the file boundary for Phase 2
 
 | Action | Files |

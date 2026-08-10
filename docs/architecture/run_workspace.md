@@ -44,6 +44,7 @@ workspace/
 │       │   ├── sources.jsonl       the evidence registry (append-only)
 │       │   └── <artifacts>         what was actually fetched
 │       ├── calculations/           deterministic computed output
+│       │                           (first producer: the security-technicals skill)
 │       ├── agent_outputs/          one envelope per specialist stage
 │       ├── final/                  decision proposals
 │       ├── tmp/                    the only disposable content
@@ -244,6 +245,33 @@ truncated file is detected.
 Registering the same evidence ID twice, or the same artifact twice, is
 refused: two rows claiming the same bytes would let a manifest cite either.
 
+### `evidence/` vs `calculations/`
+
+Both directories hold artifacts and both are registered in the same registry,
+but they answer different questions and the split is worth keeping clean:
+
+| | `evidence/` | `calculations/` |
+|---|---|---|
+| Holds | Facts obtained from **outside** the process — a yfinance pull, an ingested document | **Deterministic arithmetic** over data the run already holds |
+| Provenance means | Where the fact came from, and whether it can be trusted | Which inputs and which formula produced the number |
+| Reproducible from the run alone? | No — re-fetching may return something different | Yes — same inputs, same output, always |
+| First producer | `investment-analyst-resources` | `security-technicals` |
+
+A calculation artifact is still registered in `sources.jsonl` (with
+`evidence_type: derived_calculation`) so it gets a content hash, an audit
+event, and a place in the manifest — the registry tracks *every* artifact's
+provenance, not only fetched ones. What the directory split preserves is the
+ability to answer "what did this run learn from the outside world?" without
+derived numbers muddying the answer.
+
+`context_manifest.yaml` lists them separately: `evidence` entries versus
+`calculation_paths`. A downstream stage finds a calculation artifact through
+`calculation_paths` rather than by guessing a filename.
+
+Registering a calculation is **best-effort** in the producing skill: a registry
+failure warns to stderr but never discards a calculation that succeeded. The
+artifact on disk is the deliverable; the registry entry is bookkeeping about it.
+
 ## Validation
 
 `python src/app.py run validate --run-id <id>` returns
@@ -296,7 +324,8 @@ knowledge-base structure is created inside `workspace/`.
 
 **Working:** run creation with rollback, the state machine, the evidence
 registry, manifest generation, full validation, the audit log, archiving, the
-CLI, and `investment-analyst-resources` writing into a run via `--run-id`.
+CLI, `investment-analyst-resources` writing evidence into a run, and
+`security-technicals` writing calculation artifacts into `calculations/`.
 
 **Contracts only, no reasoning behind them:** `AgentOutput` and
 `DecisionProposal`. They exist so the stages built later have a target, and so

@@ -88,9 +88,16 @@ answers a different question: **was the data any good?** Without it,
 degradation in a source is invisible until an analysis quietly scores against
 half-empty data.
 
-Written by `src/skill_trace.py`, which every data-collecting skill shares.
-Producers today: `investment-analyst-resources` and
-`market-analyst-resources`.
+Written by `src/skill_trace.py`. Producers today: `investment-analyst-resources`,
+`market-analyst-resources`, and `security-technicals`.
+
+The first two collect data; `security-technicals` collects none — it computes
+over stored prices. It emits a trace anyway because the question the trace
+answers ("was the data any good?") applies equally to a calculation whose
+inputs may be thin: a ticker with sixty days of history cannot produce an
+SMA-200, and that fact belongs in the same place a missing options chain does.
+The rule is therefore **any skill whose output quality depends on input
+coverage**, not "any skill that fetches".
 
 ### The three-way split
 

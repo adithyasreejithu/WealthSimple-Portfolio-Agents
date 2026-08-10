@@ -1,7 +1,16 @@
 # Phase 2 Handoff — Key Changes and Context for Future Sessions
 
 **Date:** 2026-08-10
-**Status:** Phase 2 complete, staged for commit on `Agent-Development`
+**Status:** Phase 2 complete, plus a follow-on skill refactor (see below)
+
+> **Read this first.** After Phase 2 shipped, `security_technicals` was wrapped in a
+> proper skill so an agent can invoke it and its output is traceable. Two new skills
+> exist — `security-technicals` (agent-invoked) and `read-security-price-history`
+> (dependency-only) — and `runs/<id>/calculations/` now has its first producer.
+> `src/security_technicals.py` did **not** move; the skill wraps it. The full record,
+> including what the original Option C rejection got wrong, is
+> [`design-decisions.md`](design-decisions.md) **Decision 4**. Everything below about
+> the math, the `ddof` finding, and the `extra`-blob verification still stands.
 
 ---
 
