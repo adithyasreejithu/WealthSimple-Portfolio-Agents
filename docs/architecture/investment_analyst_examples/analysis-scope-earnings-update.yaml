@@ -1,0 +1,43 @@
+# Example: valid analysis-scope.v1 — earnings_update mode, incremental run
+# against an already-validated PLTR thesis.
+# Illustrates docs/architecture/analysis_scope_schema.md, and pairs with
+# valid-incremental-patch.yaml (the resulting thesis).
+
+schema: analysis-scope.v1
+run_id: 2026-08-09T193000Z-pltr
+subject: PLTR
+asset_track: equity
+mode: earnings_update
+trigger:
+  type: earnings
+  occurred_at: 2026-08-08T20:00:00Z
+  detail: "Q2 FY2026 earnings release, within the 2-day earnings-proximity window."
+decision_horizon: Long-term
+evaluate_sections:
+  - executive_conclusion
+  - financial_trajectory
+  - expectations_and_results
+  - valuation
+  - catalysts
+  - risks_and_disconfirming_evidence
+  - scenarios
+  - conclusion_and_triggers
+preserve_sections:
+  - thesis_and_variant_perception
+  - company_profile
+  - business_quality
+  - price_and_market_context
+  - options_and_positioning
+  - insider_institutional_capital_allocation
+  - market_and_macro_sensitivity
+  - portfolio_context
+not_applicable_sections: []
+required_evidence_domains:
+  - financials
+  - earnings
+  - valuation
+optional_evidence_domains:
+  - prices
+  - options
+  - news
+critical_gap_policy: stop

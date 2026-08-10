@@ -1,0 +1,223 @@
+# Example: valid investment-thesis.v1 — earnings_update incremental run
+# against valid-initial-thesis.yaml, produced under
+# analysis-scope-earnings-update.yaml.
+# Illustrates: preserved sections carry NO replacement narrative (only a
+# section_states entry), section_states matches evaluate/preserve_sections
+# from the scope exactly, and prior_thesis is populated.
+
+schema: investment-thesis.v1
+run_id: 2026-08-09T193000Z-pltr
+artifact_id: th_7b3e1d5a2c94
+generated_at: 2026-08-09T19:41:55Z
+security:
+  ticker: PLTR
+  provider_symbol: PLTR
+  asset_track: equity
+analysis_mode: earnings_update
+policy_version: v1.0
+worksheet_ref:
+  path: calculations/PLTR-2026-08-09T193000Z-worksheet.json
+  hash: "sha256:2d8e...redacted...af01"
+prior_thesis:
+  exists: true
+  artifact_id: th_4f2a9c1e0b7d
+  version: 1
+  content_hash: "sha256:71c4...redacted...b309"
+  approved_at: 2026-08-09T15:10:00Z
+
+# Every one of the 16 IDs still appears here (validator rule: "all evaluated
+# sections have a state" applies to preserved sections too), but only the
+# evaluate_sections subset gets a `sections` entry below.
+section_states:
+  executive_conclusion: changed
+  thesis_and_variant_perception: unchanged
+  company_profile: unchanged
+  business_quality: unchanged
+  financial_trajectory: changed
+  expectations_and_results: changed
+  valuation: changed
+  price_and_market_context: unchanged
+  options_and_positioning: unchanged
+  insider_institutional_capital_allocation: unchanged
+  market_and_macro_sensitivity: unchanged
+  catalysts: changed
+  risks_and_disconfirming_evidence: changed
+  scenarios: changed
+  portfolio_context: unchanged
+  conclusion_and_triggers: changed
+
+conclusion:
+  fundamental_rating: attractive
+  valuation_stance: reasonable
+  thesis_direction: strengthening
+  thesis_confidence: medium
+  evidence_completeness_pct: 91.0
+  investment_case: >
+    Q2 FY2026 commercial bookings growth of 41% YoY (ev_e5) confirms
+    thesis_1 from the initial thesis and clears the upgrade_conditions
+    trigger set at th_4f2a9c1e0b7d (commercial_bookings_reaccel, threshold
+    0.35). Valuation has partially caught down to trailing price weakness
+    since the print, improving the entry point.
+  case_against: >
+    One quarter of confirmation is one confirmation_period short of the
+    two-period bar the original trigger set; this upgrade is provisional on
+    the next print repeating it.
+  most_important_catalyst: "Q3 FY2026 commercial bookings print — second confirmation period"
+  most_important_risk: "Federal budget/appropriations timing risk to government segment (unchanged from initial thesis)"
+  most_important_unknown: "Customer concentration within the top 10 commercial accounts (still blocked on Phase 6)"
+  analysis_horizon: Long-term
+  as_of: 2026-08-09T19:30:00Z
+
+key_claims:
+  - claim_id: thesis_1
+    statement: "Commercial AIP bookings are growing faster than the company's overall revenue growth rate, broadening the customer base beyond government."
+    claim_type: fact
+    importance: critical
+    evidence_ids: [ev_e5]
+    status_vs_prior: strengthened
+    confidence: high
+  - claim_id: thesis_2
+    statement: "Current valuation already prices in several years of AIP growth continuing at its recent pace, leaving limited multiple-expansion upside."
+    claim_type: inference
+    importance: critical
+    evidence_ids: [ev_v7]
+    status_vs_prior: weakened
+    confidence: medium
+
+sections:
+  financial_trajectory:
+    narrative: >
+      Q2 FY2026 revenue grew 34% YoY with commercial segment growth of 41%
+      YoY (ev_e5), ahead of the 28% base-case assumption in the initial
+      thesis.
+    evidence_ids: [ev_e5]
+    capability_label: null
+  expectations_and_results:
+    narrative: >
+      Revenue beat consensus by 5.8% (ev_e5); this is the second consecutive
+      beat but only the current-vs-immediately-prior comparison is
+      available. Still current_snapshot_only pending Phase 8.
+    evidence_ids: [ev_e5]
+    capability_label: current_snapshot_only
+  valuation:
+    narrative: >
+      EV/Revenue range recomputed against the new NTM estimate; the
+      base-case fair value moved up while the price moved down since the
+      print, narrowing the previous gap between price and base-case value.
+    evidence_ids: [ev_v7]
+    capability_label: null
+  catalysts:
+    narrative: "Q3 FY2026 commercial bookings print now carries the second confirmation_period for the upgrade_conditions trigger."
+    evidence_ids: [ev_e5]
+    capability_label: null
+  risks_and_disconfirming_evidence:
+    narrative: "No new risks identified this run; government appropriations-timing risk from the initial thesis is unchanged and re-cited."
+    evidence_ids: [ev_n1]
+    capability_label: null
+  scenarios:
+    narrative: "Bull/base/bear fair values recomputed against updated NTM revenue estimate; probabilities shifted toward bull given the confirmed bookings acceleration."
+    evidence_ids: [ev_v7]
+    capability_label: null
+  conclusion_and_triggers:
+    narrative: "commercial_bookings_reaccel trigger partially satisfied (1 of 2 confirmation_periods); rating moved to attractive provisionally, contingent on Q3 confirming."
+    evidence_ids: [ev_e5]
+    capability_label: null
+
+valuation:
+  methods:
+    - method: ev_revenue
+      base_metric: NTM revenue
+      base_period: FY2026E (revised)
+      normalization_adjustments: []
+      assumptions:
+        growth: "31% NTM revenue growth (revised up from 28%)"
+        margin: null
+        discount_rate: null
+        terminal: null
+      currency: USD
+      resulting_equity_value_per_share: {low: 23.00, mid: 27.75, high: 33.50}
+      sensitivity_note: "Range remains sensitive to sustained commercial growth; a second confirming quarter would materially narrow the downside case."
+  interpretation: >
+    Base-case fair value rose while price fell since the initial thesis,
+    moving the valuation stance from demanding to reasonable.
+
+scenarios:
+  bull:
+    probability: 0.40
+    horizon: Long-term
+    revenue_assumption: "38%+ sustained NTM growth"
+    margin_assumption: "Operating margin expands 300bp+"
+    dilution_assumption: "SBC dilution moderates to under 3%/yr"
+    valuation_method: ev_revenue
+    fair_value_per_share: 40.00
+    expected_return_pct: 0.44
+    conditions: ["Q3 FY2026 confirms commercial bookings growth above 35% YoY"]
+  base:
+    probability: 0.40
+    horizon: Long-term
+    revenue_assumption: "31% NTM growth"
+    margin_assumption: "Operating margin modestly improving"
+    dilution_assumption: "SBC dilution continues at recent ~4%/yr pace"
+    valuation_method: ev_revenue
+    fair_value_per_share: 27.75
+    expected_return_pct: 0.00
+    conditions: []
+  bear:
+    probability: 0.20
+    horizon: Long-term
+    revenue_assumption: "19% NTM growth"
+    margin_assumption: "Operating margin compresses"
+    dilution_assumption: "SBC dilution unchanged"
+    valuation_method: ev_revenue
+    fair_value_per_share: 18.50
+    expected_return_pct: -0.33
+    conditions: ["Q3 FY2026 shows commercial bookings growth reverting below 25% YoY"]
+
+conditions:
+  upgrade_conditions:
+    - trigger_id: commercial_bookings_reaccel
+      metric: commercial_bookings_growth_yoy
+      operator: gte
+      threshold: 0.35
+      confirmation_periods: 2
+      affected_rating: attractive
+      qualitative_description: null
+  downgrade_conditions:
+    - trigger_id: revenue_growth_deceleration
+      metric: revenue_growth_yoy
+      operator: lte
+      threshold: 0.18
+      confirmation_periods: 1
+      affected_rating: unattractive
+      qualitative_description: null
+  invalidation_conditions:
+    - trigger_id: major_government_contract_loss
+      metric: null
+      operator: qualitative
+      threshold: null
+      confirmation_periods: null
+      affected_rating: unattractive
+      qualitative_description: "Loss or non-renewal of a top-3 government contract."
+  monitoring_items:
+    - "Q3 FY2026 commercial bookings growth rate — second confirmation period"
+
+known_conflicts: []
+unknowns:
+  - "Customer concentration within the top 10 commercial accounts (still blocked on Phase 6)"
+  - "Analyst estimate revision history prior to this run (still blocked on Phase 8)"
+
+evidence_ids_used: [ev_e5, ev_v7, ev_n1]
+
+challenger:
+  required: false
+  completed: false
+  material_objections: []
+
+validation:
+  status: valid_with_warnings
+  errors: []
+  warnings:
+    - "fundamental_rating upgraded on 1 of 2 required confirmation_periods; conclusion.case_against discloses this explicitly."
+    - "expectations_and_results remains current_snapshot_only."
+
+human_review_required: true

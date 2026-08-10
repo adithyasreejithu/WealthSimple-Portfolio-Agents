@@ -1,0 +1,361 @@
+version: v1.0
+name: investment_analysis_policy
+status: hand_curated
+framework: decision-framework.yml
+purpose: >
+  Hand-curated policy for the rebuilt Investment Analyst workflow
+  (docs/plans/investment-analyst-rebuild-roadmap.md, Phase 0). It is the
+  single source of truth for: the 16 stable report-section identifiers, the
+  deterministic mode-to-section/evidence-domain mapping that
+  analysis-scope.v1 is built from, TRACE-based blocking/warning thresholds,
+  the rating vocabulary the Investment Analyst emits, the confirmed
+  Portfolio Manager vocabulary decision, thesis-confidence caps, scenario
+  and challenger rules, and first-run minimum-history requirements. Every
+  tunable number here is meant to be revisited as real runs are produced
+  (Phase 4/5's benchmark is the first real evidence); KB agents and the
+  Investment Analyst read this file, none of them write it.
+  See docs/architecture/investment_thesis_schema.md and
+  docs/architecture/analysis_scope_schema.md for the artifact shapes this
+  policy is consumed by.
+
+# ---------------------------------------------------------------------------
+# 1. Rating vocabulary — the Investment Analyst's own conclusion vocabulary.
+# Confirmed decision (stock-analysis-agent-design-review.md "Decisions
+# already made", 00-overview.md §3.1): the analyst NEVER emits a
+# decision-framework.yml action. It emits security attractiveness only.
+# ---------------------------------------------------------------------------
+rating_vocabulary:
+  fundamental_rating: [attractive, neutral, unattractive, insufficient_evidence]
+  valuation_stance: [discounted, reasonable, demanding, indeterminate]
+  thesis_direction: [initial, strengthening, unchanged, weakening, broken]
+  thesis_confidence: [high, medium, low]
+  # analysis_horizon / decision_horizon reuse decision-framework.yml's
+  # time_horizons enum verbatim rather than redefining a second horizon
+  # vocabulary: Short-term, Medium-term, Long-term.
+
+# ---------------------------------------------------------------------------
+# 2. OPEN DECISION #1 (Doc A §7) — resolved.
+# Portfolio Manager action vocabulary.
+# ---------------------------------------------------------------------------
+portfolio_manager_vocabulary:
+  decision: reuse_decision_framework_unchanged
+  actions_source: decision-framework.yml#actions
+  status: approved
+  rationale: >
+    The Portfolio Manager (Phase 11, not yet built) emits actions from
+    decision-framework.yml's existing enum (Buy | Sell | Hold | Trim | Add |
+    Watchlist | Avoid) rather than a new initiate|add|hold|trim|exit|avoid
+    vocabulary. The candidate design vocabulary is a synonym set over the
+    same seven concepts (initiate=Buy, exit=Sell, watch=Watchlist, add/hold/
+    trim/avoid unchanged) with no semantic gain, and both the PM and the
+    legacy decision-rubric.yml path ultimately write to the same stock-page
+    Decision field and decision-log rows
+    (decision-framework.yml usage.stock_page_status_block /
+    usage.decision_log). Two textually different enums naming the same
+    action space for two components that write the same downstream field is
+    a translation-layer bug generator, not a useful boundary. No new
+    taxonomy file is created; decision-framework.yml is not modified because
+    its existing enum already covers every PM action without a gap.
+  not_used: [initiate, exit, watch]   # recorded so a future reader does not
+                                        # reintroduce this vocabulary by habit
+  note_on_analyst_boundary: >
+    This decision governs the Portfolio Manager only. It does not weaken the
+    rule that the Investment Analyst itself may never emit a
+    decision-framework.yml action — see rating_vocabulary above and
+    investment_thesis_schema.md §2 (forbidden fields).
+
+# ---------------------------------------------------------------------------
+# 3. Stable section registry — the 16 report sections and their identifiers.
+# investment-thesis.v1's section_states keys and analysis-scope.v1's
+# evaluate/preserve/not_applicable lists are drawn from exactly this set.
+# ---------------------------------------------------------------------------
+section_registry:
+  - id: executive_conclusion
+    source_ref: "00-overview.md §6.1"
+  - id: thesis_and_variant_perception
+    source_ref: "00-overview.md §6.2"
+  - id: company_profile
+    source_ref: "00-overview.md §6.3"
+  - id: business_quality
+    source_ref: "00-overview.md §6.4"
+  - id: financial_trajectory
+    source_ref: "00-overview.md §6.5"
+  - id: expectations_and_results
+    source_ref: "00-overview.md §6.6"
+  - id: valuation
+    source_ref: "00-overview.md §6.7"
+  - id: price_and_market_context
+    source_ref: "00-overview.md §6.8"
+  - id: options_and_positioning
+    source_ref: "00-overview.md §6.9"
+  - id: insider_institutional_capital_allocation
+    source_ref: "00-overview.md §6.10"
+  - id: market_and_macro_sensitivity
+    source_ref: "00-overview.md §6.11"
+  - id: catalysts
+    source_ref: "00-overview.md §6.12"
+  - id: risks_and_disconfirming_evidence
+    source_ref: "00-overview.md §6.13"
+  - id: scenarios
+    source_ref: "00-overview.md §6.14"
+  - id: portfolio_context
+    source_ref: "00-overview.md §6.15"
+  - id: conclusion_and_triggers
+    source_ref: "00-overview.md §6.16"
+
+# ETF-track sections that are structurally meaningless, not merely missing.
+# Company-specific sections keep the same section_id for an ETF but carry a
+# fund-appropriate narrative (e.g. business_quality -> fund mandate/quality)
+# rather than becoming not_applicable, mirroring decision-rubric.yml's
+# equity_only/etf_only split.
+etf_not_applicable_sections:
+  - expectations_and_results     # no earnings surprises for a fund
+  - insider_institutional_capital_allocation   # no company insiders for a fund
+
+# ---------------------------------------------------------------------------
+# 4. Evidence domain registry — names analysis-scope.v1's
+# required/optional_evidence_domains must be drawn from.
+# ---------------------------------------------------------------------------
+evidence_domain_registry:
+  security_resources:   # supplied by investment-analyst-resources
+    skill: investment-analyst-resources
+    domains: [position, ledger, prices, financials, earnings, dividends,
+              classification, portfolio_context, overview, valuation,
+              analyst, options, news, insider, institutional, funds]
+  market_resources:      # supplied by market-analyst-resources
+    skill: market-analyst-resources
+    domains: [market_context]
+  company_resources:     # Phase 6, not yet built
+    skill: company-research-resources
+    domains: [company_filings]
+    status: not_built
+    note: >
+      Any scope that lists company_filings as required before Phase 6 ships
+      will always report it missing; the worksheet builder must not
+      fabricate filing-derived evidence in its place.
+
+# ---------------------------------------------------------------------------
+# 5. Mode-to-section/domain mapping — analysis-scope.v1's deterministic
+# source of truth. The scope mapper (Phase 3) looks up `mode` here; it does
+# not hand-pick section lists.
+# ---------------------------------------------------------------------------
+mode_section_map:
+  initial_research:
+    evaluate_sections: [executive_conclusion, thesis_and_variant_perception,
+      company_profile, business_quality, financial_trajectory,
+      expectations_and_results, valuation, price_and_market_context,
+      options_and_positioning, insider_institutional_capital_allocation,
+      market_and_macro_sensitivity, catalysts,
+      risks_and_disconfirming_evidence, scenarios, portfolio_context,
+      conclusion_and_triggers]
+    preserve_sections: []
+    required_evidence_domains: [financials, earnings, valuation, prices,
+      overview, classification, portfolio_context]
+    optional_evidence_domains: [options, insider, institutional,
+      market_context, dividends, funds]
+    critical_gap_policy: stop
+    minimum_history: >
+      At least 4 quarters of financials and, when available, 3+ years of
+      annual context registered as run evidence (00-overview.md §5.6) --
+      not fetched fresh each time, but not left as ephemeral uncited prose
+      either.
+
+  scheduled_review:
+    evaluate_sections: [executive_conclusion, thesis_and_variant_perception,
+      financial_trajectory, expectations_and_results, valuation,
+      price_and_market_context, options_and_positioning,
+      insider_institutional_capital_allocation,
+      market_and_macro_sensitivity, catalysts,
+      risks_and_disconfirming_evidence, scenarios, portfolio_context,
+      conclusion_and_triggers]
+    preserve_sections: [company_profile, business_quality]
+    required_evidence_domains: [financials, earnings, valuation, prices]
+    optional_evidence_domains: [options, insider, institutional,
+      market_context, classification, dividends]
+    critical_gap_policy: proceed_with_gap_disclosure
+
+  earnings_update:
+    evaluate_sections: [executive_conclusion, financial_trajectory,
+      expectations_and_results, valuation, catalysts,
+      risks_and_disconfirming_evidence, scenarios, conclusion_and_triggers]
+    preserve_sections: [thesis_and_variant_perception, company_profile,
+      business_quality, price_and_market_context, options_and_positioning,
+      insider_institutional_capital_allocation,
+      market_and_macro_sensitivity, portfolio_context]
+    required_evidence_domains: [financials, earnings, valuation]
+    optional_evidence_domains: [prices, options, news]
+    critical_gap_policy: stop
+
+  material_event:
+    evaluate_sections: [executive_conclusion, thesis_and_variant_perception,
+      risks_and_disconfirming_evidence, scenarios, catalysts,
+      conclusion_and_triggers]
+    preserve_sections: [company_profile, business_quality,
+      financial_trajectory, expectations_and_results,
+      price_and_market_context, options_and_positioning,
+      insider_institutional_capital_allocation,
+      market_and_macro_sensitivity, portfolio_context]
+    extendable: true
+    extension_rule: >
+      The worksheet builder may move a section from preserve_sections to
+      evaluate_sections when trigger.detail maps to a prior key_claim or
+      condition tied to that section (e.g. a management-change event pulls
+      in business_quality). Extension only adds sections; it never removes
+      one from the default evaluate_sections list.
+    required_evidence_domains: [news]
+    optional_evidence_domains: [financials, valuation, company_filings]
+    critical_gap_policy: proceed_with_gap_disclosure
+
+  price_move_review:
+    evaluate_sections: [executive_conclusion, thesis_and_variant_perception,
+      valuation, price_and_market_context, scenarios, conclusion_and_triggers]
+    preserve_sections: [company_profile, business_quality,
+      financial_trajectory, expectations_and_results,
+      options_and_positioning, insider_institutional_capital_allocation,
+      market_and_macro_sensitivity, portfolio_context]
+    required_evidence_domains: [prices, valuation, news]
+    optional_evidence_domains: [options]
+    critical_gap_policy: proceed_with_gap_disclosure
+
+  thesis_monitor:
+    evaluate_sections: [conclusion_and_triggers]
+    preserve_sections: [executive_conclusion, thesis_and_variant_perception,
+      company_profile, business_quality, financial_trajectory,
+      expectations_and_results, valuation, price_and_market_context,
+      options_and_positioning, insider_institutional_capital_allocation,
+      market_and_macro_sensitivity, catalysts,
+      risks_and_disconfirming_evidence, scenarios, portfolio_context]
+    required_evidence_domains: [prices]
+    optional_evidence_domains: [financials, earnings, valuation, news]
+    critical_gap_policy: proceed_with_gap_disclosure
+    note: >
+      required_evidence_domains here is a floor; the worksheet builder adds
+      whichever domain the specific stored trigger's metric belongs to
+      (e.g. a revenue_growth_yoy trigger requires financials).
+
+  portfolio_decision:
+    evaluate_sections: [executive_conclusion, portfolio_context]
+    preserve_sections: [thesis_and_variant_perception, company_profile,
+      business_quality, financial_trajectory, expectations_and_results,
+      valuation, price_and_market_context, options_and_positioning,
+      insider_institutional_capital_allocation,
+      market_and_macro_sensitivity, catalysts,
+      risks_and_disconfirming_evidence, scenarios, conclusion_and_triggers]
+    required_evidence_domains: [portfolio_context, classification]
+    optional_evidence_domains: []
+    critical_gap_policy: stop
+    note: >
+      Reuses the current validated thesis if one exists and is not stale;
+      runs a full scheduled_review pass first if none exists. Hands off to
+      the Portfolio Manager (Phase 11) after this run -- the analyst itself
+      still emits no portfolio action (see portfolio_manager_vocabulary and
+      rating_vocabulary above).
+
+# ---------------------------------------------------------------------------
+# 6. OPEN DECISION #2 (Doc A §7) — resolved.
+# TRACE blocking/warning thresholds and override authority.
+# ---------------------------------------------------------------------------
+trace_policy:
+  status: approved
+  scope: >
+    Applies to the completeness_pct computed over ONLY the fields belonging
+    to a run's required_evidence_domains (analysis-scope.v1), not the
+    resource bundle's overall completeness_pct. A run requiring only
+    [financials, earnings, valuation] is judged on those domains' TRACE
+    outcome, not on whether an optional options/insider domain came back
+    empty. not_applicable is excluded from the denominator exactly as
+    src/skill_trace.py already implements -- this policy does not redefine
+    that classification, only adds a threshold on top of it.
+  blocking_threshold: 50.0
+  blocking_condition: >
+    completeness_pct (scoped to required_evidence_domains) is below 50.0,
+    OR any single required_evidence_domain is domains_failed (ok == 0 and
+    missing > 0) in the run's TRACE record.
+  blocking_behavior: >
+    When critical_gap_policy is "stop" (see mode_section_map), a blocking
+    condition halts the run before the Investment Analyst is invoked. The
+    run's status becomes insufficient_evidence; no investment-thesis.v1 can
+    reach validation.status: valid or valid_with_warnings for this run
+    without an override (see override_authority). When critical_gap_policy
+    is "proceed_with_gap_disclosure", the run proceeds regardless, but every
+    domains_failed required domain is force-added to the thesis's unknowns
+    list and thesis_confidence is capped at low (see confidence_caps).
+  warning_threshold: 80.0
+  warning_condition: >
+    completeness_pct (scoped to required_evidence_domains) is at or above
+    the blocking_threshold but below 80.0.
+  warning_behavior: >
+    The run proceeds. The validator marks the artifact
+    valid_with_warnings (not valid) and thesis_confidence is capped at
+    medium regardless of what the analyst would otherwise assign (see
+    confidence_caps). The specific missing fields are copied from the
+    run's TRACE record into the thesis's unknowns list, not summarized away.
+  rationale: >
+    Calibrated against real investment-analyst-resources bundles observed
+    in this repo: PLTR ranged 76.5-98.2% complete across separate pulls,
+    XEQT (an ETF, structurally sparser) came in at 67.9%, L at 81.4%. A
+    blocking_threshold of 50 catches genuinely broken pulls (e.g. a
+    provider-symbol mismatch or a data_sufficiency-gate-equivalent failure)
+    without penalizing an ETF's structurally thinner equity-domain coverage.
+    A warning_threshold of 80 flags runs like PLTR-2026-08-05 (76.5%) for a
+    confidence cap without blocking them outright -- that run was usable,
+    just imperfect. Both numbers are provisional pending Phase 4/5's actual
+    benchmark; revisit with real multi-ticker data once the analyst exists.
+  override_authority: >
+    Only the human operator invoking the run may override a TRACE block, by
+    setting an explicit override flag on the run request (e.g.
+    request.restrictions equivalent field, defined precisely in Phase 1) and
+    supplying a required override_reason string. No agent -- including the
+    Investment Analyst itself and any future orchestrator -- may set this
+    flag autonomously; it is a human-only escape hatch, consistent with
+    Restrictions' existing pattern in src/workspace/models.py where
+    research_only/do_not_invent_data/human_review_required cannot be turned
+    off by a field value alone. Every override is written to the run's
+    audit_log.jsonl as its own event (override_reason, prior blocking
+    condition, operator) so an overridden run is auditable, never silent.
+
+# ---------------------------------------------------------------------------
+# 7. Confidence model — three separate measures, only one owned by the
+# analyst (00-overview.md §8.2).
+# ---------------------------------------------------------------------------
+confidence_caps:
+  description: >
+    thesis_confidence is the analyst's own assessment, but the validator
+    (Phase 1) clamps it downward -- it may never raise a cap, only enforce
+    one. Evidence completeness and evidence quality are computed
+    deterministically and are informational fields alongside
+    thesis_confidence, never substitutes for it.
+  rules:
+    - condition: any required_evidence_domain is domains_failed (TRACE)
+      cap: low
+    - condition: completeness_pct (scoped) below warning_threshold (80.0)
+      cap: medium
+    - condition: a claim with importance:critical cites only evidence with
+        an unresolved known_conflicts entry, or cites no evidence_ids at all
+      cap: low
+    - condition: none of the above
+      cap: none   # analyst's own thesis_confidence stands
+
+# ---------------------------------------------------------------------------
+# 8. Challenger triggers (00-overview.md §5.9) -- policy-level list, mirrored
+# here so the challenger invocation decision (Phase 8) is also deterministic.
+# ---------------------------------------------------------------------------
+challenger_triggers:
+  - initial_research mode
+  - fundamental_rating in [attractive, unattractive] AND thesis_confidence in [medium, high]
+  - large rating change vs prior_thesis (fundamental_rating or valuation_stance differs)
+  - unresolved known_conflicts with importance:critical claim dependency
+  - any valuation method sensitivity_note flags high sensitivity to one input
+  - material_event or earnings_update mode with a surprise beyond policy tolerance
+  - completeness_pct below warning_threshold paired with a decisive (non-insufficient_evidence) rating
+  - user explicitly requests adversarial review
+
+# ---------------------------------------------------------------------------
+# 9. Scenario rules -- policy-level restatement of 00-overview.md §6.14
+# validator rules, so Phase 1's validator has one place to read them from.
+# ---------------------------------------------------------------------------
+scenario_rules:
+  probability_sum_tolerance: 0.001   # bull + base + bear must equal 1.0 within this tolerance
+  bear_below_current_price_required: false
+  bear_ordering_exception_requires_explanation: true
+  fair_value_and_return_must_recompute: true

@@ -1,0 +1,51 @@
+# Example: valid analysis-scope.v1 — initial_research mode.
+# Illustrates docs/architecture/analysis_scope_schema.md.
+# All fields here are produced deterministically from
+# Knowledge-Base/taxonomy/investment-analysis-policy.yml's
+# mode_section_map.initial_research entry; nothing here is agent-chosen.
+
+schema: analysis-scope.v1
+run_id: 2026-08-09T140000Z-pltr
+subject: PLTR
+asset_track: equity
+mode: initial_research
+trigger:
+  type: user_request
+  occurred_at: 2026-08-09T14:00:00Z
+  detail: "First research pass; no validated prior thesis exists for PLTR."
+decision_horizon: Long-term
+evaluate_sections:
+  - executive_conclusion
+  - thesis_and_variant_perception
+  - company_profile
+  - business_quality
+  - financial_trajectory
+  - expectations_and_results
+  - valuation
+  - price_and_market_context
+  - options_and_positioning
+  - insider_institutional_capital_allocation
+  - market_and_macro_sensitivity
+  - catalysts
+  - risks_and_disconfirming_evidence
+  - scenarios
+  - portfolio_context
+  - conclusion_and_triggers
+preserve_sections: []
+not_applicable_sections: []
+required_evidence_domains:
+  - financials
+  - earnings
+  - valuation
+  - prices
+  - overview
+  - classification
+  - portfolio_context
+optional_evidence_domains:
+  - options
+  - insider
+  - institutional
+  - market_context
+  - dividends
+  - funds
+critical_gap_policy: stop

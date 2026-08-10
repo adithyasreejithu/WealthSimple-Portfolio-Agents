@@ -1,0 +1,217 @@
+# Example: valid investment-thesis.v1 — first-ever thesis for PLTR,
+# produced under analysis-scope-initial-research.yaml.
+# Illustrates docs/architecture/investment_thesis_schema.md.
+# Trimmed for readability: a real artifact has full narrative text and more
+# evidence_ids per section; the shape and enum usage are what this example
+# demonstrates, not final PLTR prose.
+
+schema: investment-thesis.v1
+run_id: 2026-08-09T140000Z-pltr
+artifact_id: th_4f2a9c1e0b7d
+generated_at: 2026-08-09T14:32:10Z
+security:
+  ticker: PLTR
+  provider_symbol: PLTR
+  asset_track: equity
+analysis_mode: initial_research
+policy_version: v1.0
+worksheet_ref:
+  path: calculations/PLTR-2026-08-09T140000Z-worksheet.json
+  hash: "sha256:9a1c...redacted...4e2f"
+prior_thesis:
+  exists: false
+  artifact_id: null
+  version: null
+  content_hash: null
+  approved_at: null
+
+section_states:
+  executive_conclusion: changed
+  thesis_and_variant_perception: changed
+  company_profile: changed
+  business_quality: changed
+  financial_trajectory: changed
+  expectations_and_results: changed
+  valuation: changed
+  price_and_market_context: changed
+  options_and_positioning: changed
+  insider_institutional_capital_allocation: changed
+  market_and_macro_sensitivity: changed
+  catalysts: changed
+  risks_and_disconfirming_evidence: changed
+  scenarios: changed
+  portfolio_context: changed
+  conclusion_and_triggers: changed
+
+conclusion:
+  fundamental_rating: neutral
+  valuation_stance: demanding
+  thesis_direction: initial
+  thesis_confidence: medium
+  evidence_completeness_pct: 84.3
+  investment_case: >
+    PLTR's government and commercial AIP bookings growth is real and
+    broad-based across verticals (ev_a1, ev_a4), but current pricing already
+    embeds several years of that growth continuing at its recent pace.
+  case_against: >
+    If AIP conversion decelerates even modestly, the current forward
+    multiple leaves little room for a re-rating and would likely compress
+    faster than revenue growth actually slows.
+  most_important_catalyst: "Q3 FY2026 commercial bookings disclosure"
+  most_important_risk: "Federal budget/appropriations timing risk to government segment"
+  most_important_unknown: "Customer concentration within the top 10 commercial accounts (filing-derived; not yet collected — Phase 6)"
+  analysis_horizon: Long-term
+  as_of: 2026-08-09T14:00:00Z
+
+key_claims:
+  - claim_id: thesis_1
+    statement: "Commercial AIP bookings are growing faster than the company's overall revenue growth rate, broadening the customer base beyond government."
+    claim_type: fact
+    importance: critical
+    evidence_ids: [ev_a1, ev_a4]
+    status_vs_prior: new
+    confidence: high
+  - claim_id: thesis_2
+    statement: "Current valuation already prices in several years of AIP growth continuing at its recent pace, leaving limited multiple-expansion upside."
+    claim_type: inference
+    importance: critical
+    evidence_ids: [ev_v2, ev_v3]
+    status_vs_prior: new
+    confidence: medium
+  - claim_id: thesis_3
+    statement: "Government segment carries appropriations-timing risk that is independent of commercial execution."
+    claim_type: assumption
+    importance: supporting
+    evidence_ids: [ev_n1]
+    status_vs_prior: new
+    confidence: medium
+
+sections:
+  thesis_and_variant_perception:
+    narrative: >
+      The market appears to price PLTR primarily on government-contract
+      visibility; the faster-growing and more scalable story is commercial
+      AIP adoption (ev_a1, ev_a4), which is not yet fully reflected in
+      consensus estimates (ev_v2).
+    evidence_ids: [ev_a1, ev_a4, ev_v2]
+    capability_label: null
+  expectations_and_results:
+    narrative: >
+      Last quarter beat consensus revenue by 4.1% (ev_e2) with commercial
+      bookings the primary driver. Only the current analyst-estimate
+      snapshot is available; revision-trend history is not yet persisted
+      (Phase 8), so this section cannot characterize the direction of prior
+      revisions beyond this one print.
+    evidence_ids: [ev_e2]
+    capability_label: current_snapshot_only
+  options_and_positioning:
+    narrative: >
+      Put/call open interest is roughly balanced (ev_o1); no strong
+      directional positioning signal. IV percentile and unusual-flow
+      detection are not available (Phase 12).
+    evidence_ids: [ev_o1]
+    capability_label: snapshot_only
+  # ... remaining changed sections omitted for brevity in this example ...
+
+valuation:
+  methods:
+    - method: ev_revenue
+      base_metric: NTM revenue
+      base_period: FY2026E
+      normalization_adjustments: []
+      assumptions:
+        growth: "28% NTM revenue growth"
+        margin: null
+        discount_rate: null
+        terminal: null
+      currency: USD
+      resulting_equity_value_per_share: {low: 21.50, mid: 26.00, high: 31.75}
+      sensitivity_note: "Range is highly sensitive to the assumed NTM growth rate; a 5pt lower growth assumption moves mid-point below the current price."
+  interpretation: >
+    The EV/Revenue range brackets the current price near its midpoint,
+    consistent with a demanding-but-not-indefensible valuation stance given
+    the growth rate actually being delivered.
+
+scenarios:
+  bull:
+    probability: 0.30
+    horizon: Long-term
+    revenue_assumption: "35%+ sustained NTM growth as commercial scales"
+    margin_assumption: "Operating margin expands 300bp+ from operating leverage"
+    dilution_assumption: "SBC dilution moderates to under 3%/yr"
+    valuation_method: ev_revenue
+    fair_value_per_share: 38.00
+    expected_return_pct: 0.46
+    conditions: ["Two consecutive quarters of commercial bookings acceleration"]
+  base:
+    probability: 0.45
+    horizon: Long-term
+    revenue_assumption: "28% NTM growth, roughly in line with current trend"
+    margin_assumption: "Operating margin roughly flat to modestly improving"
+    dilution_assumption: "SBC dilution continues at recent ~4%/yr pace"
+    valuation_method: ev_revenue
+    fair_value_per_share: 26.00
+    expected_return_pct: -0.01
+    conditions: []
+  bear:
+    probability: 0.25
+    horizon: Long-term
+    revenue_assumption: "18% NTM growth as AIP conversion decelerates"
+    margin_assumption: "Operating margin compresses on slower revenue leverage"
+    dilution_assumption: "SBC dilution unchanged"
+    valuation_method: ev_revenue
+    fair_value_per_share: 17.00
+    expected_return_pct: -0.35
+    conditions: ["Commercial bookings growth decelerates below 20% YoY for two consecutive quarters"]
+
+conditions:
+  upgrade_conditions:
+    - trigger_id: commercial_bookings_reaccel
+      metric: commercial_bookings_growth_yoy
+      operator: gte
+      threshold: 0.35
+      confirmation_periods: 2
+      affected_rating: attractive
+      qualitative_description: null
+  downgrade_conditions:
+    - trigger_id: revenue_growth_deceleration
+      metric: revenue_growth_yoy
+      operator: lte
+      threshold: 0.18
+      confirmation_periods: 1
+      affected_rating: unattractive
+      qualitative_description: null
+  invalidation_conditions:
+    - trigger_id: major_government_contract_loss
+      metric: null
+      operator: qualitative
+      threshold: null
+      confirmation_periods: null
+      affected_rating: unattractive
+      qualitative_description: "Loss or non-renewal of a top-3 government contract."
+  monitoring_items:
+    - "Quarterly commercial bookings growth rate"
+    - "Federal appropriations calendar events affecting government segment"
+
+known_conflicts: []
+unknowns:
+  - "Customer concentration within the top 10 commercial accounts (requires filing-derived evidence; blocked on Phase 6 company-research-resources)"
+  - "Analyst estimate revision history prior to this run (blocked on Phase 8 expectations-history persistence)"
+  - "Historical IV/OI percentile context for options positioning (blocked on Phase 12)"
+
+evidence_ids_used: [ev_a1, ev_a4, ev_v2, ev_v3, ev_n1, ev_e2, ev_o1]
+
+challenger:
+  required: true
+  completed: true
+  material_objections:
+    - "Bull case assumes margin expansion without citing a specific operating-leverage driver beyond revenue scale; flagged as under-supported."
+
+validation:
+  status: valid_with_warnings
+  errors: []
+  warnings:
+    - "expectations_and_results is current_snapshot_only; revision-trend claims beyond this print are not supported."
+    - "options_and_positioning is snapshot_only; no IV percentile or unusual-flow claims are made."
+
+human_review_required: true

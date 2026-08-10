@@ -1,0 +1,131 @@
+# Example: INVALID investment-thesis.v1 — must be rejected by the Phase 1
+# validator. Illustrates docs/architecture/investment_thesis_schema.md §2
+# (forbidden fields) and is the required Phase 1 test fixture named in the
+# roadmap's Phase 1 gate: "a fabricated evidence ID and a target_weight
+# field both fail validation."
+#
+# This file intentionally combines THREE separate violations so each is
+# easy to point at in a test assertion. A real invalid artifact from the
+# analyst would likely have exactly one.
+#
+# Otherwise structurally identical to valid-initial-thesis.yaml; only the
+# `conclusion` block and one evidence_id are altered.
+
+schema: investment-thesis.v1
+run_id: 2026-08-09T140000Z-pltr
+artifact_id: th_bad0000000ex
+generated_at: 2026-08-09T14:32:10Z
+security:
+  ticker: PLTR
+  provider_symbol: PLTR
+  asset_track: equity
+analysis_mode: initial_research
+policy_version: v1.0
+worksheet_ref:
+  path: calculations/PLTR-2026-08-09T140000Z-worksheet.json
+  hash: "sha256:9a1c...redacted...4e2f"
+prior_thesis:
+  exists: false
+  artifact_id: null
+  version: null
+  content_hash: null
+  approved_at: null
+
+section_states:
+  executive_conclusion: changed
+  thesis_and_variant_perception: changed
+  company_profile: changed
+  business_quality: changed
+  financial_trajectory: changed
+  expectations_and_results: changed
+  valuation: changed
+  price_and_market_context: changed
+  options_and_positioning: changed
+  insider_institutional_capital_allocation: changed
+  market_and_macro_sensitivity: changed
+  catalysts: changed
+  risks_and_disconfirming_evidence: changed
+  scenarios: changed
+  portfolio_context: changed
+  conclusion_and_triggers: changed
+
+conclusion:
+  fundamental_rating: attractive
+  # VIOLATION 1: portfolio_action is a decision-framework.yml action —
+  # reserved for the Portfolio Manager (Phase 11). The Investment Analyst
+  # must never emit this field.
+  portfolio_action: Buy
+  valuation_stance: discounted
+  thesis_direction: initial
+  # VIOLATION 2: confidence expressed as a raw numeric percentage instead of
+  # the categorical high|medium|low enum. False precision — rejected
+  # regardless of the number's value.
+  thesis_confidence: "78%"
+  evidence_completeness_pct: 84.3
+  investment_case: "Placeholder for this negative fixture."
+  case_against: "Placeholder for this negative fixture."
+  most_important_catalyst: "Q3 FY2026 commercial bookings disclosure"
+  most_important_risk: "Federal budget/appropriations timing risk"
+  most_important_unknown: "Customer concentration"
+  # VIOLATION 3: target_weight does not belong anywhere in this schema —
+  # it is a Portfolio Manager sizing field. This is the exact fixture named
+  # in the Phase 1 roadmap gate.
+  target_weight: 0.05
+  analysis_horizon: Long-term
+  as_of: 2026-08-09T14:00:00Z
+
+key_claims:
+  - claim_id: thesis_1
+    statement: "Placeholder claim for this negative fixture."
+    claim_type: fact
+    importance: critical
+    # VIOLATION 4: ev_does_not_exist is not a registered evidence_id in this
+    # run's evidence/sources.jsonl. The validator must reject a citation to
+    # evidence that was never registered — this is the "fabricated evidence
+    # ID" half of the Phase 1 gate.
+    evidence_ids: [ev_does_not_exist]
+    status_vs_prior: new
+    confidence: high
+
+sections: {}
+valuation:
+  methods: []
+  interpretation: "Placeholder for this negative fixture."
+scenarios:
+  bull: {probability: 0.30, horizon: Long-term, revenue_assumption: "n/a",
+         margin_assumption: "n/a", dilution_assumption: "n/a",
+         valuation_method: ev_revenue, fair_value_per_share: 30.0,
+         expected_return_pct: 0.1, conditions: []}
+  base: {probability: 0.40, horizon: Long-term, revenue_assumption: "n/a",
+         margin_assumption: "n/a", dilution_assumption: "n/a",
+         valuation_method: ev_revenue, fair_value_per_share: 26.0,
+         expected_return_pct: 0.0, conditions: []}
+  bear: {probability: 0.20, horizon: Long-term, revenue_assumption: "n/a",
+         margin_assumption: "n/a", dilution_assumption: "n/a",
+         valuation_method: ev_revenue, fair_value_per_share: 17.0,
+         expected_return_pct: -0.3, conditions: []}
+  # VIOLATION 5 (bonus, not part of the Phase 1 named gate but worth keeping
+  # as a fixture): probabilities sum to 0.90, not 1.0.
+
+conditions:
+  upgrade_conditions: []
+  downgrade_conditions: []
+  invalidation_conditions: []
+  monitoring_items: []
+known_conflicts: []
+unknowns: []
+evidence_ids_used: [ev_does_not_exist]
+challenger:
+  required: true
+  completed: false
+  material_objections: []
+validation:
+  status: invalid
+  errors:
+    - "forbidden field: conclusion.portfolio_action (reserved for Portfolio Manager)"
+    - "forbidden field: conclusion.target_weight (reserved for Portfolio Manager)"
+    - "conclusion.thesis_confidence must be one of [high, medium, low]; got numeric percentage"
+    - "key_claims[thesis_1].evidence_ids contains unregistered evidence_id: ev_does_not_exist"
+    - "scenarios probabilities sum to 0.90, expected 1.0 (+/- 0.001)"
+  warnings: []
+human_review_required: true
