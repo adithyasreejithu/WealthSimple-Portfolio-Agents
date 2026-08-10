@@ -19,7 +19,8 @@ See `docs/architecture/run_workspace.md`.
 
 from __future__ import annotations
 
-from . import audit, evidence, manifest, models, paths, run, state, validation
+from . import analysis_models, audit, evidence, manifest, models, paths, run, state, thesis_validation, validation
+from .analysis_models import AnalysisScope, InvestmentThesis
 from .models import (
     AgentOutput,
     ContextManifest,
@@ -31,11 +32,14 @@ from .models import (
 from .paths import PathEscapeError, WorkspaceError, resolve_in_run
 from .run import RunExistsError, RunNotFoundError, archive_run, create_run, resolve_run
 from .state import InvalidTransitionError
+from .thesis_validation import validate_thesis
 
 __all__ = [
-    "audit", "evidence", "manifest", "models", "paths", "run", "state", "validation",
-    "AgentOutput", "ContextManifest", "DecisionProposal", "EvidenceRecord", "Request", "RunMetadata",
+    "analysis_models", "audit", "evidence", "manifest", "models", "paths", "run", "state",
+    "thesis_validation", "validation",
+    "AgentOutput", "AnalysisScope", "ContextManifest", "DecisionProposal", "EvidenceRecord",
+    "InvestmentThesis", "Request", "RunMetadata",
     "WorkspaceError", "PathEscapeError", "InvalidTransitionError",
     "RunExistsError", "RunNotFoundError",
-    "create_run", "resolve_run", "archive_run", "resolve_in_run",
+    "create_run", "resolve_run", "archive_run", "resolve_in_run", "validate_thesis",
 ]
