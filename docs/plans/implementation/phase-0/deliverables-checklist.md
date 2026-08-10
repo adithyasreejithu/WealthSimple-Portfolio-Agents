@@ -32,7 +32,9 @@ The two open decisions identified in [`stock-analysis-agent-design-review.md`](.
 
 | File | Purpose | Lines | Status |
 |---|---|---|---|
-| **`Knowledge-Base/taxonomy/investment-analysis-policy.yml`** | Policy configuration for the rebuilt v2 workflow: 16-section registry, mode→section/domain mapping, TRACE thresholds, rating vocabulary, PM vocabulary decision, confidence caps, challenger triggers, scenario rules | 361 | ✅ Complete |
+| **`config/policies/investment-analysis-policy.yml`** | Policy configuration for the rebuilt v2 workflow: 16-section registry, mode→section/domain mapping, TRACE thresholds, rating vocabulary, PM vocabulary decision, confidence caps, challenger triggers, scenario rules | 361 | ✅ Complete |
+
+**Location:** `config/policies/` (operational configuration, separate from Knowledge-Base research content)
 
 **Use:** Phase 1's validator reads this. Phase 3's scope mapper reads this. This is executable policy, not documentation.
 
@@ -109,6 +111,17 @@ Who may override a TRACE-based block: __________________
 **Consequence:** The analyst still never emits a `decision-framework.yml` action (see `investment_thesis_schema.md` §2: forbidden fields). Only the Portfolio Manager emits actions, using the reused enum.
 
 ---
+
+## Architectural Note: Configuration Outside Knowledge-Base
+
+Phase 0 established that operational policy/configuration files (`investment-analysis-policy.yml`) live in `config/policies/`, not in the Knowledge-Base. The Knowledge-Base is reserved for research content (stock theses, market analysis, research notes); operational infrastructure (policy, configuration, reference data) belongs in `config/` at the repo root.
+
+Future phases should follow this pattern when adding policy files:
+- Portfolio/allocation policies: `config/policies/`
+- Data collection policy: `config/policies/` (or `config/collection/`)
+- Classification rules, reference data: same structure
+
+A future architectural refactor should migrate existing policy files (`Knowledge-Base/policy_v1_1.yaml`, `Knowledge-Base/taxonomy/decision-rubric.yml`, etc.) to this structure for consistency, but that is deferred past Phase 0.
 
 ## Files Not Modified
 

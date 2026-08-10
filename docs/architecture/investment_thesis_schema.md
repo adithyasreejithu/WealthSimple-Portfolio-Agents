@@ -10,7 +10,7 @@ match.
 **Companion documents:**
 [`analysis_scope_schema.md`](analysis_scope_schema.md) (the request-side
 contract this artifact is produced against),
-[`../../Knowledge-Base/taxonomy/investment-analysis-policy.yml`](../../Knowledge-Base/taxonomy/investment-analysis-policy.yml)
+[`../../config/policies/investment-analysis-policy.yml`](../../config/policies/investment-analysis-policy.yml)
 (the tunable policy this schema reads: section registry, TRACE thresholds,
 confidence caps, vocabulary).
 

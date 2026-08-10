@@ -9,7 +9,7 @@ first consumer that enforces it.
 **Companion documents:**
 [`investment_thesis_schema.md`](investment_thesis_schema.md) (the artifact
 produced under this scope),
-[`../../Knowledge-Base/taxonomy/investment-analysis-policy.yml`](../../Knowledge-Base/taxonomy/investment-analysis-policy.yml)
+[`../../config/policies/investment-analysis-policy.yml`](../../config/policies/investment-analysis-policy.yml)
 (`mode_section_map` and `evidence_domain_registry` are this schema's
 deterministic source of truth — the scope mapper reads the policy file, it
 does not hardcode section lists).
