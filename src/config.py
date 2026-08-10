@@ -18,6 +18,11 @@ PORTFOLIO_GROUPING_FOLDER = KNOWLEDGE_BASE_FOLDER / "ref"
 DEFAULT_DATA_FOLDER = DATA_FOLDER
 DEFAULT_EXPORT_FOLDER = EXPORT_FOLDER
 LOG_FOLDER = BASE_DIR / "logs"
+# Operational policy/configuration (e.g. investment-analysis-policy.yml), kept
+# separate from KNOWLEDGE_BASE_FOLDER which is reserved for research content
+# (stock theses, market analysis, research notes). See
+# docs/plans/implementation/phase-0/HANDOFF.md.
+POLICIES_FOLDER = BASE_DIR / "config" / "policies"
 """
 Run workspace: one directory per research/portfolio request, holding that
 request's inputs, evidence, calculations, agent outputs, and audit log. This is

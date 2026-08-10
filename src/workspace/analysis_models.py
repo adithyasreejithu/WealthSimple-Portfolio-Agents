@@ -13,11 +13,14 @@ invariants live here as pydantic validators; every model sets
 `extra="forbid"` so an unrecognized key is a hard failure, not a silent
 no-op. The 16 report-section ids, the ETF not-applicable subset, the
 evidence-domain vocabulary, and the scenario-probability/TRACE-threshold
-tunables are all read from
-`Knowledge-Base/taxonomy/investment-analysis-policy.yml` at import time
-rather than hardcoded twice -- that policy file is the single source of
-truth per its own header, this module and `thesis_validation.py` only read
-it.
+tunables are all read from `config/policies/investment-analysis-policy.yml`
+at import time rather than hardcoded twice -- that policy file is the
+single source of truth per its own header, this module and
+`thesis_validation.py` only read it. (Phase 0 originally placed this file
+under `Knowledge-Base/taxonomy/`; it moved to `config/policies/` before
+Phase 1 landed -- Knowledge-Base is reserved for research content, not
+operational configuration. See
+`docs/plans/implementation/phase-0/HANDOFF.md`.)
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ import config
 SCHEMA_VERSION_THESIS = "investment-thesis.v1"
 SCHEMA_VERSION_SCOPE = "analysis-scope.v1"
 
-_POLICY_PATH = config.KNOWLEDGE_BASE_FOLDER / "taxonomy" / "investment-analysis-policy.yml"
+_POLICY_PATH = config.POLICIES_FOLDER / "investment-analysis-policy.yml"
 
 _FALLBACK_SECTION_IDS: tuple[str, ...] = (
     "executive_conclusion", "thesis_and_variant_perception", "company_profile",
