@@ -9,7 +9,12 @@ from typing import Callable, Iterable
 
 import pandas as pd
 
-from config import BENCHMARK_TICKERS, DATABASE_PATH, FX_PAIR_SYMBOL
+from config import (
+    BENCHMARK_TICKERS,
+    DATABASE_PATH,
+    FX_PAIR_SYMBOL,
+    MINIMUM_PRICE_HISTORY_DAYS,
+)
 from database import get_shared_connection, initialize_database
 from database_command import (
     upload_dividend_events,
@@ -30,6 +35,26 @@ MetadataFetcher = Callable[[Iterable[dict[str, str]]], tuple[pd.DataFrame, pd.Da
 HistoryFetcher = Callable[[Iterable[str], date, date], pd.DataFrame]
 
 
+def _has_trading_weekday(start: date, end: date) -> bool:
+    """Whether the half-open range `[start, end)` contains a Mon-Fri.
+
+    A range covering only a weekend cannot yield bars, and asking yfinance for
+    one logs a misleading "possibly delisted; no price data found" error. Two
+    ordinary situations produce such ranges: a weekend sync (last bar Friday,
+    range Sat-Sun) and a history floor that lands just before a ticker's first
+    stored bar. Holidays are not modelled -- only the provably-empty weekend
+    case is skipped, so this never suppresses a range that could hold data.
+    """
+    if (end - start).days >= 7:
+        return True
+    day = start
+    while day < end:
+        if day.weekday() < 5:
+            return True
+        day += timedelta(days=1)
+    return False
+
+
 def _fetch_security_history_strict(
     tickers: Iterable[str], start_date: date, end_date: date
 ) -> pd.DataFrame:
@@ -46,12 +71,41 @@ class MarketTarget:
     currency: str
     security_name: str
     first_owned_date: date
+    earliest_market_date: date | None
     latest_market_date: date | None
 
-    def fetch_start(self) -> date:
-        if self.latest_market_date is None:
-            return self.first_owned_date
-        return self.latest_market_date + timedelta(days=1)
+    def history_floor(self, today: date) -> date:
+        """How far back stored history should reach.
+
+        Ownership alone is not deep enough: a name bought last month can never
+        accumulate the ~275 bars an SMA-200 or a 365-day relative-strength
+        window needs. The floor is therefore the earlier of first ownership and
+        `MINIMUM_PRICE_HISTORY_DAYS` ago.
+        """
+        return min(self.first_owned_date, today - timedelta(days=MINIMUM_PRICE_HISTORY_DAYS))
+
+    def fetch_ranges(self, today: date, *, full: bool = False) -> list[tuple[date, date]]:
+        """The `[start, end)` ranges to request, head gap first.
+
+        Mirrors `ensure_benchmark_history`'s two-range shape: a head range when
+        stored history starts later than the floor, plus the usual incremental
+        tail. Self-limiting -- once a ticker's `earliest_market_date` reaches
+        its floor the floor keeps advancing daily while the stored minimum
+        stays put, so the head gap is fetched exactly once and never again.
+        """
+        floor = self.history_floor(today)
+        end = today + timedelta(days=1)
+        if full or self.earliest_market_date is None:
+            return [(floor, end)] if floor <= today else []
+        candidates = [
+            (floor, self.earliest_market_date),
+            (self.latest_market_date + timedelta(days=1), end),
+        ]
+        return [
+            (start, stop)
+            for start, stop in candidates
+            if start < stop and _has_trading_weekday(start, stop)
+        ]
 
 
 @dataclass(frozen=True)
@@ -113,8 +167,11 @@ def get_market_targets(
             ) owned
             GROUP BY ticker_id
         ),
-        latest_history AS (
-            SELECT ticker_id, MAX(record_date) AS latest_market_date
+        history_bounds AS (
+            SELECT
+                ticker_id,
+                MIN(record_date) AS earliest_market_date,
+                MAX(record_date) AS latest_market_date
             FROM historical_records
             GROUP BY ticker_id
         )
@@ -125,6 +182,7 @@ def get_market_targets(
             t.currency,
             t.security_name,
             o.first_owned_date,
+            h.earliest_market_date,
             h.latest_market_date
         FROM owned_dates o
         JOIN tickers t USING (ticker_id)
@@ -132,12 +190,15 @@ def get_market_targets(
           ON m.ticker_id = t.ticker_id
          AND m.provider = 'yahoo'
          AND m.verification_status = 'verified'
-        LEFT JOIN latest_history h USING (ticker_id)
+        LEFT JOIN history_bounds h USING (ticker_id)
         ORDER BY t.ticker_symbol, t.exchange
         """
     ).fetchall()
     targets = [
-        MarketTarget(int(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4]), row[5], row[6])
+        MarketTarget(
+            int(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4]),
+            row[5], row[6], row[7],
+        )
         for row in rows
     ]
     if not requested:
@@ -376,14 +437,15 @@ def sync_market_data(
     skipped = 0
     failed_symbols: list[str] = []
     for target in targets:
-        start = target.first_owned_date if full else target.fetch_start()
-        if start > today:
+        ranges = target.fetch_ranges(today, full=full)
+        if not ranges:
             skipped += 1
             continue
         try:
-            frame = history_fetcher([target.provider_symbol], start, today + timedelta(days=1))
-            if not frame.empty:
-                frames.append(frame)
+            for start, end in ranges:
+                frame = history_fetcher([target.provider_symbol], start, end)
+                if not frame.empty:
+                    frames.append(frame)
         except Exception:
             failed_symbols.append(target.symbol)
             logger.exception("Yfinance history fetch failed | ticker=%s", target.symbol)

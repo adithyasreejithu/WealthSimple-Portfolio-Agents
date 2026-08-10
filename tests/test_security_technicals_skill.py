@@ -3,7 +3,10 @@
 Builds a real temp DuckDB fixture (via `database.initialize_database` + direct
 inserts, the same pattern `test_investment_analyst_resources.py` uses) so the
 read boundary is exercised against actual schema and constraints, not mocks.
-No network anywhere -- this skill has no fetch path to mock.
+The technicals themselves have no fetch path to mock; the one network call
+this skill makes, the optional current-price quote, is always exercised via
+`patch.object(cli, "_fetch_latest_quote", ...)` -- no real network access
+anywhere in this file.
 
 The pure math is covered by `tests/test_security_technicals.py`; this file
 covers the skill layer around it: the DB read, the artifact's placement in
@@ -31,7 +34,12 @@ import read_price_history as price_reader  # noqa: E402
 import security_technicals_cli as cli  # noqa: E402
 
 TODAY = date(2026, 8, 10)
+# The Yahoo form callers hold (config.DEFAULT_BENCHMARK_SYMBOL) ...
 BENCHMARK = "XEQT.TO"
+# ... versus the canonical symbol `tickers` actually stores. Fixtures seed the
+# canonical one so the suite exercises the real shape: the exchange suffix lives
+# in ticker_provider_mappings.provider_symbol, never in tickers.ticker_symbol.
+BENCHMARK_STORED = "XEQT"
 
 
 class FixtureDatabaseTest(unittest.TestCase):
@@ -67,7 +75,7 @@ class FixtureDatabaseTest(unittest.TestCase):
     def _seed_pair(self, *, ticker_closes: list[float], benchmark_closes: list[float]):
         ticker_id = self._seed_ticker()
         self._seed_prices(ticker_id, ticker_closes)
-        benchmark_id = self._seed_ticker(BENCHMARK, exchange="TORONTO", currency="CAD")
+        benchmark_id = self._seed_ticker(BENCHMARK_STORED, exchange="TORONTO", currency="CAD")
         self._seed_prices(benchmark_id, benchmark_closes)
         return ticker_id, benchmark_id
 
@@ -130,6 +138,69 @@ class ReadPriceHistoryTest(FixtureDatabaseTest):
         self.assertIsNotNone(identity)
         self.assertEqual(identity["ticker_symbol"], "PLTR")
 
+    def test_yahoo_form_resolves_to_the_canonical_stored_symbol(self):
+        # DEFAULT_BENCHMARK_SYMBOL is 'XEQT.TO' but tickers stores 'XEQT'.
+        # Without the suffix fallback this misses and beta/alpha/relative
+        # strength are silently reported as unavailable.
+        self._seed_ticker(BENCHMARK_STORED, exchange="TORONTO", currency="CAD")
+        connection = self._reopen_read_only()
+        try:
+            identity = price_reader.resolve_ticker(connection, BENCHMARK)
+        finally:
+            connection.close()
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity["ticker_symbol"], BENCHMARK_STORED)
+
+    def test_exact_match_wins_over_the_suffix_fallback(self):
+        # A ticker genuinely stored with a suffix must resolve to itself rather
+        # than being redirected to a different security sharing the bare symbol.
+        suffixed = self._seed_ticker("FOO.TO", exchange="TORONTO", currency="CAD")
+        self._seed_ticker("FOO", exchange="NASDAQ", currency="USD")
+        connection = self._reopen_read_only()
+        try:
+            identity = price_reader.resolve_ticker(connection, "FOO.TO")
+        finally:
+            connection.close()
+        self.assertEqual(identity["ticker_id"], suffixed)
+        self.assertEqual(identity["ticker_symbol"], "FOO.TO")
+
+    def test_resolve_provider_symbol_returns_the_verified_yahoo_symbol(self):
+        ticker_id = self._seed_ticker()
+        self.connection.execute(
+            "INSERT INTO ticker_provider_mappings (ticker_id, provider, provider_symbol, "
+            "verification_status) VALUES (?, 'yahoo', 'PLTR', 'verified')",
+            [ticker_id],
+        )
+        connection = self._reopen_read_only()
+        try:
+            symbol = price_reader.resolve_provider_symbol(connection, ticker_id)
+        finally:
+            connection.close()
+        self.assertEqual(symbol, "PLTR")
+
+    def test_resolve_provider_symbol_is_none_when_unmapped(self):
+        ticker_id = self._seed_ticker()
+        connection = self._reopen_read_only()
+        try:
+            self.assertIsNone(price_reader.resolve_provider_symbol(connection, ticker_id))
+        finally:
+            connection.close()
+
+    def test_resolve_provider_symbol_ignores_unverified_mappings(self):
+        # A pending/rejected mapping is not trusted for a real network call --
+        # only 'verified' rows count, matching db_resources.resolve_ticker's rule.
+        ticker_id = self._seed_ticker()
+        self.connection.execute(
+            "INSERT INTO ticker_provider_mappings (ticker_id, provider, provider_symbol, "
+            "verification_status) VALUES (?, 'yahoo', 'PLTR', 'pending')",
+            [ticker_id],
+        )
+        connection = self._reopen_read_only()
+        try:
+            self.assertIsNone(price_reader.resolve_provider_symbol(connection, ticker_id))
+        finally:
+            connection.close()
+
     def test_missing_database_is_an_actionable_error(self):
         database.close_connection()
         with self.assertRaises(price_reader.DatabaseNotReady) as caught:
@@ -170,7 +241,7 @@ class TraceClassificationTest(FixtureDatabaseTest):
         # The contrast case: the ticker resolves but has no stored rows. That
         # IS a real data gap and must grade as missing.
         self._seed_ticker()
-        benchmark_id = self._seed_ticker(BENCHMARK, exchange="TORONTO", currency="CAD")
+        benchmark_id = self._seed_ticker(BENCHMARK_STORED, exchange="TORONTO", currency="CAD")
         self._seed_prices(benchmark_id, [50.0, 52.0])
         connection = self._reopen_read_only()
         try:
@@ -200,6 +271,29 @@ class TraceClassificationTest(FixtureDatabaseTest):
         benchmark = next(d for d in trace.domains if d.name == "benchmark")
         self.assertEqual(benchmark.missing, [f"history:{BENCHMARK}"])
 
+    def test_quote_skipped_by_flag_is_not_applicable(self):
+        # build_trace's own default (no_quote=True) covers this same case, but
+        # it is asserted explicitly here since it is the CLI's off switch.
+        trace = cli.build_trace("PLTR", [], BENCHMARK, [], {}, quote=None, no_quote=True)
+        quote = next(d for d in trace.domains if d.name == "quote")
+        self.assertEqual(sorted(quote.not_applicable), ["as_of", "price"])
+        self.assertEqual(quote.missing, [])
+
+    def test_quote_fetch_failure_is_missing_not_not_applicable(self):
+        # Attempted (no_quote=False) but came back empty -- a real gap, unlike
+        # the opt-out case above.
+        trace = cli.build_trace("PLTR", [], BENCHMARK, [], {}, quote=None, no_quote=False)
+        quote = next(d for d in trace.domains if d.name == "quote")
+        self.assertEqual(sorted(quote.missing), ["as_of", "price"])
+        self.assertEqual(quote.not_applicable, [])
+
+    def test_quote_success_grades_ok(self):
+        fake_quote = {"price": 189.10, "as_of": "2026-08-10T14:32:01", "source": "fast_info"}
+        trace = cli.build_trace("PLTR", [], BENCHMARK, [], {}, quote=fake_quote, no_quote=False)
+        quote = next(d for d in trace.domains if d.name == "quote")
+        self.assertEqual(sorted(quote.ok), ["as_of", "price"])
+        self.assertEqual(quote.missing, [])
+
 
 class BuildResultTest(FixtureDatabaseTest):
     def test_unresolved_ticker_short_circuits_with_a_gap(self):
@@ -226,6 +320,29 @@ class BuildResultTest(FixtureDatabaseTest):
         self.assertIsNotNone(payload["technicals"]["moving_averages"]["sma_200d"])
         self.assertIsNotNone(payload["technicals"]["beta_alpha"]["beta"])
         self.assertEqual(payload["prices"]["count"], 400)
+
+    def test_quote_field_defaults_to_skipped(self):
+        # build_result's own default (no_quote=True) matches build_trace's --
+        # a direct call with no quote args produces the CLI's --no-quote shape.
+        payload = cli.build_result("PLTR", {"security_name": "x", "currency": "USD"}, [], BENCHMARK, [], TODAY)
+        self.assertEqual(payload["quote"], {"skipped": True})
+        self.assertNotIn("current-price quote unavailable", payload["gaps"])
+
+    def test_quote_field_carries_the_fetched_quote(self):
+        fake_quote = {"price": 189.10, "as_of": "2026-08-10T14:32:01", "source": "fast_info"}
+        payload = cli.build_result(
+            "PLTR", {"security_name": "x", "currency": "USD"}, [], BENCHMARK, [], TODAY,
+            quote=fake_quote, no_quote=False,
+        )
+        self.assertEqual(payload["quote"], fake_quote)
+
+    def test_quote_fetch_failure_is_reported_as_a_gap(self):
+        payload = cli.build_result(
+            "PLTR", {"security_name": "x", "currency": "USD"}, [], BENCHMARK, [], TODAY,
+            quote=None, no_quote=False,
+        )
+        self.assertIsNone(payload["quote"])
+        self.assertIn("current-price quote unavailable", payload["gaps"])
 
     def test_price_summary_carries_coverage_not_the_series(self):
         closes = [100.0, 110.0, 120.0]
@@ -295,6 +412,7 @@ class CliWorkspaceTest(FixtureDatabaseTest):
         exit_code = self._run_cli([
             "--ticker", "PLTR",
             "--run-id", "technicals-run",
+            "--no-quote",
             "--trace-log-path", str(Path(self.temp_dir.name) / "trace.txt"),
         ])
         self.assertEqual(exit_code, 0)
@@ -320,6 +438,7 @@ class CliWorkspaceTest(FixtureDatabaseTest):
         self._run_cli([
             "--ticker", "PLTR",
             "--run-id", "technicals-run",
+            "--no-quote",
             "--trace-log-path", str(Path(self.temp_dir.name) / "trace.txt"),
         ])
 
@@ -339,6 +458,7 @@ class CliWorkspaceTest(FixtureDatabaseTest):
         self._run_cli([
             "--ticker", "PLTR",
             "--run-id", "technicals-run",
+            "--no-quote",
             "--trace-log-path", str(Path(self.temp_dir.name) / "trace.txt"),
         ])
 
@@ -357,6 +477,7 @@ class CliWorkspaceTest(FixtureDatabaseTest):
         runs_root = self._patch_workspace()
         exit_code = self._run_cli([
             "--ticker", "PLTR",
+            "--no-quote",
             "--trace-log-path", str(Path(self.temp_dir.name) / "trace.txt"),
         ])
         self.assertEqual(exit_code, 0)
@@ -371,7 +492,7 @@ class CliWorkspaceTest(FixtureDatabaseTest):
         trace_log = Path(self.temp_dir.name) / "trace.txt"
         exit_code = self._run_cli([
             "--ticker", "PLTR",
-            "--no-run", "--output", str(destination), "--trace-log-path", str(trace_log),
+            "--no-run", "--no-quote", "--output", str(destination), "--trace-log-path", str(trace_log),
         ])
         self.assertEqual(exit_code, 0)
         self.assertTrue(destination.is_file())
@@ -386,7 +507,7 @@ class CliWorkspaceTest(FixtureDatabaseTest):
         trace_log = Path(self.temp_dir.name) / "trace.txt"
         self._run_cli([
             "--ticker", "PLTR",
-            "--no-run", "--output", str(Path(self.temp_dir.name) / "t.json"),
+            "--no-run", "--no-quote", "--output", str(Path(self.temp_dir.name) / "t.json"),
             "--trace-log-path", str(trace_log),
         ])
         self.assertTrue(trace_log.is_file())
@@ -400,7 +521,7 @@ class CliWorkspaceTest(FixtureDatabaseTest):
         trace_log = Path(self.temp_dir.name) / "trace.txt"
         self._run_cli([
             "--ticker", "PLTR",
-            "--no-run", "--output", str(destination),
+            "--no-run", "--no-quote", "--output", str(destination),
             "--no-trace", "--trace-log-path", str(trace_log),
         ])
         payload = json.loads(destination.read_text(encoding="utf-8"))
@@ -419,6 +540,43 @@ class CliWorkspaceTest(FixtureDatabaseTest):
         self.assertFalse(payload["resolved"])
         self.assertTrue(payload["gaps"])
 
+    def test_quote_is_fetched_by_default_and_included_in_the_artifact(self):
+        # Patches the network call itself, not resolve_provider_symbol -- a
+        # verified mapping is seeded so the CLI's own resolution path runs
+        # end to end, same as it would against the real database.
+        ticker_id = self._seed_ticker()
+        self._seed_prices(ticker_id, [100.0 + i * 0.5 for i in range(400)])
+        benchmark_id = self._seed_ticker(BENCHMARK_STORED, exchange="TORONTO", currency="CAD")
+        self._seed_prices(benchmark_id, [50.0 + i * 0.1 for i in range(400)])
+        self.connection.execute(
+            "INSERT INTO ticker_provider_mappings (ticker_id, provider, provider_symbol, "
+            "verification_status) VALUES (?, 'yahoo', 'PLTR', 'verified')",
+            [ticker_id],
+        )
+        self._patch_workspace()
+        destination = Path(self.temp_dir.name) / "technicals.json"
+        fake_quote = {"price": 189.10, "as_of": None, "source": "fast_info", "previous_close": 187.42}
+
+        with patch.object(cli, "_fetch_latest_quote", return_value=fake_quote) as mock_quote:
+            exit_code = self._run_cli(["--ticker", "PLTR", "--no-run", "--output", str(destination)])
+
+        self.assertEqual(exit_code, 0)
+        mock_quote.assert_called_once_with("PLTR")
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+        self.assertEqual(payload["quote"]["price"], 189.10)
+
+    def test_no_quote_flag_skips_the_fetch_entirely(self):
+        self._seed_full()
+        self._patch_workspace()
+        destination = Path(self.temp_dir.name) / "technicals.json"
+
+        with patch.object(cli, "_fetch_latest_quote") as mock_quote:
+            self._run_cli(["--ticker", "PLTR", "--no-run", "--no-quote", "--output", str(destination)])
+
+        mock_quote.assert_not_called()
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+        self.assertEqual(payload["quote"], {"skipped": True})
+
 
 class CliArgumentTest(unittest.TestCase):
     def test_no_run_and_run_id_together_is_a_usage_error(self):
@@ -432,6 +590,14 @@ class CliArgumentTest(unittest.TestCase):
     def test_benchmark_defaults_to_the_configured_symbol(self):
         args = cli.parse_args(["--ticker", "PLTR"])
         self.assertEqual(args.benchmark, BENCHMARK)
+
+    def test_quote_is_fetched_by_default(self):
+        args = cli.parse_args(["--ticker", "PLTR"])
+        self.assertFalse(args.no_quote)
+
+    def test_no_quote_flag_disables_it(self):
+        args = cli.parse_args(["--ticker", "PLTR", "--no-quote"])
+        self.assertTrue(args.no_quote)
 
 
 if __name__ == "__main__":

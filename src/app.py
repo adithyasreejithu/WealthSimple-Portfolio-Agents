@@ -1115,7 +1115,7 @@ def _run_yfinance_sync_command(argv: list[str]) -> int:
     parser.add_argument(
         "--full",
         action="store_true",
-        help="Backfill again from each ticker's first portfolio activity.",
+        help="Backfill again from each ticker's history floor.",
     )
     args = parser.parse_args(argv)
     result = sync_market_data(args.database, args.tickers, full=args.full)

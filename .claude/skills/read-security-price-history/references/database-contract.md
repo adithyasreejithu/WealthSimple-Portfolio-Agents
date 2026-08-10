@@ -24,9 +24,9 @@ SQL, no production database-path argument, and no caller-supplied date range.
 | --- | --- |
 | `connect_read_only(db_path=DATABASE_PATH)` | A read-only connection. Raises `DatabaseNotReady` with an actionable message when the file is missing or another process holds the write lock. |
 | `validate_database(connection)` | `None`; raises `DatabaseNotReady` on a missing or version-mismatched schema. |
-| `resolve_ticker(connection, symbol)` | `{ticker_id, ticker_symbol, security_name, currency, exchange}` or `None`. Case-insensitive; ties broken by lowest `ticker_id` for determinism. |
+| `resolve_ticker(connection, symbol)` | `{ticker_id, ticker_symbol, security_name, currency, exchange}` or `None`. Case-insensitive; ties broken by lowest `ticker_id` for determinism. Accepts the canonical symbol (`XEQT`) or its Yahoo form (`XEQT.TO`) — the exact match is tried first, then the exchange suffix (`config.YFINANCE_CANADIAN_SUFFIXES`) is stripped, so a ticker genuinely stored as `FOO.TO` still wins over a different `FOO`. |
 | `read_security_prices(connection, ticker_id)` | Ascending `list[dict]` of `record_date, open, high, low, close, adjusted_close, volume`. Empty list when the ticker has no rows. |
-| `read_benchmark_prices(connection, symbol=DEFAULT_BENCHMARK_SYMBOL)` | `(symbol, rows)`. Resolves the benchmark symbol then delegates to `read_security_prices`. `rows` is empty when the benchmark is unknown or unfetched. |
+| `read_benchmark_prices(connection, symbol=DEFAULT_BENCHMARK_SYMBOL)` | `(symbol, rows)`. Resolves the benchmark symbol then delegates to `read_security_prices`. `rows` is empty when the benchmark is unknown or unfetched. The default is the Yahoo-form `XEQT.TO` while `tickers` stores `XEQT`, which is precisely why `resolve_ticker` falls back to the bare symbol. |
 
 `read_benchmark_prices` exists because nothing else in the repository reads a
 benchmark's stored price series: `src/analytics.py` does an ad-hoc inline query

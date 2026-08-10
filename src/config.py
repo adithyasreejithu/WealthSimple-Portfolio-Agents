@@ -48,6 +48,11 @@ WEALTHSIMPLE_FX_FEE_RATE = Decimal("0.015")
 ANNUALIZATION_PERIODS = 252
 DEFAULT_RISK_FREE_RATE = 0.0
 STALE_PRICE_MAX_AGE_DAYS = 7
+# Floor on how far back `market_data.sync_market_data` backfills `historical_records`,
+# independent of when the holding was first bought. 400 calendar days is ~275 trading
+# bars: enough for an SMA-200 and for the 365-day relative-strength window, both of
+# which a recently-purchased name would otherwise never be able to compute.
+MINIMUM_PRICE_HISTORY_DAYS = 400
 SUSPICIOUS_UNREALIZED_GAIN_THRESHOLD = 0.95
 DEFAULT_BENCHMARK_SYMBOL = "XEQT.TO"
 # Benchmarks persisted to `historical_records` by `market_data.ensure_benchmark_history`

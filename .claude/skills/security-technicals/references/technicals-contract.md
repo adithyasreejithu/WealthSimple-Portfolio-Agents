@@ -7,7 +7,8 @@ conventions every number follows.
 
 | Rule | Why |
 | --- | --- |
-| No network, ever | This skill reads `historical_records` only. Stale prices are a gap to report, not a reason to fetch. `investment-analyst-resources` and the pipeline own refreshing. |
+| No network for technicals, ever | Moving averages, drawdown, volatility, relative strength, and beta/alpha read `historical_records` only. Stale history is a gap to report, not a reason to fetch. `investment-analyst-resources` and the pipeline own refreshing. |
+| One exception: an optional live quote | `_fetch_latest_quote` (yfinance `fast_info`) runs by default, independent of the technicals above, and is reported under a separate `quote` field so it is never mistaken for a stored, history-derived number. `--no-quote` opts out for a strictly offline run. |
 | No judgment in the output | Every field is a number, a `null`, or a coverage fact. No ratings, no adjectives, no recommendation. |
 | Artifact goes to `calculations/`, not `evidence/` | It is arithmetic derived from data the run already holds, not a fact obtained from outside. `evidence/` means provenance-from-elsewhere; conflating the two would make an evidence registry that no longer answers "where did this come from". |
 | `null` is a real answer | Insufficient history returns `null`, never a shorter window silently relabelled as the requested one. |
@@ -61,6 +62,10 @@ Written to `runs/<run_id>/calculations/security-technicals-<TICKER>-<date>.json`
       "tracking_error": 0.4820, "information_ratio": 0.9276
     }
   },
+  "quote": {
+    "price": 189.10, "as_of": "2026-08-10T14:32:01", "source": "fast_info",
+    "previous_close": 187.42
+  },
   "gaps": [],
   "trace": { "...": "skill_trace.Trace.to_dict()" }
 }
@@ -69,6 +74,12 @@ Written to `runs/<run_id>/calculations/security-technicals-<TICKER>-<date>.json`
 `beta_alpha` is `null` in full (not a dict of nulls) below the minimum
 overlap, because `calculate_benchmark_stats` returns `None` rather than
 partial statistics it cannot stand behind.
+
+`quote` is `{"skipped": true}` under `--no-quote`, and `null` (not an error)
+when a fetch was attempted and failed — no verified `ticker_provider_mappings`
+row, or yfinance itself failed. Never confuse it with `prices.latest_close`:
+that field is the stored close as of the last pipeline ingestion; `quote` is
+the wall-clock-time price at the moment this skill ran.
 
 ## Digest (stdout)
 
@@ -88,6 +99,7 @@ Three domains, graded per `src/skill_trace.py`'s three-way split. Getting the
 | `prices` | `history` when rows exist | `history` when the ticker resolves but has no rows | — |
 | `benchmark` | `history` when rows exist | `history` when the configured benchmark has no stored rows (it should — `market_data.ensure_benchmark_history` populates it) | — |
 | `technicals` | each metric that computed | — | each metric that could not compute for lack of history |
+| `quote` | `price`/`as_of` when the fetch succeeded | `price`/`as_of` when attempted (no `--no-quote`) but the fetch came back empty | `price`/`as_of` when skipped by `--no-quote` — nothing was ever attempted |
 
 **Insufficient history is `not_applicable`, never `missing`.** A 60-day-old
 holding genuinely cannot have an SMA-200; grading that as a gap would report a

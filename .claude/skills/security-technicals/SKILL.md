@@ -1,24 +1,30 @@
 ---
 name: security-technicals
-description: Compute per-security price technicals for one or more tickers from stored DuckDB history -- moving averages, max drawdown, annualized volatility, relative strength versus the configured benchmark, and beta/alpha -- and write the result as a run-workspace calculation artifact with an evidence entry, audit event, and completeness trace. Use when a stock's price behavior needs quantifying for research, before scoring or thesis work. Never interprets the numbers.
+description: Compute per-security price technicals for one or more tickers from stored DuckDB history -- moving averages, max drawdown, annualized volatility, relative strength versus the configured benchmark, and beta/alpha -- plus an optional live current-price quote, and write the result as a run-workspace calculation artifact with an evidence entry, audit event, and completeness trace. Use when a stock's price behavior needs quantifying for research, before scoring or thesis work. Never interprets the numbers.
 model: haiku
 ---
 
 # Security Technicals
 
 Deterministic, no-judgment calculation layer. Reads stored prices, computes,
-writes an artifact. It does **not** fetch from the network, does not decide
-anything, and does not write the knowledge base.
+writes an artifact. It does not decide anything and does not write the
+knowledge base. The technicals themselves never fetch — see Guardrails for
+the one deliberate exception, an optional live current-price quote.
 
 Run `uv run python .claude/skills/security-technicals/scripts/security_technicals_cli.py`:
 
 - `--ticker TICKER [TICKER ...]` — one or more pipeline ticker symbols.
 - `--benchmark SYMBOL` — comparison series for relative strength and
-  beta/alpha. Defaults to `config.DEFAULT_BENCHMARK_SYMBOL` (`XEQT.TO`).
+  beta/alpha. Defaults to `config.DEFAULT_BENCHMARK_SYMBOL` (`XEQT.TO`), the
+  same benchmark the dashboard uses at the portfolio level. For a single
+  US-listed holding, `VFV.TO` (the repo's S&P 500 stand-in, already stored)
+  is the more conventional single-name beta benchmark — pass it explicitly
+  when that's what's being asked.
 - `--output PATH` — write the artifact here instead of into a run
   (single-ticker runs only).
 - `--no-run` / `--run-id ID` — see below.
 - `--no-trace` — skip the completeness trace.
+- `--no-quote` — skip the live current-price quote (on by default).
 - `--pretty` — pretty-print the JSON digest.
 
 ## Workflow
@@ -78,6 +84,7 @@ See `docs/architecture/run_workspace.md`.
 | `volatility` | Daily and annualized, `ddof=0`, `x sqrt(252)`. |
 | `relative_strength` | Ticker's trailing 365-day return minus the benchmark's over the same window. Either leg is `null` when its series does not reach back that far. |
 | `beta_alpha` | Beta, alpha, tracking error, information ratio versus the benchmark. `null` below 20 overlapping trading days. |
+| `quote` | Live current price via yfinance `fast_info` (`price`, `as_of`, `previous_close`) — separate from the stored technicals above, and the one thing here that is not read-only. `{"skipped": true}` under `--no-quote`, `null` if the fetch was attempted and failed. |
 
 Full field-by-field contract, including the convention parity statement, is in
 [technicals-contract.md](references/technicals-contract.md).
@@ -92,8 +99,14 @@ Full field-by-field contract, including the convention parity statement, is in
   should".
 - **Never writes the knowledge base.** The artifact goes to the run workspace;
   `kb-intake` owns every KB write.
-- **Never fetches.** No network. If the stored history is short, that is a gap
-  to report, not a reason to reach for yfinance.
+- **The technicals never fetch.** SMA, drawdown, volatility, relative
+  strength, and beta/alpha are always computed from stored history only. If
+  that history is short, that is a gap to report, not a reason to reach for
+  yfinance. **One deliberate exception:** a lightweight live current-price
+  quote (`fast_info`, the same call `investment-analyst-resources` uses) is
+  fetched by default and reported under a separate `quote` field, because the
+  stored `latest_close` is only as fresh as the last pipeline run. Pass
+  `--no-quote` for a strictly offline invocation.
 - **A `null` is a real answer.** Report it as insufficient history. Do not
   silently widen or narrow a window to produce a number.
 

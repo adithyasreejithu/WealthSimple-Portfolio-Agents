@@ -158,9 +158,23 @@ uv run python src/app.py yfinance-sync --full
 - `--database PATH` selects the DuckDB database.
 - `--tickers SYMBOL [SYMBOL ...]` optionally limits the run by canonical or
   Yahoo provider symbol.
-- `--full` backfills again from each selected ticker's first portfolio activity.
-- History starts at the earliest owned date on the first run and continues
-  incrementally after the latest stored date on later runs.
+- `--full` backfills again from each selected ticker's history floor.
+- Every ticker is backfilled to a **history floor** — the earlier of its first
+  portfolio activity and `config.MINIMUM_PRICE_HISTORY_DAYS` (400 calendar days,
+  ~275 trading bars) before today. Ownership alone is not deep enough: a name
+  bought last month could otherwise never accumulate the history an SMA-200 or a
+  365-day relative-strength window needs.
+- A run therefore fetches up to two ranges per ticker: a head range when stored
+  history starts later than the floor, plus the usual incremental tail after the
+  latest stored date. The head range is self-limiting — once stored history
+  reaches the floor, the floor keeps advancing daily while the stored minimum
+  stays put, so it is fetched exactly once per ticker.
+- A range covering only a weekend is never requested, since it cannot hold bars
+  and yfinance reports an empty download as a misleading "possibly delisted"
+  error. A ticker with no fetchable range is counted as skipped.
+- A young security is backfilled only as far as the provider has data — its
+  listing date, not the floor. That is a real gap for downstream calculations
+  to report, not a sync failure.
 - Each run also persists daily closes for the configured FX pair and the
   dashboard benchmark tickers (`config.BENCHMARK_TICKERS`, currently XEQT and
   VFV as the S&P 500 proxy), backfilled to the earliest transaction date so

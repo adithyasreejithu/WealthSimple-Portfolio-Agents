@@ -277,3 +277,124 @@ The `ddof` asymmetry recorded in `HANDOFF.md` is still unfixed, still deliberate
 file was created — Decision 2's "extend" path made a new file unnecessary once the live
 pass-through fields were confirmed already-fetched and the DB-sourced ratios were
 confirmed to read `extra` fields the existing functions never touch.
+
+---
+
+## Decision 5 — Benchmark default kept; a live current-price quote added (2026-08-10)
+
+Two questions raised after Decision 4 shipped, both resolved the same day.
+
+### Benchmark: keep `XEQT.TO` as the default, `VFV.TO` stays a `--benchmark` override
+
+`XEQT.TO` (`config.DEFAULT_BENCHMARK_SYMBOL`) is a globally-diversified, multi-region
+equity ETF — the repo's proxy for "the whole portfolio's market" (`analytics.py:2004`
+treats it as such for concentration checks, and it is also the portfolio-level beta/alpha
+benchmark on the dashboard). For a *single* US-listed security, the more conventional
+beta benchmark is the market that security actually trades in — `VFV.TO`, which
+`config.py`'s own comment already documents as existing specifically as an "S&P 500
+stand-in... so the overlay stays in the portfolio's currency," and which
+`market_data.ensure_benchmark_history` already fetches and stores alongside XEQT.
+
+Kept `XEQT.TO` as the default rather than switching: it keeps `security-technicals`
+consistent with the dashboard's own portfolio-level convention, so the same benchmark
+choice isn't silently different between the two surfaces unless asked. `--benchmark`
+already existed and needed no code change — `--benchmark VFV.TO` is the answer whenever a
+single US-listed holding's beta against "the market" (rather than against this
+portfolio's asset-allocation benchmark) is what's being asked. Documented in `SKILL.md`'s
+flag description rather than silently left for someone to discover.
+
+### Live quote: one optional network call, sharply scoped
+
+The technicals (`SMA`, drawdown, volatility, relative strength, beta/alpha) are unaffected
+by staleness — they're long-window statistics over stored history, and one day's price
+barely moves them. But `prices.latest_close` is only as fresh as the last pipeline
+ingestion, and the artifact never distinguished "stored as of the last run" from "right
+now." `investment_analyst_resources._fetch_latest_quote` already solved exactly this
+problem for the sibling skill with a single cheap `yfinance` `fast_info` call, independent
+of its own `--no-live` flag via a dedicated `--no-quote`.
+
+Reused the same pattern rather than inventing a new one: `_fetch_latest_quote` (a trimmed
+copy — `price`/`as_of`/`source`/`previous_close` only, no day/year range, which is
+`investment-analyst-resources` territory, not a price-technicals concern), a `--no-quote`
+flag defaulting to fetch-on, and a `quote` artifact field kept clearly separate from the
+history-derived `technicals` block. `read_price_history.py` gained one new function,
+`resolve_provider_symbol` — every other read in that module deliberately does *not*
+require a verified Yahoo mapping (`read_benchmark_prices`' docstring: requiring one "would
+exclude a benchmark whose history is already stored"), but a real network call needs a
+real symbol, so this one function does require `ticker_provider_mappings`' `provider =
+'yahoo' AND verification_status = 'verified'` row, mirroring `db_resources.resolve_ticker`.
+
+This is the one place the skill's "reads only, never fetches" guardrail gets a carve-out.
+`SKILL.md`, the CLI's own `--help` description, and `technicals-contract.md`'s Boundary
+table were all updated to state the carve-out explicitly rather than leave the guardrail
+overstated. The trace gained a third domain, `quote`, with the same three-way split as
+`technicals` but inverted in spirit: skipped-by-`--no-quote` is `not_applicable` (nothing
+was attempted), while an attempted fetch that came back empty — no verified mapping, or
+yfinance itself failing — is a real `missing`, because the quote was genuinely obtainable
+in principle. 13 new tests cover `resolve_provider_symbol`, the trace's three quote
+states, the artifact's `quote` field, and the CLI path with `_fetch_latest_quote` mocked
+(no real network access anywhere in the test file); the full skill suite grew from 23 to
+36 tests, all passing.
+
+---
+
+## Decision 6 — Ownership-based backfill was too shallow for the technicals it now feeds (2026-08-10)
+
+Testing Decision 5's benchmark choice against a recently-bought real holding surfaced a
+gap upstream of `security-technicals` entirely: `market_data.sync_market_data` only ever
+backfilled `historical_records` from `first_owned_date` forward. A name bought a month ago
+therefore has ~20 trading bars stored — nowhere near the ~200 an SMA-200 needs or the ~252
+a 365-day relative-strength window needs — and no flag in the sync CLI could fix that,
+because the sync itself never reached further back than ownership. This is a sync-layer
+gap, not a `security_technicals.py` bug: `compute_security_technicals` was already
+correctly reporting `null` for what it could not compute (Decision 1's local functions,
+Decision 4's trace rule) — the fix is giving it more to compute *from*.
+
+### The fix: a history floor independent of ownership
+
+Added `config.MINIMUM_PRICE_HISTORY_DAYS = 400` (calendar days, ~275 trading bars — enough
+slack above the 252-bar ceiling that a handful of provider gaps or holidays don't erode the
+window). `MarketTarget.history_floor(today)` returns
+`min(first_owned_date, today - MINIMUM_PRICE_HISTORY_DAYS)`, so ownership can only push the
+backfill *further* back, never short of the floor. `fetch_ranges` requests up to two
+`[start, end)` windows per ticker — a one-time "head gap" between the floor and whatever is
+already stored (`earliest_market_date`), plus the ordinary incremental tail after
+`latest_market_date` — mirroring the two-range shape `ensure_benchmark_history` already
+used for benchmarks. The head gap is self-limiting: once stored history reaches the floor,
+the floor keeps advancing by one day at a time while the stored minimum stays fixed, so it
+naturally stops recurring without any extra bookkeeping. `_has_trading_weekday` skips a
+range that provably covers only a weekend, since requesting one produces a misleading
+"possibly delisted" log line from yfinance for zero benefit. A ticker newer than 400 days
+old is still only backfilled to its actual listing date (yfinance returns what it has); that
+remains a real, reportable data gap for the technicals layer, not something this change
+papers over.
+
+**Scope check, same as Decision 1's:** this touches `market_data.py`/`config.py`, neither
+of which is `portfolio_metrics.py` or `analytics.py` — the dashboard's own valuation-series
+ingestion is unaffected, and `--full` continues to mean "restart from the floor," now
+correctly rather than from ownership alone. 6 new/updated tests in
+`MarketDataSyncTest`/`MarketTargetRangeTest` cover the floor computation, the one-time head
+gap, the steady-state tail-only case, and the weekend skip.
+
+### The fallout: the benchmark didn't resolve
+
+Decision 5 kept `XEQT.TO` (the Yahoo form, from `config.DEFAULT_BENCHMARK_SYMBOL`) as the
+default `--benchmark` value. But `tickers.ticker_symbol` stores the bare canonical symbol
+(`XEQT`) — the `.TO` suffix lives only in `ticker_provider_mappings.provider_symbol`. Before
+this fix, `read_price_history.resolve_ticker` did an exact match only, so the default
+benchmark silently failed to resolve and every beta/alpha/relative-strength field came back
+`null` for every ticker unless `--benchmark XEQT` (undocumented, bare form) was passed
+instead. Fixed by trying the exact symbol first, then a Canadian-suffix-stripped fallback
+(`_bare_symbol`, reusing `config.YFINANCE_CANADIAN_SUFFIXES`) — exact-first so a ticker
+genuinely stored *with* a suffix (e.g. a dual-listed name kept as `FOO.TO`) still resolves to
+itself rather than being redirected to an unrelated `FOO`. 3 new tests cover the Yahoo-form
+fallback, the exact-match-wins case, and the pre-existing case-insensitive match.
+
+### Why this wasn't caught by Decision 5's own tests
+
+Decision 5's fixtures seeded the benchmark ticker under its Yahoo form (`XEQT.TO`) directly,
+which happened to match `resolve_ticker`'s exact-match query — masking the mismatch that a
+real database (where `tickers` never stores the suffix) would hit immediately. The test
+fixtures were corrected alongside the fix (`BENCHMARK_STORED = "XEQT"`, seeded separately
+from the Yahoo-form `BENCHMARK` constant the CLI is invoked with) so the suite now exercises
+the real shape instead of accidentally sidestepping the bug.

@@ -9,6 +9,13 @@ import market_data
 
 class MarketDataSyncTest(unittest.TestCase):
     def setUp(self):
+        # Shorten the history floor so the expected dates below stay readable;
+        # the production 400-day value is exercised in MarketTargetRangeTest.
+        minimum = patch.object(market_data, "MINIMUM_PRICE_HISTORY_DAYS", 30)
+        minimum.start()
+        self.addCleanup(minimum.stop)
+        # first_owned 2025-01-02 with as_of 2025-01-10 puts the floor at
+        # 2024-12-11 -- earlier than first ownership, so it governs.
         self.target = market_data.MarketTarget(
             ticker_id=12,
             symbol="VFV",
@@ -16,6 +23,7 @@ class MarketDataSyncTest(unittest.TestCase):
             currency="CAD",
             security_name="Vanguard S&P 500 Index ETF",
             first_owned_date=date(2025, 1, 2),
+            earliest_market_date=None,
             latest_market_date=None,
         )
 
@@ -33,7 +41,7 @@ class MarketDataSyncTest(unittest.TestCase):
             }]
         )
 
-    def test_initial_sync_uses_owned_date_and_tomorrow_as_exclusive_end(self):
+    def test_initial_sync_uses_history_floor_and_tomorrow_as_exclusive_end(self):
         connection = Mock()
         metadata_fetcher = Mock(return_value=(pd.DataFrame(), pd.DataFrame()))
         history_fetcher = Mock(return_value=self._history())
@@ -54,7 +62,7 @@ class MarketDataSyncTest(unittest.TestCase):
             )
 
         history_fetcher.assert_called_once_with(
-            ["VFV.TO"], date(2025, 1, 2), date(2025, 1, 11)
+            ["VFV.TO"], date(2024, 12, 11), date(2025, 1, 11)
         )
         upload.assert_called_once()
         metadata_upload.assert_called_once_with(
@@ -66,8 +74,13 @@ class MarketDataSyncTest(unittest.TestCase):
         self.assertEqual(result.rows, 1)
 
     def test_incremental_sync_starts_after_latest_market_date(self):
+        # Stored history already reaches below the floor, so only the tail runs.
         target = market_data.MarketTarget(
-            **{**self.target.__dict__, "latest_market_date": date(2025, 1, 8)}
+            **{
+                **self.target.__dict__,
+                "earliest_market_date": date(2024, 12, 1),
+                "latest_market_date": date(2025, 1, 8),
+            }
         )
         connection = Mock()
         history_fetcher = Mock(return_value=self._history())
@@ -88,9 +101,13 @@ class MarketDataSyncTest(unittest.TestCase):
             ["VFV.TO"], date(2025, 1, 9), date(2025, 1, 11)
         )
 
-    def test_full_sync_restarts_at_first_owned_date(self):
+    def test_full_sync_restarts_at_history_floor(self):
         target = market_data.MarketTarget(
-            **{**self.target.__dict__, "latest_market_date": date(2025, 1, 8)}
+            **{
+                **self.target.__dict__,
+                "earliest_market_date": date(2025, 1, 2),
+                "latest_market_date": date(2025, 1, 8),
+            }
         )
         connection = Mock()
         history_fetcher = Mock(return_value=self._history())
@@ -109,7 +126,66 @@ class MarketDataSyncTest(unittest.TestCase):
             )
 
         history_fetcher.assert_called_once_with(
-            ["VFV.TO"], date(2025, 1, 2), date(2025, 1, 11)
+            ["VFV.TO"], date(2024, 12, 11), date(2025, 1, 11)
+        )
+
+    def test_shallow_ticker_fetches_head_gap_then_tail(self):
+        # Bought recently: stored history starts well after the floor, so the
+        # missing head is requested before the usual incremental tail.
+        target = market_data.MarketTarget(
+            **{
+                **self.target.__dict__,
+                "earliest_market_date": date(2025, 1, 5),
+                "latest_market_date": date(2025, 1, 8),
+            }
+        )
+        history_fetcher = Mock(return_value=self._history())
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[target]),
+            patch.object(market_data, "get_shared_connection", return_value=Mock()),
+            patch.object(market_data, "upload_security_metadata"),
+            patch.object(market_data, "upload_security_history", return_value=2),
+        ):
+            market_data.sync_market_data(
+                as_of=date(2025, 1, 10),
+                metadata_fetcher=Mock(return_value=(pd.DataFrame(), pd.DataFrame())),
+                history_fetcher=history_fetcher,
+            )
+
+        self.assertEqual(
+            [call.args for call in history_fetcher.call_args_list],
+            [
+                (["VFV.TO"], date(2024, 12, 11), date(2025, 1, 5)),
+                (["VFV.TO"], date(2025, 1, 9), date(2025, 1, 11)),
+            ],
+        )
+
+    def test_deep_ticker_fetches_only_the_tail(self):
+        # Held long enough that stored history already predates the floor.
+        target = market_data.MarketTarget(
+            **{
+                **self.target.__dict__,
+                "earliest_market_date": date(2024, 11, 1),
+                "latest_market_date": date(2025, 1, 8),
+            }
+        )
+        history_fetcher = Mock(return_value=self._history())
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[target]),
+            patch.object(market_data, "get_shared_connection", return_value=Mock()),
+            patch.object(market_data, "upload_security_metadata"),
+            patch.object(market_data, "upload_security_history", return_value=1),
+        ):
+            market_data.sync_market_data(
+                as_of=date(2025, 1, 10),
+                metadata_fetcher=Mock(return_value=(pd.DataFrame(), pd.DataFrame())),
+                history_fetcher=history_fetcher,
+            )
+
+        history_fetcher.assert_called_once_with(
+            ["VFV.TO"], date(2025, 1, 9), date(2025, 1, 11)
         )
 
     def test_one_ticker_failure_still_publishes_successful_history(self):
@@ -137,8 +213,13 @@ class MarketDataSyncTest(unittest.TestCase):
         self.assertEqual(connection.execute.call_args_list[-1].args[0], "COMMIT")
 
     def test_current_ticker_is_skipped(self):
+        # Backfilled past the floor and current through today: nothing to plan.
         target = market_data.MarketTarget(
-            **{**self.target.__dict__, "latest_market_date": date(2025, 1, 10)}
+            **{
+                **self.target.__dict__,
+                "earliest_market_date": date(2024, 12, 1),
+                "latest_market_date": date(2025, 1, 10),
+            }
         )
         connection = Mock()
         history_fetcher = Mock()
@@ -174,6 +255,55 @@ class MarketDataSyncTest(unittest.TestCase):
 
         self.assertFalse(result.succeeded)
         self.assertEqual(connection.execute.call_args_list[-1].args[0], "ROLLBACK")
+
+
+class MarketTargetRangeTest(unittest.TestCase):
+    """Range planning against the real `MINIMUM_PRICE_HISTORY_DAYS`."""
+
+    def _target(self, **overrides):
+        base = {
+            "ticker_id": 1,
+            "symbol": "SOFI",
+            "provider_symbol": "SOFI",
+            "currency": "USD",
+            "security_name": "SoFi Technologies, Inc.",
+            "first_owned_date": date(2024, 12, 20),
+            "earliest_market_date": None,
+            "latest_market_date": None,
+        }
+        return market_data.MarketTarget(**{**base, **overrides})
+
+    def test_floor_reaches_back_the_configured_minimum(self):
+        self.assertEqual(
+            self._target().history_floor(date(2025, 1, 10)), date(2023, 12, 7)
+        )
+
+    def test_floor_never_moves_forward_past_first_ownership(self):
+        target = self._target(first_owned_date=date(2020, 5, 1))
+        self.assertEqual(target.history_floor(date(2025, 1, 10)), date(2020, 5, 1))
+
+    def test_head_gap_is_fetched_only_once(self):
+        # A first sync pulls the whole floor-to-today window ...
+        first = self._target().fetch_ranges(date(2025, 1, 10))
+        self.assertEqual(first, [(date(2023, 12, 7), date(2025, 1, 11))])
+
+        # ... and once stored, the floor has advanced past the stored minimum
+        # so only the tail remains (2025-01-10 is a Friday, 2025-01-13 a Monday).
+        second = self._target(
+            earliest_market_date=date(2023, 12, 7),
+            latest_market_date=date(2025, 1, 10),
+        ).fetch_ranges(date(2025, 1, 13))
+        self.assertEqual(second, [(date(2025, 1, 11), date(2025, 1, 14))])
+
+    def test_weekend_only_range_is_not_requested(self):
+        # Syncing on a Saturday with Friday's bar already stored leaves a
+        # Sat-Sun range that cannot hold data; asking for it makes yfinance log
+        # a misleading "possibly delisted" error.
+        target = self._target(
+            earliest_market_date=date(2023, 12, 7),
+            latest_market_date=date(2025, 1, 10),
+        )
+        self.assertEqual(target.fetch_ranges(date(2025, 1, 11)), [])
 
 
 class FxHistorySyncTest(unittest.TestCase):
@@ -392,6 +522,7 @@ class EarningsDividendsSyncTest(unittest.TestCase):
             currency="USD",
             security_name="Apple Inc.",
             first_owned_date=date(2025, 1, 2),
+            earliest_market_date=None,
             latest_market_date=None,
         )
 
@@ -509,6 +640,7 @@ class FinancialSnapshotsSyncTest(unittest.TestCase):
             currency="USD",
             security_name="Apple Inc.",
             first_owned_date=date(2025, 1, 2),
+            earliest_market_date=None,
             latest_market_date=None,
         )
 

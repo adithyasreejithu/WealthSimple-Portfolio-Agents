@@ -37,7 +37,12 @@ import duckdb
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from config import DATABASE_PATH, DATABASE_SCHEMA_VERSION, DEFAULT_BENCHMARK_SYMBOL  # noqa: E402
+from config import (  # noqa: E402
+    DATABASE_PATH,
+    DATABASE_SCHEMA_VERSION,
+    DEFAULT_BENCHMARK_SYMBOL,
+    YFINANCE_CANADIAN_SUFFIXES,
+)
 from database import REQUIRED_TABLES, SCHEMA_COMPONENT  # noqa: E402
 
 
@@ -107,6 +112,21 @@ def validate_database(connection: duckdb.DuckDBPyConnection) -> None:
         raise DatabaseNotReady("Configured database schema version is inactive or incompatible")
 
 
+def _bare_symbol(symbol: str) -> str:
+    """A Yahoo-form Canadian symbol reduced to the bare symbol `tickers` stores.
+
+    `tickers.ticker_symbol` holds the canonical Wealthsimple symbol (`XEQT`),
+    while the exchange suffix lives in `ticker_provider_mappings.provider_symbol`
+    (`XEQT.TO`). Callers legitimately hold either form -- notably
+    `DEFAULT_BENCHMARK_SYMBOL`, which is the Yahoo one.
+    """
+    upper = symbol.strip().upper()
+    for suffix in YFINANCE_CANADIAN_SUFFIXES:
+        if upper.endswith(suffix):
+            return upper[: -len(suffix)]
+    return upper
+
+
 def resolve_ticker(connection: duckdb.DuckDBPyConnection, symbol: str) -> dict[str, Any] | None:
     """Resolve a symbol to its `tickers` identity, or `None` if unknown.
 
@@ -116,17 +136,30 @@ def resolve_ticker(connection: duckdb.DuckDBPyConnection, symbol: str) -> dict[s
     mapping: every read here is from the local database, so a provider mapping
     is irrelevant, and requiring one would exclude a benchmark whose history is
     already stored.
+
+    Accepts either the canonical symbol or its Yahoo form: the exact match is
+    tried first, then the exchange suffix is stripped. Exact-first matters so a
+    ticker genuinely stored as `FOO.TO` still resolves to itself rather than
+    being redirected to a different `FOO`.
     """
-    row = connection.execute(
-        """
-        SELECT ticker_id, ticker_symbol, security_name, currency, exchange
-        FROM tickers
-        WHERE UPPER(ticker_symbol) = UPPER(?)
-        ORDER BY ticker_id ASC
-        LIMIT 1
-        """,
-        [symbol],
-    ).fetchone()
+    candidates = [symbol]
+    bare = _bare_symbol(symbol)
+    if bare and bare != symbol.strip().upper():
+        candidates.append(bare)
+    row = None
+    for candidate in candidates:
+        row = connection.execute(
+            """
+            SELECT ticker_id, ticker_symbol, security_name, currency, exchange
+            FROM tickers
+            WHERE UPPER(ticker_symbol) = UPPER(?)
+            ORDER BY ticker_id ASC
+            LIMIT 1
+            """,
+            [candidate],
+        ).fetchone()
+        if row is not None:
+            break
     if row is None:
         return None
     return {
@@ -136,6 +169,27 @@ def resolve_ticker(connection: duckdb.DuckDBPyConnection, symbol: str) -> dict[s
         "currency": row[3],
         "exchange": row[4],
     }
+
+
+def resolve_provider_symbol(connection: duckdb.DuckDBPyConnection, ticker_id: int) -> str | None:
+    """The verified Yahoo provider symbol for a ticker, or `None` if unmapped.
+
+    Every read above stays inside the local database and so never needs a
+    provider mapping. This is the one exception: the security-technicals
+    skill's optional current-price top-up calls yfinance directly and needs a
+    real, verified symbol to call it with -- unverified or absent mappings
+    return `None` rather than guessing, mirroring `db_resources.resolve_ticker`'s
+    `provider='yahoo' AND verification_status='verified'` rule.
+    """
+    row = connection.execute(
+        """
+        SELECT provider_symbol FROM ticker_provider_mappings
+        WHERE ticker_id = ? AND provider = 'yahoo' AND verification_status = 'verified'
+        LIMIT 1
+        """,
+        [ticker_id],
+    ).fetchone()
+    return row[0] if row else None
 
 
 def read_security_prices(connection: duckdb.DuckDBPyConnection, ticker_id: int) -> list[dict[str, Any]]:
