@@ -27,6 +27,24 @@ Two entry points, split by source shape:
   (`net_income_latest_quarter`, not `net_income_latest`) rather than
   silently implying parity with v1's annual figure.
 
+Phase 2 (see docs/plans/implementation/phase-2/design-decisions.md) added six
+normalized ratios without a new data source. Four are live pass-throughs of
+provider-computed fields `fetch-stock-research-data` already fetches in the
+`valuation` group but this skill never surfaced: `ev_to_ebitda`,
+`ev_to_revenue`, `roe`, `peg_ratio`. Two are DB-sourced from
+`financial_snapshots.extra` line items that survive today's `_extra_line_items`
+capture (`Net Debt`, `EBITDA`, `EBIT`, `Tax Provision`, `Pretax Income`,
+`Invested Capital` -- confirmed present for real portfolio tickers, not
+assumed): `net_debt_to_ebitda`, `roic`. Deliberately not `debt_to_ebitda`
+(gross Total Debt is a *consumed* balance-sheet label -- see
+`_BALANCE_CONSUMED_LABELS` -- so it is dropped before `extra` is built and is
+not recoverable from this table; Net Debt is not consumed and is the
+leverage figure actually available here) and not a conflict with the
+existing quarterly `_debt_to_equity`/`_current_ratio` -- neither reads Net
+Debt, EBITDA, EBIT, or Invested Capital, so there are two ratio pairs from
+one table with no overlapping inputs, not two implementations of the same
+ratio.
+
 Both entry points also take an optional `quote`
 (`investment_analyst_resources._fetch_latest_quote`'s result: a lightweight
 `fast_info` pull, distinct from and fresher than the `valuation` group's
@@ -80,6 +98,40 @@ def _fcf_yield(live_data: dict[str, Any]) -> float | None:
     if fcf is None or not mcap:
         return None
     return fcf / mcap
+
+
+def _valuation_num(live_data: dict[str, Any], key: str) -> float | None:
+    return _num((live_data.get("valuation") or {}).get(key))
+
+
+def _ev_to_ebitda(live_data: dict[str, Any]) -> float | None:
+    """Pass-through of the provider's own `enterpriseToEbitda` -- already
+    fetched by `fetch-stock-research-data`'s `valuation` group
+    (`VALUATION_INFO_KEYS`) but never surfaced by this skill until now. No
+    recomputation: reporting the provider's figure as-is, including when it
+    is negative (negative EBITDA), is truer to "no judgment" than silently
+    filtering it out."""
+    return _valuation_num(live_data, "enterpriseToEbitda")
+
+
+def _ev_to_revenue(live_data: dict[str, Any]) -> float | None:
+    """Pass-through of `enterpriseToRevenue`, same rationale as `_ev_to_ebitda`."""
+    return _valuation_num(live_data, "enterpriseToRevenue")
+
+
+def _roe(live_data: dict[str, Any]) -> float | None:
+    """Pass-through of `returnOnEquity`, same rationale as `_ev_to_ebitda`."""
+    return _valuation_num(live_data, "returnOnEquity")
+
+
+def _peg_ratio(live_data: dict[str, Any]) -> float | None:
+    """Prefers `trailingPegRatio` (built from realized trailing earnings
+    growth) over `pegRatio` (mixes in forward estimates) when both are
+    present, since the trailing figure is the more verifiable of the two;
+    falls back to `pegRatio` when trailing is unavailable rather than
+    reporting nothing."""
+    trailing = _valuation_num(live_data, "trailingPegRatio")
+    return trailing if trailing is not None else _valuation_num(live_data, "pegRatio")
 
 
 def _spot(live_data: dict[str, Any], quote: dict[str, Any] | None = None) -> float | None:
@@ -308,6 +360,10 @@ def _net_insider_shares(live_data: dict[str, Any]) -> float | None:
 
 LIVE_METRICS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "fcf_yield": _fcf_yield,
+    "ev_to_ebitda": _ev_to_ebitda,
+    "ev_to_revenue": _ev_to_revenue,
+    "roe": _roe,
+    "peg_ratio": _peg_ratio,
     "put_call_oi_ratio": _put_call_oi_ratio,
     "put_call_volume_ratio": _put_call_volume_ratio,
     "atm_iv_near": _atm_iv_near,
@@ -356,6 +412,61 @@ def _debt_to_equity(db_bundle: dict[str, Any]) -> float | None:
 def _current_ratio(db_bundle: dict[str, Any]) -> float | None:
     row = _latest_financial_row(db_bundle)
     return _num(row.get("current_ratio")) if row else None
+
+
+def _extra_num(row: dict | None, section: str, label: str) -> float | None:
+    """Read one raw line item out of a `financial_snapshots` row's `extra`
+    blob (`db_resources.read_financial_snapshots` already parses it from JSON
+    into a dict). `section` is `income_statement`, `balance_sheet`, or
+    `cash_flow`; `label` is the exact yfinance row label."""
+    if not row:
+        return None
+    extra = row.get("extra") or {}
+    section_data = extra.get(section) or {}
+    return _num(section_data.get(label))
+
+
+def _net_debt_to_ebitda(db_bundle: dict[str, Any]) -> float | None:
+    """Net Debt / EBITDA, both read from the latest quarter's `extra` line
+    items. Not gross Debt/EBITDA: yfinance's `Total Debt` label is consumed
+    by `_debt_to_equity`'s extraction (see `_BALANCE_CONSUMED_LABELS`) and so
+    is dropped before `extra` is built -- it is not recoverable from this
+    table. `Net Debt` is never consumed and is the leverage figure this table
+    can actually support. `None` when EBITDA is missing or non-positive,
+    since a leverage multiple over zero or negative EBITDA is not meaningful."""
+    row = _latest_financial_row(db_bundle)
+    net_debt = _extra_num(row, "balance_sheet", "Net Debt")
+    ebitda = _extra_num(row, "income_statement", "EBITDA")
+    if net_debt is None or not ebitda or ebitda <= 0:
+        return None
+    return net_debt / ebitda
+
+
+def _roic(db_bundle: dict[str, Any]) -> float | None:
+    """Return on invested capital: NOPAT / Invested Capital, both read from
+    the latest quarter's `extra` line items -- `EBIT`, `Tax Provision`,
+    `Pretax Income`, and `Invested Capital` (the last is yfinance's own
+    computed figure, not re-derived here from debt+equity-cash, since raw
+    Total Debt and Stockholders Equity are not recoverable from this table --
+    see `_net_debt_to_ebitda`). Tax rate = Tax Provision / Pretax Income is
+    not clamped to [0, 1]: an unusual quarter (a tax benefit, or a loss
+    quarter) can legitimately produce a rate outside that range, and
+    clamping would be a judgment call this function does not make. `None`
+    when Pretax Income is missing or non-positive, since the tax rate is
+    undefined for a loss quarter, or when Invested Capital is missing or
+    non-positive."""
+    row = _latest_financial_row(db_bundle)
+    ebit = _extra_num(row, "income_statement", "EBIT")
+    tax_provision = _extra_num(row, "income_statement", "Tax Provision")
+    pretax_income = _extra_num(row, "income_statement", "Pretax Income")
+    invested_capital = _extra_num(row, "balance_sheet", "Invested Capital")
+    if ebit is None or tax_provision is None or not pretax_income or pretax_income <= 0:
+        return None
+    if not invested_capital or invested_capital <= 0:
+        return None
+    tax_rate = tax_provision / pretax_income
+    nopat = ebit * (1 - tax_rate)
+    return nopat / invested_capital
 
 
 def _net_income_latest_quarter(db_bundle: dict[str, Any]) -> float | None:
@@ -412,7 +523,14 @@ def _return_over(db_bundle: dict[str, Any], days: int, quote: dict[str, Any] | N
     least as recent as the last stored close, it becomes the series'
     "today" endpoint instead of that (possibly a day or more stale) DB row
     -- ties on the same calendar date favor the quote, since it's the
-    fresher of the two."""
+    fresher of the two.
+
+    Returns `None` when history does not reach back `days` -- i.e. no point
+    exists at or before the cutoff. Falling back to the earliest available
+    point here previously made `return_30d`/`return_90d`/`return_365d`
+    silently identical whenever history was shorter than 365 days, since all
+    three windows resolved to the same earliest-point fallback instead of
+    reporting that the wider windows had insufficient history."""
     rows = (db_bundle.get("prices") or {}).get("rows") or []
     points = [
         (row["record_date"], _num(row.get("close")))
@@ -428,7 +546,9 @@ def _return_over(db_bundle: dict[str, Any], days: int, quote: dict[str, Any] | N
     latest_day, latest_close = points[-1]
     cutoff = latest_day - timedelta(days=days)
     past = [p for p in points if p[0] <= cutoff]
-    past_close = past[-1][1] if past else points[0][1]
+    if not past:
+        return None
+    past_close = past[-1][1]
     if not past_close:
         return None
     return latest_close / past_close - 1.0
@@ -437,6 +557,8 @@ def _return_over(db_bundle: dict[str, Any], days: int, quote: dict[str, Any] | N
 DB_METRICS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "debt_to_equity": _debt_to_equity,
     "current_ratio": _current_ratio,
+    "net_debt_to_ebitda": _net_debt_to_ebitda,
+    "roic": _roic,
     "net_income_latest_quarter": _net_income_latest_quarter,
     "revenue_growth_yoy": _revenue_growth_yoy,
     "return_30d": lambda db, quote=None: _return_over(db, 30, quote),

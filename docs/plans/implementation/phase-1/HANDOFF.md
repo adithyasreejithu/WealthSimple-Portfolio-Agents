@@ -114,4 +114,11 @@ All three should show success. If policy fails to load, check that `config/polic
 
 ## Ready for Phase 2
 
-The Phase 1 gate is met. Phase 2 can begin when approved. See `../../combined-investment-analyst-plan/03-phase-2-worksheet-builder.md` for the next phase's contract.
+The Phase 1 gate is met. Phase 2 can begin when approved.
+
+**Watch the numbering.** The roadmap inserted the cheap data-gap closure as its Phase 2,
+so it no longer lines up with `combined-investment-analyst-plan/`. The next phase's
+contract is the **roadmap's** Phase 2 row plus its "Phase 2 design decision — reuse
+boundary" section in `../../investment-analyst-rebuild-roadmap.md`, with the binding
+file boundary in `../phase-2/design-decisions.md`. The combined plan's
+`03-phase-2-worksheet-builder.md` is the roadmap's **Phase 3**, not this one.

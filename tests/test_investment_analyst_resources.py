@@ -711,6 +711,50 @@ class DerivedLiveMetricsTest(unittest.TestCase):
         # valuation was fetched but has no freeCashflow -> fcf_yield still None.
         self.assertIsNone(metrics["fcf_yield"])
 
+    def test_roe_and_peg_pass_through_from_shared_fixture(self):
+        # research_payload()'s valuation group already carries these two --
+        # confirms the new pass-throughs wire into the existing fixture
+        # without needing a bespoke live_data dict.
+        self.assertAlmostEqual(self.live_metrics["roe"], 1.5)
+        self.assertAlmostEqual(self.live_metrics["peg_ratio"], 2.4)
+
+
+class DerivedLiveRatioMetricsTest(unittest.TestCase):
+    """Phase 2 ratio pass-throughs -- see
+    docs/plans/implementation/phase-2/design-decisions.md. These read
+    provider-computed fields `fetch-stock-research-data` already fetches in
+    the `valuation` group (`VALUATION_INFO_KEYS`); no new live fetch."""
+
+    def test_ev_to_ebitda_and_ev_to_revenue_pass_through(self):
+        live_data = {"valuation": {"enterpriseToEbitda": 18.5, "enterpriseToRevenue": 6.2}}
+        metrics = dm.compute_live_metrics(live_data)
+        self.assertAlmostEqual(metrics["ev_to_ebitda"], 18.5)
+        self.assertAlmostEqual(metrics["ev_to_revenue"], 6.2)
+
+    def test_ev_to_ebitda_passes_through_negative_without_filtering(self):
+        # Negative EBITDA makes for a negative ratio -- that is signal, not
+        # noise to hide; "no judgment" means reporting it, not suppressing it.
+        live_data = {"valuation": {"enterpriseToEbitda": -12.0}}
+        metrics = dm.compute_live_metrics(live_data)
+        self.assertAlmostEqual(metrics["ev_to_ebitda"], -12.0)
+
+    def test_peg_ratio_prefers_trailing_over_forward_mix(self):
+        live_data = {"valuation": {"pegRatio": 2.4, "trailingPegRatio": 2.1}}
+        metrics = dm.compute_live_metrics(live_data)
+        self.assertAlmostEqual(metrics["peg_ratio"], 2.1)
+
+    def test_peg_ratio_falls_back_to_forward_mix_when_trailing_missing(self):
+        live_data = {"valuation": {"pegRatio": 2.4}}
+        metrics = dm.compute_live_metrics(live_data)
+        self.assertAlmostEqual(metrics["peg_ratio"], 2.4)
+
+    def test_missing_valuation_group_is_none_not_raise(self):
+        metrics = dm.compute_live_metrics({})
+        self.assertIsNone(metrics["ev_to_ebitda"])
+        self.assertIsNone(metrics["ev_to_revenue"])
+        self.assertIsNone(metrics["roe"])
+        self.assertIsNone(metrics["peg_ratio"])
+
 
 class DerivedDbMetricsTest(FixtureDatabaseTest):
     def test_debt_to_equity_and_current_ratio_surfaced_from_latest_row(self):
@@ -767,10 +811,171 @@ class DerivedDbMetricsTest(FixtureDatabaseTest):
         self.assertAlmostEqual(metrics["return_90d"], 200 / 180 - 1, places=6)
         self.assertAlmostEqual(metrics["return_30d"], 200 / 190 - 1, places=6)
 
+    def test_short_history_returns_none_instead_of_duplicating_the_earliest_price(self):
+        # Regression for the return_30d==90d==365d defect (Phase 2, Decision
+        # 3): history only reaches back 40 days, so return_90d/return_365d
+        # have no point at or before their cutoffs. Previously both silently
+        # fell back to the earliest available close, making them identical
+        # to each other (and possibly to return_30d) instead of reporting
+        # that the wider windows are simply unavailable.
+        ticker_id = self._seed_ticker()  # seeds one row: 2025-01-03 close=100.0 (>1 year before TODAY)
+        for offset, close in ((40, 180.0), (0, 200.0)):
+            self.connection.execute(
+                "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [ticker_id, TODAY - timedelta(days=offset), close, close, close, close, close, 10],
+            )
+        connection = self._reopen_read_only()
+        db_bundle = db_resources.read_ticker_bundle(connection, ticker_id, "PLTR")
+        # Drop the seeded 2025-01-03 row from the bundle's price rows so
+        # history genuinely starts 40 days back, matching the scenario the
+        # defect actually manifested for (a newly-added ticker).
+        db_bundle["prices"]["rows"] = [
+            row for row in db_bundle["prices"]["rows"] if row["record_date"] != date(2025, 1, 3)
+        ]
+        metrics = dm.compute_db_metrics(db_bundle)
+        # cutoff for the 30d window (TODAY-30) is still after the only
+        # available past point (TODAY-40), so it correctly resolves to that
+        # point rather than needing one exactly 30 days back.
+        self.assertAlmostEqual(metrics["return_30d"], 200 / 180 - 1, places=6)
+        self.assertIsNone(metrics["return_90d"])
+        self.assertIsNone(metrics["return_365d"])
+
     def test_empty_bundle_returns_none_not_raise(self):
         metrics = dm.compute_db_metrics({})
         for name, value in metrics.items():
             self.assertIsNone(value, f"{name} should be None on empty input, got {value!r}")
+
+
+class DerivedDbRatioMetricsTest(FixtureDatabaseTest):
+    """Phase 2 ratio functions sourced from `financial_snapshots.extra` --
+    see docs/plans/implementation/phase-2/design-decisions.md. The `extra`
+    shape below (`Net Debt`, `EBITDA`, `EBIT`, `Tax Provision`,
+    `Pretax Income`, `Invested Capital` under `balance_sheet`/
+    `income_statement`) mirrors what `_extra_line_items` actually persists --
+    confirmed against a real portfolio ticker's stored row, not assumed."""
+
+    def _insert_snapshot(self, ticker_id: int, *, extra: dict) -> None:
+        self.connection.execute(
+            "INSERT INTO financial_snapshots (ticker_id, period_end_date, extra) VALUES (?, ?, ?)",
+            [ticker_id, date(2025, 12, 31), json.dumps(extra)],
+        )
+
+    def test_net_debt_to_ebitda(self):
+        ticker_id = self._seed_ticker()
+        self._insert_snapshot(
+            ticker_id,
+            extra={
+                "balance_sheet": {"Net Debt": 40_000.0},
+                "income_statement": {"EBITDA": 10_000.0},
+            },
+        )
+        connection = self._reopen_read_only()
+        db_bundle = db_resources.read_ticker_bundle(connection, ticker_id, "PLTR")
+        metrics = dm.compute_db_metrics(db_bundle)
+        self.assertAlmostEqual(metrics["net_debt_to_ebitda"], 4.0)
+
+    def test_net_debt_to_ebitda_none_when_ebitda_non_positive(self):
+        ticker_id = self._seed_ticker()
+        self._insert_snapshot(
+            ticker_id,
+            extra={
+                "balance_sheet": {"Net Debt": 40_000.0},
+                "income_statement": {"EBITDA": -5_000.0},
+            },
+        )
+        connection = self._reopen_read_only()
+        db_bundle = db_resources.read_ticker_bundle(connection, ticker_id, "PLTR")
+        metrics = dm.compute_db_metrics(db_bundle)
+        self.assertIsNone(metrics["net_debt_to_ebitda"])
+
+    def test_roic(self):
+        ticker_id = self._seed_ticker()
+        self._insert_snapshot(
+            ticker_id,
+            extra={
+                "balance_sheet": {"Invested Capital": 100_000.0},
+                "income_statement": {
+                    "EBIT": 20_000.0,
+                    "Tax Provision": 4_000.0,
+                    "Pretax Income": 16_000.0,
+                },
+            },
+        )
+        connection = self._reopen_read_only()
+        db_bundle = db_resources.read_ticker_bundle(connection, ticker_id, "PLTR")
+        metrics = dm.compute_db_metrics(db_bundle)
+        # tax_rate = 4000/16000 = 0.25; NOPAT = 20000 * 0.75 = 15000; ROIC = 15000/100000
+        self.assertAlmostEqual(metrics["roic"], 0.15)
+
+    def test_roic_none_on_loss_quarter_pretax_income(self):
+        ticker_id = self._seed_ticker()
+        self._insert_snapshot(
+            ticker_id,
+            extra={
+                "balance_sheet": {"Invested Capital": 100_000.0},
+                "income_statement": {
+                    "EBIT": -2_000.0,
+                    "Tax Provision": -500.0,
+                    "Pretax Income": -3_000.0,
+                },
+            },
+        )
+        connection = self._reopen_read_only()
+        db_bundle = db_resources.read_ticker_bundle(connection, ticker_id, "PLTR")
+        metrics = dm.compute_db_metrics(db_bundle)
+        self.assertIsNone(metrics["roic"])
+
+    def test_roic_none_without_invested_capital(self):
+        ticker_id = self._seed_ticker()
+        self._insert_snapshot(
+            ticker_id,
+            extra={
+                "income_statement": {
+                    "EBIT": 20_000.0,
+                    "Tax Provision": 4_000.0,
+                    "Pretax Income": 16_000.0,
+                },
+            },
+        )
+        connection = self._reopen_read_only()
+        db_bundle = db_resources.read_ticker_bundle(connection, ticker_id, "PLTR")
+        metrics = dm.compute_db_metrics(db_bundle)
+        self.assertIsNone(metrics["roic"])
+
+    def test_does_not_collide_with_existing_debt_to_equity_and_current_ratio(self):
+        # Decision 2: the new ratios read Net Debt/EBITDA/EBIT/Invested
+        # Capital -- none of which `_debt_to_equity`/`_current_ratio` touch
+        # -- so both old and new metrics are populated independently from
+        # the same row without one overwriting the other.
+        ticker_id = self._seed_ticker()
+        self.connection.execute(
+            "INSERT INTO financial_snapshots (ticker_id, period_end_date, debt_to_equity, current_ratio, extra) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                ticker_id,
+                date(2025, 12, 31),
+                1.75,
+                0.86,
+                json.dumps(
+                    {
+                        "balance_sheet": {"Net Debt": 40_000.0, "Invested Capital": 100_000.0},
+                        "income_statement": {
+                            "EBITDA": 10_000.0,
+                            "EBIT": 20_000.0,
+                            "Tax Provision": 4_000.0,
+                            "Pretax Income": 16_000.0,
+                        },
+                    }
+                ),
+            ],
+        )
+        connection = self._reopen_read_only()
+        db_bundle = db_resources.read_ticker_bundle(connection, ticker_id, "PLTR")
+        metrics = dm.compute_db_metrics(db_bundle)
+        self.assertAlmostEqual(metrics["debt_to_equity"], 1.75)
+        self.assertAlmostEqual(metrics["current_ratio"], 0.86)
+        self.assertAlmostEqual(metrics["net_debt_to_ebitda"], 4.0)
+        self.assertAlmostEqual(metrics["roic"], 0.15)
 
 
 class CompletenessTraceTest(FixtureDatabaseTest):

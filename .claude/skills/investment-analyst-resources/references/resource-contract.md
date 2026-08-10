@@ -133,6 +133,13 @@ the two research tracks stay independent), computed by
 the same `fetch_stock_research_data` code):
 
 - `fcf_yield` -- `valuation.freeCashflow / valuation.marketCap`
+- `ev_to_ebitda`, `ev_to_revenue`, `roe` -- pass-through of the provider's
+  own `enterpriseToEbitda` / `enterpriseToRevenue` / `returnOnEquity`
+  (Phase 2 -- already fetched by `fetch-stock-research-data`'s `valuation`
+  group, just never surfaced here before; not recomputed, including when
+  negative)
+- `peg_ratio` -- `valuation.trailingPegRatio` when present (realized
+  trailing growth), else `valuation.pegRatio` (Phase 2)
 - `put_call_oi_ratio`, `put_call_volume_ratio` -- nearest-expiry chain, puts / calls
 - `atm_iv_near`, `atm_iv_far` -- average call/put implied vol at the strike nearest spot, nearest and farthest fetched expiry
 - `iv_skew` -- OTM put IV (~7% below spot) minus OTM call IV (~7% above spot); positive means downside protection is bid up
@@ -146,6 +153,21 @@ version, hence the distinct names:
 
 - `debt_to_equity`, `current_ratio` -- surfaced from the latest
   `financial_snapshots` row (**quarterly**, not v1's annual figure)
+- `net_debt_to_ebitda` -- `Net Debt / EBITDA` read from the latest quarter's
+  `extra` line items (Phase 2). Deliberately **not** gross Debt/EBITDA:
+  yfinance's `Total Debt` label is consumed by `_debt_to_equity`'s
+  extraction and so is dropped before `extra` is built (see
+  `financial_snapshots_extractor.py`'s `_BALANCE_CONSUMED_LABELS`); `Net
+  Debt` is never consumed and is the leverage figure this table can
+  actually support. `None` when EBITDA is missing or non-positive.
+- `roic` -- NOPAT / Invested Capital, both read from the latest quarter's
+  `extra` line items (`EBIT`, `Tax Provision`, `Pretax Income`, `Invested
+  Capital` -- the last is yfinance's own computed figure, not re-derived
+  from debt+equity-cash, since raw Total Debt/Stockholders Equity are not
+  recoverable from this table). Tax rate is not clamped to `[0, 1]`; an
+  unusual quarter can legitimately fall outside that range and clamping
+  would be a judgment call this metric does not make. `None` on a
+  loss-quarter Pretax Income or missing Invested Capital. (Phase 2)
 - `revenue_growth_yoy` -- same-quarter-prior-year revenue growth from
   `financial_snapshots` (quarterly cadence, not v1's annual-over-annual)
 - `net_income_latest_quarter` -- latest quarter's net income (v1's
@@ -153,11 +175,20 @@ version, hence the distinct names:
   purpose so nothing conflates the two)
 - `return_30d`, `return_90d`, `return_365d` -- from `historical_records`,
   same algorithm as v1's `_price_return` against the DB series instead of a
-  live pull
+  live pull. Each window is `None`, not a repeat of a shorter window's
+  value, when history does not reach back that far (fixed in Phase 2 -- see
+  docs/plans/implementation/phase-2/design-decisions.md, Decision 3).
 
 Every metric is `None`, never raised, when its inputs are missing (no
 options chain, no analyst coverage, insufficient price history, etc.) --
 this is a normal, expected outcome for many tickers, not a data failure.
+
+Per-security **technicals** (moving averages, drawdown, volatility, relative
+strength vs `XEQT.TO`, beta/alpha) are a separate module,
+`src/security_technicals.py`, not part of this skill's `derived_metrics.py`
+-- see docs/plans/implementation/phase-2/design-decisions.md for why. It
+operates on the same `db_bundle["prices"]["rows"]` shape but is not yet
+wired into this skill's digest/bundle output.
 
 ## Completeness trace (`trace`, in digest + bundle, plus a log line)
 
