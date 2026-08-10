@@ -25,6 +25,17 @@ Three deliberate choices, each with a reason worth keeping:
   run as incomplete and bury the gaps that matter. `src/skill_trace.py`'s
   docstring documents this exact failure mode -- only `ok + missing` forms the
   completeness denominator.
+
+- **The technicals never fetch, but an optional live quote does.** SMA,
+  drawdown, volatility, relative strength, and beta/alpha are all computed
+  from stored `historical_records` only -- staleness there is a gap to
+  report, not a reason to reach for yfinance. But the artifact's `latest_close`
+  is therefore only as fresh as the last pipeline ingestion, which can be a
+  stale "current price" if an agent invokes this mid-day. `_fetch_latest_quote`
+  closes that one gap with the same lightweight `fast_info` pull
+  `investment_analyst_resources._fetch_latest_quote` already uses, attached as
+  a clearly separate `quote` field so it is never confused with the
+  history-derived technicals. Opt out with `--no-quote`.
 """
 
 from __future__ import annotations
@@ -45,6 +56,7 @@ import read_price_history as price_reader  # noqa: E402
 import security_technicals  # noqa: E402
 import skill_trace  # noqa: E402
 from config import DATABASE_PATH, DEFAULT_BENCHMARK_SYMBOL  # noqa: E402
+from yfinance_extractor import _build_session, _create_ticker, _require_yfinance  # noqa: E402
 
 SKILL_NAME = "security-technicals"
 SCHEMA = "security-technicals.v1"
@@ -98,12 +110,53 @@ def _price_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _fetch_latest_quote(provider_symbol: str | None) -> dict[str, Any] | None:
+    """A lightweight "current price" pull via yfinance's `fast_info`.
+
+    Mirrors `investment_analyst_resources._fetch_latest_quote` -- same
+    rationale (stored history is only as fresh as the last pipeline run;
+    this closes that one gap with a single cheap call), same discipline
+    (never raises; a quote failure is a gap, never fatal to the technicals
+    that already computed). Trimmed to the fields this skill's digest
+    actually reports; day/year range is `investment-analyst-resources`
+    territory, not a price-technicals concern.
+    """
+    if not provider_symbol:
+        return None
+    try:
+        yf_module = _require_yfinance()
+        session = _build_session()
+        client = _create_ticker(yf_module, provider_symbol, session)
+        info = client.fast_info
+        price = info.get("lastPrice")
+        if price is None:
+            return None
+        return {
+            "price": float(price),
+            "as_of": datetime.now(),
+            "source": "fast_info",
+            "previous_close": info.get("previousClose"),
+        }
+    except Exception:  # a quote failure is a gap, never fatal to the run
+        return None
+
+
+def _quote_summary(quote: dict[str, Any] | None, no_quote: bool) -> dict[str, Any] | None:
+    """The artifact's `quote` field: `{"skipped": True}` when opted out,
+    `None` when a fetch was attempted and failed, otherwise the quote."""
+    if no_quote:
+        return {"skipped": True}
+    return quote
+
+
 def build_trace(
     ticker: str,
     rows: list[dict[str, Any]],
     benchmark_symbol: str,
     benchmark_rows: list[dict[str, Any]],
     technicals: dict[str, Any],
+    quote: dict[str, Any] | None = None,
+    no_quote: bool = True,
 ) -> skill_trace.Trace:
     """Grade this run's completeness.
 
@@ -112,6 +165,14 @@ def build_trace(
     every metric that failed did so because the history it needs does not
     exist, which is `not_applicable`, not `missing`. Nothing in this domain is
     ever graded `missing`, and that asymmetry is the whole point.
+
+    `quote` draws a third distinction: skipped-by-request (`--no-quote`) is
+    `not_applicable` -- nothing was ever attempted -- while a fetch that ran
+    and came back empty (no verified provider mapping, or yfinance failed) is
+    a real `missing`, because the quote was genuinely obtainable in principle.
+    `no_quote` defaults `True` here (not the CLI's own default) so callers
+    that build a trace directly -- every existing test in this module -- keep
+    grading the quote as not-attempted unless they pass live quote data.
     """
     trace = skill_trace.Trace(skill=SKILL_NAME, subject=ticker, kind="security")
 
@@ -126,6 +187,18 @@ def build_trace(
     for name, section, key in _TECHNICAL_FIELDS:
         (computed if _metric_value(technicals, section, key) is not None else unavailable).append(name)
     trace.add("technicals", ok=computed, not_applicable=unavailable)
+
+    quote_fields = ("price", "as_of")
+    if no_quote:
+        trace.add("quote", not_applicable=list(quote_fields))
+    elif quote is None:
+        trace.add("quote", missing=list(quote_fields))
+    else:
+        trace.add(
+            "quote",
+            ok=[f for f in quote_fields if quote.get(f) is not None],
+            missing=[f for f in quote_fields if quote.get(f) is None],
+        )
     return trace
 
 
@@ -136,6 +209,8 @@ def build_result(
     benchmark_symbol: str,
     benchmark_rows: list[dict[str, Any]],
     today: date,
+    quote: dict[str, Any] | None = None,
+    no_quote: bool = True,
 ) -> dict[str, Any]:
     """Compute and assemble one ticker's artifact payload.
 
@@ -163,6 +238,8 @@ def build_result(
     for name, section, key in _TECHNICAL_FIELDS:
         if _metric_value(technicals, section, key) is None:
             gaps.append(f"{name}: insufficient history")
+    if not no_quote and quote is None:
+        gaps.append("current-price quote unavailable")
 
     return {
         "schema": SCHEMA,
@@ -175,6 +252,7 @@ def build_result(
         "prices": _price_summary(rows),
         "benchmark_prices": _price_summary(benchmark_rows),
         "technicals": technicals,
+        "quote": _quote_summary(quote, no_quote),
         "gaps": gaps,
     }
 
@@ -246,6 +324,7 @@ def process_ticker(
     *,
     today: date,
     no_trace: bool,
+    no_quote: bool,
     output: Path | None,
     pretty: bool,
     trace_log_path: Path | None,
@@ -257,11 +336,16 @@ def process_ticker(
     identity = price_reader.resolve_ticker(connection, ticker)
     rows = price_reader.read_security_prices(connection, identity["ticker_id"]) if identity else []
 
-    payload = build_result(ticker, identity, rows, benchmark_symbol, benchmark_rows, today)
+    quote: dict[str, Any] | None = None
+    if identity is not None and not no_quote:
+        provider_symbol = price_reader.resolve_provider_symbol(connection, identity["ticker_id"])
+        quote = _fetch_latest_quote(provider_symbol)
+
+    payload = build_result(ticker, identity, rows, benchmark_symbol, benchmark_rows, today, quote, no_quote)
 
     trace: skill_trace.Trace | None = None
     if not no_trace and identity is not None:
-        trace = build_trace(ticker, rows, benchmark_symbol, benchmark_rows, payload["technicals"])
+        trace = build_trace(ticker, rows, benchmark_symbol, benchmark_rows, payload["technicals"], quote, no_quote)
         if workspace_status is not None:
             trace.workspace = skill_trace.WorkspaceOutcome(
                 status=workspace_status, run_id=run_id, skip_reason=skip_reason
@@ -332,7 +416,8 @@ def _resolve_run(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Per-security price technicals from stored DuckDB history. Reads only; never fetches."
+        description="Per-security price technicals from stored DuckDB history. Technicals are read-only; "
+                     "an optional live current-price quote may be fetched (see --no-quote)."
     )
     parser.add_argument("--ticker", nargs="+", required=True, help="Pipeline ticker symbol(s).")
     parser.add_argument(
@@ -357,10 +442,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip the completeness trace (no digest 'trace' key, no log line written).",
     )
     parser.add_argument(
+        "--no-quote", action="store_true",
+        help="Skip the live current-price quote (fast_info). Technicals themselves never fetch either "
+             "way -- this only controls the one optional network call, on by default.",
+    )
+    parser.add_argument(
         "--trace-log-path", type=Path, default=None,
         help="Override the shared trace log path (testing). The .jsonl sidecar follows it.",
     )
-    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    parser.add_argument("--pretty", action="store_true", default=True, help="Pretty-print JSON output (default: true).")
+    parser.add_argument("--no-pretty", dest="pretty", action="store_false", help="Compact JSON output (single line).")
     args = parser.parse_args(argv)
     if args.output and len(args.ticker) > 1:
         parser.error("--output requires exactly one --ticker")
@@ -384,7 +475,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         outputs = [
             process_ticker(
                 ticker, connection, benchmark_symbol, benchmark_rows,
-                today=today, no_trace=args.no_trace, output=args.output, pretty=args.pretty,
+                today=today, no_trace=args.no_trace, no_quote=args.no_quote,
+                output=args.output, pretty=args.pretty,
                 trace_log_path=args.trace_log_path,
                 run_dir=run_dir, run_id=run_id,
                 workspace_status=workspace_status, skip_reason=skip_reason,
