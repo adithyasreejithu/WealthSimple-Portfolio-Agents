@@ -105,6 +105,15 @@ TRACE_WARNING_THRESHOLD: float = float(
 POLICY_VERSION: str = str(_POLICY.get("version") or "v1.0")
 
 
+def get_mode_section_map() -> dict[str, Any]:
+    """`investment-analysis-policy.yml`'s `mode_section_map` -- the scope
+    mapper's (`workspace.investment_worksheet.build_analysis_scope`, Phase 3)
+    sole source of truth for translating a run `mode` into section/evidence-
+    domain lists. Exposed here rather than read a second time so there is one
+    loaded copy of the policy file, not two."""
+    return _POLICY.get("mode_section_map") or {}
+
+
 # --- shared vocabulary ---------------------------------------------------
 
 Confidence = Literal["high", "medium", "low"]

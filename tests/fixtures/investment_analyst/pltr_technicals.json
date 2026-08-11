@@ -1,0 +1,56 @@
+{
+  "schema": "security-technicals.v1",
+  "ticker": "PLTR",
+  "as_of": "2026-08-10",
+  "benchmark": "XEQT.TO",
+  "resolved": true,
+  "prices": {
+    "count": 504,
+    "start": "2024-08-12",
+    "end": "2026-08-08",
+    "latest_close": 187.42
+  },
+  "benchmark_prices": {
+    "count": 504,
+    "start": "2024-08-12",
+    "end": "2026-08-08",
+    "latest_close": 41.18
+  },
+  "technicals": {
+    "moving_averages": {"latest_close": 187.42, "sma_50d": 172.10, "sma_200d": 149.83},
+    "max_drawdown": {"max_drawdown": -0.3142},
+    "volatility": {"volatility": 0.5218, "daily_volatility": 0.0329},
+    "relative_strength": {"excess_return": 0.4471, "ticker_return": 0.6183, "benchmark_return": 0.1712},
+    "beta_alpha": {"overlap_days": 501, "beta": 1.8402, "alpha": 0.3915, "tracking_error": 0.4820, "information_ratio": 0.9276}
+  },
+  "quote": {
+    "price": 189.10,
+    "as_of": "2026-08-10T14:32:01",
+    "source": "fast_info",
+    "previous_close": 187.42
+  },
+  "gaps": [],
+  "trace": {
+    "skill": "security-technicals",
+    "subject": "PLTR",
+    "kind": null,
+    "completeness_pct": 100.0,
+    "fields_ok": 8,
+    "fields_missing": 0,
+    "fields_graded": 8,
+    "fields_not_applicable": 0,
+    "domains_ok": 4,
+    "domains_partial": 0,
+    "domains_failed": 0,
+    "domains_not_applicable": 0,
+    "missing": [],
+    "not_applicable": [],
+    "domains": {
+      "prices": {"ok": ["history"], "missing": [], "not_applicable": []},
+      "benchmark": {"ok": ["history"], "missing": [], "not_applicable": []},
+      "technicals": {"ok": ["moving_averages", "max_drawdown", "volatility", "relative_strength", "beta_alpha"], "missing": [], "not_applicable": []},
+      "quote": {"ok": ["price", "as_of"], "missing": [], "not_applicable": []}
+    },
+    "workspace": {"status": "attached", "run_id": "test-run", "skip_reason": null}
+  }
+}

@@ -1,0 +1,256 @@
+{
+  "schema": "investment-analyst-resources.v1",
+  "ticker": "PLTR",
+  "provider_symbol": "PLTR",
+  "asset_class": "stock",
+  "as_of": "2026-08-10",
+  "earnings_window": false,
+  "freshness": {
+    "prices": {"stale": false, "last": "2026-08-08"},
+    "earnings": {"stale": false, "last": "2026-08-05"},
+    "financials": {"stale": false, "last": "2026-08-05"},
+    "dividends": {"stale": false, "last": "2026-08-01"},
+    "classification": {"stale": false, "last": "2026-08-05"},
+    "positions": {"stale": false, "last": "2026-08-10"}
+  },
+  "refreshed": {},
+  "db": {
+    "position": {
+      "quantity": 30.0,
+      "book_value_cad": 3200.50,
+      "realized_gain_cad": 0.0,
+      "computed_at": "2026-08-10T00:00:00Z"
+    },
+    "ledger_summary": {
+      "first_purchase_date": "2025-01-15",
+      "latest_purchase_date": "2026-03-02",
+      "number_of_buys": 4,
+      "number_of_sells": 0
+    },
+    "prices": {
+      "rows": [],
+      "count": 504,
+      "start": "2024-08-12",
+      "end": "2026-08-08",
+      "latest_close": 187.42,
+      "period_return_pct": 12.3,
+      "week52_low": 95.10,
+      "week52_high": 210.55
+    },
+    "financials": [
+      {
+        "period_end_date": "2025-09-30",
+        "revenue": 726000000,
+        "net_income": 143000000,
+        "eps": 0.06,
+        "gross_margin": 0.80,
+        "operating_margin": 0.16,
+        "debt_to_equity": 0.04,
+        "current_ratio": 5.9,
+        "free_cash_flow": 149000000,
+        "extra": {
+          "income_statement": {"EBIT": 118000000, "EBITDA": 155000000, "Tax Provision": 18000000, "Pretax Income": 158000000},
+          "balance_sheet": {"Invested Capital": 3400000000, "Net Debt": -1900000000}
+        },
+        "fetched_at": "2025-11-05T12:00:00Z"
+      },
+      {
+        "period_end_date": "2025-12-31",
+        "revenue": 761000000,
+        "net_income": 158000000,
+        "eps": 0.07,
+        "gross_margin": 0.80,
+        "operating_margin": 0.17,
+        "debt_to_equity": 0.04,
+        "current_ratio": 6.1,
+        "free_cash_flow": 161000000,
+        "extra": {
+          "income_statement": {"EBIT": 129000000, "EBITDA": 168000000, "Tax Provision": 20000000, "Pretax Income": 172000000},
+          "balance_sheet": {"Invested Capital": 3550000000, "Net Debt": -2050000000}
+        },
+        "fetched_at": "2026-02-10T12:00:00Z"
+      },
+      {
+        "period_end_date": "2026-03-31",
+        "revenue": 799000000,
+        "net_income": 167000000,
+        "eps": 0.07,
+        "gross_margin": 0.81,
+        "operating_margin": 0.17,
+        "debt_to_equity": 0.03,
+        "current_ratio": 6.4,
+        "free_cash_flow": 172000000,
+        "extra": {
+          "income_statement": {"EBIT": 136000000, "EBITDA": 178000000, "Tax Provision": 21000000, "Pretax Income": 179000000},
+          "balance_sheet": {"Invested Capital": 3700000000, "Net Debt": -2200000000}
+        },
+        "fetched_at": "2026-05-06T12:00:00Z"
+      },
+      {
+        "period_end_date": "2026-06-30",
+        "revenue": 843000000,
+        "net_income": 181000000,
+        "eps": 0.08,
+        "gross_margin": 0.81,
+        "operating_margin": 0.18,
+        "debt_to_equity": 0.03,
+        "current_ratio": 6.6,
+        "free_cash_flow": 188000000,
+        "extra": {
+          "income_statement": {"EBIT": 149000000, "EBITDA": 193000000, "Tax Provision": 23000000, "Pretax Income": 191000000},
+          "balance_sheet": {"Invested Capital": 3860000000, "Net Debt": -2400000000}
+        },
+        "fetched_at": "2026-08-05T12:00:00Z"
+      }
+    ],
+    "earnings": [
+      {
+        "report_date": "2026-05-05",
+        "period": "Q1 2026",
+        "eps_estimate": 0.065,
+        "eps_actual": 0.07,
+        "revenue_estimate": 780000000,
+        "revenue_actual": 799000000,
+        "surprise_pct": 7.7,
+        "fetched_at": "2026-05-06T12:00:00Z"
+      },
+      {
+        "report_date": "2026-08-05",
+        "period": "Q2 2026",
+        "eps_estimate": 0.075,
+        "eps_actual": 0.08,
+        "revenue_estimate": 820000000,
+        "revenue_actual": 843000000,
+        "surprise_pct": 6.7,
+        "fetched_at": "2026-08-05T12:00:00Z"
+      }
+    ],
+    "dividends": {"declared": [], "received": {}},
+    "stock_details": {"sector": "Technology", "industry": "Software - Infrastructure"},
+    "etf_details": null,
+    "classification": {
+      "primary_group": "growth",
+      "confidence": "high",
+      "generated_at": "2026-08-05T00:00:00Z"
+    },
+    "portfolio_context": {
+      "role": "Growth",
+      "weight_pct": 4.4,
+      "position_market_value": 5622.60,
+      "cost_basis_cad": 3200.50,
+      "unrealized_gain_cad": 2422.10,
+      "unrealized_gain_pct": 75.7,
+      "account_type": "TFSA",
+      "price_source": "live_quote"
+    }
+  },
+  "live": {
+    "overview": {"longBusinessSummary": "Palantir builds software platforms for data integration and analytics.", "fullTimeEmployees": 3800},
+    "valuation": {
+      "currentPrice": 187.42,
+      "marketCap": 412000000000,
+      "enterpriseValue": 405000000000,
+      "trailingPE": 210.6,
+      "forwardPE": 165.3,
+      "pegRatio": 3.4,
+      "trailingPegRatio": 3.1,
+      "priceToBook": 38.2,
+      "priceToSalesTrailing12Months": 34.1,
+      "enterpriseToEbitda": 148.2,
+      "enterpriseToRevenue": 33.9,
+      "freeCashflow": 720000000,
+      "operatingCashflow": 780000000,
+      "returnOnEquity": 0.42,
+      "returnOnAssets": 0.11,
+      "trailingEps": 0.89,
+      "forwardEps": 1.13
+    },
+    "analyst": {"recommendationKey": "hold", "numberOfAnalystOpinions": 22, "targetMeanPrice": 175.0},
+    "options": {},
+    "news": [{"title": "Palantir wins new government contract", "publisher": "Reuters"}],
+    "insider": {},
+    "institutional": {"institutionalHoldersPct": 0.42},
+    "funds": {}
+  },
+  "derived": {
+    "fcf_yield": 0.011,
+    "ev_to_ebitda": 148.2,
+    "ev_to_revenue": 33.9,
+    "roe": 0.42,
+    "peg_ratio": 3.1,
+    "put_call_oi_ratio": null,
+    "put_call_volume_ratio": null,
+    "atm_iv_near": null,
+    "atm_iv_far": null,
+    "iv_skew": null,
+    "max_oi_call_strike": null,
+    "max_oi_put_strike": null,
+    "upgrades_90d": 2,
+    "downgrades_90d": 0,
+    "net_revisions_365d": 5,
+    "net_insider_shares": null,
+    "debt_to_equity": 0.03,
+    "current_ratio": 6.6,
+    "net_debt_to_ebitda": -12.44,
+    "roic": 0.192,
+    "net_income_latest_quarter": 181000000,
+    "revenue_growth_yoy": 0.34,
+    "return_30d": 3.2,
+    "return_90d": 18.4,
+    "return_365d": 61.8
+  },
+  "quote": {
+    "price": 189.10,
+    "as_of": "2026-08-10T14:32:01",
+    "source": "fast_info",
+    "previous_close": 187.42,
+    "day_high": 190.20,
+    "day_low": 186.55,
+    "year_high": 210.55,
+    "year_low": 95.10
+  },
+  "trace": {
+    "skill": "investment-analyst-resources",
+    "subject": "PLTR",
+    "kind": "stock",
+    "completeness_pct": 88.9,
+    "fields_ok": 32,
+    "fields_missing": 4,
+    "fields_graded": 36,
+    "fields_not_applicable": 8,
+    "domains_ok": 10,
+    "domains_partial": 1,
+    "domains_failed": 0,
+    "domains_not_applicable": 2,
+    "missing": ["derived.financials.current_ratio", "derived.insider.net_insider_shares", "live.insider"],
+    "not_applicable": [
+      "etf_details.fund_family", "etf_details.yield", "etf_details.expense_ratio", "etf_details.aum", "etf_details.nav",
+      "derived.options.put_call_oi_ratio", "derived.options.put_call_volume_ratio", "derived.options.atm_iv_near",
+      "derived.options.atm_iv_far", "derived.options.iv_skew", "derived.options.max_oi_call_strike", "derived.options.max_oi_put_strike",
+      "live.options", "live.funds"
+    ],
+    "domains": {
+      "position": {"ok": ["quantity", "book_value_cad", "realized_gain_cad", "computed_at"], "missing": [], "not_applicable": []},
+      "ledger_summary": {"ok": ["first_purchase_date", "latest_purchase_date", "number_of_buys", "number_of_sells"], "missing": [], "not_applicable": []},
+      "portfolio_context": {"ok": ["role", "weight_pct", "position_market_value", "cost_basis_cad", "unrealized_gain_cad", "account_type"], "missing": [], "not_applicable": []},
+      "prices": {"ok": ["latest_close", "period_return_pct", "week52_low", "week52_high"], "missing": [], "not_applicable": []},
+      "financials": {"ok": ["latest_period_end", "latest_revenue", "latest_net_income", "latest_eps"], "missing": [], "not_applicable": []},
+      "earnings": {"ok": ["last_reported"], "missing": [], "not_applicable": []},
+      "dividends": {"ok": ["declared_count", "total_received_cad"], "missing": [], "not_applicable": []},
+      "classification": {"ok": ["primary_group", "confidence", "generated_at"], "missing": [], "not_applicable": []},
+      "stock_details": {"ok": ["sector", "industry"], "missing": [], "not_applicable": []},
+      "etf_details": {"ok": [], "missing": [], "not_applicable": ["fund_family", "yield", "expense_ratio", "aum", "nav"]},
+      "derived.options": {"ok": [], "missing": [], "not_applicable": ["put_call_oi_ratio", "put_call_volume_ratio", "atm_iv_near", "atm_iv_far", "iv_skew", "max_oi_call_strike", "max_oi_put_strike"]},
+      "derived.analyst": {"ok": ["upgrades_90d", "downgrades_90d", "net_revisions_365d"], "missing": [], "not_applicable": []},
+      "derived.insider": {"ok": [], "missing": ["net_insider_shares"], "not_applicable": []},
+      "derived.valuation": {"ok": ["fcf_yield"], "missing": [], "not_applicable": []},
+      "derived.financials": {"ok": ["debt_to_equity", "net_income_latest_quarter", "revenue_growth_yoy"], "missing": ["current_ratio"], "not_applicable": []},
+      "derived.prices": {"ok": ["return_30d", "return_90d", "return_365d"], "missing": [], "not_applicable": []},
+      "live": {"ok": ["overview", "valuation", "analyst", "news", "institutional"], "missing": ["insider"], "not_applicable": ["options", "funds"]},
+      "quote": {"ok": ["price", "as_of"], "missing": [], "not_applicable": []}
+    },
+    "workspace": {"status": "attached", "run_id": "test-run", "skip_reason": null}
+  },
+  "errors": {},
+  "gaps": ["derived.financials.current_ratio: missing", "live.insider: missing", "live.funds: missing"]
+}

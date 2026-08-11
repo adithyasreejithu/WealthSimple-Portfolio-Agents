@@ -22,6 +22,8 @@
 !dashboard/web/**
 !.claude/
 !.claude/**
+!config/
+!config/**
 !pyproject.toml
 __pycache__/
 *.pyc*
