@@ -391,6 +391,21 @@ class RunDirTestCase(unittest.TestCase):
         if mutate_after:
             artifact.write_text('{"value": "mutated after registration"}', encoding="utf-8")
 
+    def _register_worksheet(self, *, relpath: str = "calculations/TEST-worksheet.json") -> dict:
+        """Writes a real file at the fixture's `worksheet_ref.path` and
+        returns `{"path": relpath, "hash": "sha256:..."}` -- `check_worksheet_ref`
+        checks the file exists and its live hash matches, so a payload built
+        from `build_valid_thesis_payload()`'s placeholder path/hash must
+        override `worksheet_ref` with this to stay valid once `run_dir` is
+        supplied."""
+        worksheet_path = self.run_dir / relpath
+        worksheet_path.parent.mkdir(parents=True, exist_ok=True)
+        worksheet_path.write_bytes(b'{"schema": "investment-worksheet.v1"}')
+        return {
+            "path": relpath,
+            "hash": "sha256:" + evidence_module.content_hash(worksheet_path),
+        }
+
 
 class EvidenceCitationResolutionTest(RunDirTestCase):
     def test_fabricated_evidence_id_fails(self):
@@ -429,8 +444,9 @@ class ValidateThesisEndToEndTest(RunDirTestCase):
     def test_valid_thesis_with_registered_evidence_and_scope_is_valid(self):
         self._register("ev_1")
         self._register("ev_2")
+        worksheet_ref = self._register_worksheet()
         result = validate_thesis(
-            build_valid_thesis_payload(),
+            build_valid_thesis_payload(worksheet_ref=worksheet_ref),
             run_dir=self.run_dir,
             scope=build_valid_scope_payload(),
             domain_status={"financials": "ok", "earnings": "ok", "valuation": "ok"},
