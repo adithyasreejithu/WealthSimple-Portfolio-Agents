@@ -277,6 +277,81 @@ class DatabaseTest(unittest.TestCase):
             connection.execute("SELECT COUNT(*) FROM v_trade_events").fetchone()[0], 0
         )
 
+    def test_version_fourteen_schema_is_upgraded_and_adds_security_status_table(self):
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute("DROP TABLE security_status")
+        connection.execute(
+            "UPDATE schema_metadata SET schema_version = 14 WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        )
+
+        created = database.initialize_database(self.db_path)
+
+        version = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE component = ?",
+            [database.SCHEMA_COMPONENT],
+        ).fetchone()[0]
+        self.assertFalse(created)
+        self.assertEqual(version, database.DATABASE_SCHEMA_VERSION)
+        self.assertTrue(database.is_database_active(connection))
+        table_names = database._get_table_names(connection)
+        self.assertIn("security_status", table_names)
+        # The new table must be writable after the migration.
+        ticker_id = connection.execute(
+            """
+            INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+            VALUES ('OUST', 'NYSE', 'USD', 'Ouster, Inc.', 'stock')
+            RETURNING ticker_id
+            """
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO security_status (ticker_id, declared_status, rationale, declared_at, declared_by)
+            VALUES (?, 'wishlist', 'watching for entry', CURRENT_TIMESTAMP, 'cli')
+            """,
+            [ticker_id],
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM security_status").fetchone()[0], 1
+        )
+        # Regression: the terminal-block edit must still recreate the view.
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM v_trade_events").fetchone()[0], 0
+        )
+
+    def test_security_status_rejects_a_declared_status_outside_the_check_constraint(self):
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        ticker_id = connection.execute(
+            """
+            INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+            VALUES ('OUST', 'NYSE', 'USD', 'Ouster, Inc.', 'stock')
+            RETURNING ticker_id
+            """
+        ).fetchone()[0]
+
+        with self.assertRaises(duckdb.ConstraintException):
+            connection.execute(
+                """
+                INSERT INTO security_status (ticker_id, declared_status, declared_at, declared_by)
+                VALUES (?, 'owned', CURRENT_TIMESTAMP, 'cli')
+                """,
+                [ticker_id],
+            )
+
+    def test_security_status_requires_a_known_ticker(self):
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+
+        with self.assertRaises(duckdb.ConstraintException):
+            connection.execute(
+                """
+                INSERT INTO security_status (ticker_id, declared_status, declared_at, declared_by)
+                VALUES (999999, 'wishlist', CURRENT_TIMESTAMP, 'cli')
+                """
+            )
+
     def test_trade_events_view_is_recreated_on_every_startup(self):
         database.initialize_database(self.db_path)
         connection = database.get_shared_connection(self.db_path)

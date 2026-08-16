@@ -15,10 +15,18 @@ AWAITING_INPUT = "awaiting_input"
 AWAITING_HUMAN_REVIEW = "awaiting_human_review"
 COMPLETED = "completed"
 FAILED = "failed"
+# A working pipeline meeting a real, expected data gap -- distinct from
+# FAILED (a bug/exception). `analysis_scope_schema.md`'s `critical_gap_policy`
+# names this exact status: a `stop`-policy run whose required evidence
+# doesn't clear the TRACE blocking threshold lands here instead of drafting
+# an investment-thesis.v1 artifact. Reopens to IN_PROGRESS once a human
+# supplies the missing evidence (an override, not a retry).
+INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 ARCHIVED = "archived"
 
 STATUSES: tuple[str, ...] = (
-    CREATED, IN_PROGRESS, AWAITING_INPUT, AWAITING_HUMAN_REVIEW, COMPLETED, FAILED, ARCHIVED,
+    CREATED, IN_PROGRESS, AWAITING_INPUT, AWAITING_HUMAN_REVIEW, COMPLETED, FAILED,
+    INSUFFICIENT_EVIDENCE, ARCHIVED,
 )
 
 # Terminal states a run may be archived from. A run is never deleted, so
@@ -26,18 +34,21 @@ STATUSES: tuple[str, ...] = (
 # because "keep it, but move it out of the active set" is a valid outcome for
 # an abandoned run. Only `archived` itself has no exit.
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    CREATED: frozenset({IN_PROGRESS, AWAITING_INPUT, FAILED, ARCHIVED}),
-    IN_PROGRESS: frozenset({AWAITING_INPUT, AWAITING_HUMAN_REVIEW, COMPLETED, FAILED}),
+    CREATED: frozenset({IN_PROGRESS, AWAITING_INPUT, FAILED, INSUFFICIENT_EVIDENCE, ARCHIVED}),
+    IN_PROGRESS: frozenset(
+        {AWAITING_INPUT, AWAITING_HUMAN_REVIEW, COMPLETED, FAILED, INSUFFICIENT_EVIDENCE}
+    ),
     AWAITING_INPUT: frozenset({IN_PROGRESS, FAILED, ARCHIVED}),
     AWAITING_HUMAN_REVIEW: frozenset({IN_PROGRESS, COMPLETED, FAILED}),
     COMPLETED: frozenset({ARCHIVED}),
     FAILED: frozenset({IN_PROGRESS, ARCHIVED}),
+    INSUFFICIENT_EVIDENCE: frozenset({IN_PROGRESS, ARCHIVED}),
     ARCHIVED: frozenset(),
 }
 
 # Reaching one of these means no further work is expected without an explicit
 # reopen. Used by `validate` to decide whether an empty manifest is a problem.
-TERMINAL_STATUSES = frozenset({COMPLETED, FAILED, ARCHIVED})
+TERMINAL_STATUSES = frozenset({COMPLETED, FAILED, INSUFFICIENT_EVIDENCE, ARCHIVED})
 
 
 class InvalidTransitionError(WorkspaceError):

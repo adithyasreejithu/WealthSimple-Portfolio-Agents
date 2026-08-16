@@ -276,9 +276,13 @@ def _register_calculation_evidence(
 ) -> None:
     """Record the calculation in the run's evidence registry.
 
-    Registered as `derived_calculation` rather than a data-bundle type: the
+    Registered as `security_technicals` rather than a data-bundle type: the
     artifact lives in `calculations/`, and the registry entry exists to give it
     a content hash and provenance, not to claim it came from outside.
+    `security_status` and `policy_worksheet` (this run's other two
+    `calculations/`-only artifacts) each get their own distinct evidence
+    type too -- the three used to share `derived_calculation`, which let
+    `investment_worksheet._find_latest_evidence` match the wrong artifact.
 
     Best-effort -- a registry failure must not discard a calculation that
     succeeded, matching `investment_analyst_resources._register_bundle_evidence`.
@@ -296,7 +300,7 @@ def _register_calculation_evidence(
         record = evidence_module.register(
             run_dir,
             run_id=run_id,
-            evidence_type="derived_calculation",
+            evidence_type="security_technicals",
             source_name="duckdb",
             status=status,
             artifact=artifact_path,

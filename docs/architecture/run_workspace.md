@@ -47,7 +47,10 @@ workspace/
 │       │                           (first producer: the security-technicals skill)
 │       ├── agent_outputs/          one envelope per specialist stage
 │       ├── final/                  decision proposals
-│       ├── tmp/                    the only disposable content
+│       ├── tmp/                    disposable agent drafts (cleared at archive)
+│       ├── cache/                  disposable bulk payloads (cleared on a
+│       │                           terminal set-status; never registered
+│       │                           as evidence -- see "Retention" below)
 │       └── audit_log.jsonl         append-only event history
 └── archive/
     └── 2026-08/<run_id>/
@@ -191,6 +194,22 @@ obtain.
 agent output and proposal at any nesting depth for order/fill/broker fields,
 failing the run if it finds one. This is decision support, not trading.
 
+The one deliberate, narrow exception is `DecisionProposal.order_guidance`
+(`models.OrderGuidance`, Phase 11): advisory order-mechanics guidance --
+`order_type` (Market/Limit/Stop-Limit/Stop-Market) plus one to three cited
+price levels, for a live buy/sell action only. It does not weaken this
+guarantee: `trade_executed`/`human_approval_required` remain pinned exactly
+as above, and its field names (`order_type`, `reference_price`,
+`trigger_price`, `limit_price`) were checked against the scanner's key list
+above and against `analysis_models.FORBIDDEN_FIELD_NAMES` (the *thesis*-side
+ban, invoked only from `InvestmentThesis`'s own validator) and collide with
+neither. Every cited price is re-derived against the actual thesis/policy
+worksheet on disk and rejected if it doesn't match
+(`decision_validation.check_order_guidance_prices_are_grounded`) -- the same
+"never invent" discipline above, applied to prices instead of evidence. See
+`docs/agents/investment-portfolio-manager/architecture.md`'s "Order
+guidance" section for the full mechanism.
+
 ## How information moves
 
 ```text
@@ -201,9 +220,9 @@ run_metadata.json + empty registry + audit log
 evidence/<artifacts> + sources.jsonl rows (present AND missing)
     ↓  build-manifest
 context_manifest.yaml   ← the contract: what may be used, what is absent
-    ↓  (deferred) specialist stages
+    ↓  specialist stages (investment-analyst; market-researcher deferred)
 agent_outputs/*.json    ← must cite registered evidence IDs
-    ↓  (deferred) portfolio stage
+    ↓  portfolio stage (investment-portfolio-manager)
 final/*.json            ← a proposal, never an order
     ↓  human review
 completed → archive
@@ -257,8 +276,9 @@ but they answer different questions and the split is worth keeping clean:
 | Reproducible from the run alone? | No — re-fetching may return something different | Yes — same inputs, same output, always |
 | First producer | `investment-analyst-resources` | `security-technicals` |
 
-A calculation artifact is still registered in `sources.jsonl` (with
-`evidence_type: derived_calculation`) so it gets a content hash, an audit
+A calculation artifact is still registered in `sources.jsonl` (with its own
+`evidence_type` -- `security_technicals`, `security_status`, or
+`policy_worksheet`, one per producer) so it gets a content hash, an audit
 event, and a place in the manifest — the registry tracks *every* artifact's
 provenance, not only fetched ones. What the directory split preserves is the
 ability to answer "what did this run learn from the outside world?" without
@@ -296,13 +316,54 @@ active run → validation → human review → completion
 ```
 
 **Runs are never deleted.** `archive-run` moves the directory, with its
-structure intact, into `workspace/archive/<YYYY-MM>/<run_id>/`. Only `tmp/` is
-discarded. An existing archive slot is never overwritten.
+structure intact, into `workspace/archive/<YYYY-MM>/<run_id>/`. Only `tmp/`
+and `cache/` are discarded. An existing archive slot is never overwritten.
 
 A run that fails validation is refused by default, so archiving cannot be used
 to hide a broken run — but `--no-validate` archives it anyway, because an
 abandoned or failed run must still be *retained*. There is no automatic
 deletion in this phase.
+
+### `cache/`: bulk payloads, purged before archive
+
+`evidence/` never shrinks — `evidence.register` computes a content hash and
+`validation.validate_run` re-verifies it forever, so a registered artifact can
+never be deleted without turning every future `run validate` into a permanent
+error. Combined with "runs are never deleted," a bulk raw payload embedded in
+a registered artifact would sit at full size in `workspace/runs/` forever.
+`cache/` (`src/workspace/cache.py`) exists to hold exactly that kind of
+payload — full price history, financial statements, raw options/news
+blobs — **outside** the evidence registry, so it can be deleted safely.
+
+Two rules make this work:
+
+- **A `cache/` payload is never registered as evidence.** Only the small
+  bundle that references it (via a `{"cached": true, "cache_path": "cache/..."}`
+  pointer — see `investment_analyst_resources.build_bundle`) is registered
+  and lands in `evidence/`. A stage that needs the full payload back (the
+  worksheet builder) resolves the pointer by reading the file, the same way
+  it already reads the bundle itself — never a fetch, never a database read.
+- **Purge is automatic, not something an agent remembers to call.** `run
+  set-status` purges `cache/` the moment a run enters `completed`, `failed`,
+  or `insufficient_evidence` (`state.TERMINAL_STATUSES`); `run archive`
+  purges it too, covering a run archived directly from a non-terminal status.
+  `awaiting_human_review` is deliberately excluded — an analyst's cache must
+  survive for the portfolio-manager stage that reads the same run next.
+  `run gc --older-than-days N` sweeps `workspace/runs/` for a run that
+  crashed before ever reaching a terminal status.
+
+Each purge writes `cache/cache_manifest.json` — `{filename, sha256, bytes,
+source, fetched_at, purged_at}` per deleted file — so the payload's
+provenance is detectable after deletion, even though the bytes are not.
+**This is a conscious non-reproducibility trade:** a purged run's thesis can
+no longer be re-derived from its original inputs, only re-fetched at
+today's prices. Purge is idempotent — calling it on an already-purged or
+never-populated `cache/` is a clean no-op.
+
+A run shared by a ticker fan-out has **one status for the whole run**, not
+one per ticker. A caller must not set a terminal status until every ticker
+in the fan-out has finished, or the first to finish purges cache the others
+still need.
 
 ## Knowledge-base promotion
 
@@ -324,15 +385,20 @@ knowledge-base structure is created inside `workspace/`.
 
 **Working:** run creation with rollback, the state machine, the evidence
 registry, manifest generation, full validation, the audit log, archiving, the
-CLI, `investment-analyst-resources` writing evidence into a run, and
-`security-technicals` writing calculation artifacts into `calculations/`.
+ephemeral `cache/` layer with automatic purge and a `run gc` sweeper, the
+CLI, `investment-analyst-resources` writing evidence into a run (and its bulk
+`db`/`live` payloads into `cache/`), `security-technicals` writing
+calculation artifacts into `calculations/`, the shared, read-only
+`security-status` skill resolving a ticker's owned/wishlist/avoid/retired
+status for both specialist agents, the `investment-analyst` agent writing
+`investment-thesis.v1` into `agent_outputs/`, and the
+`investment-portfolio-manager` agent (Phase 11) — backed by the deterministic
+`policy_worksheet.py` layer reading `Knowledge-Base/ref/policy_v1_1.yaml` and
+`src/analytics.py`'s exposure functions — writing `DecisionProposal` into
+`final/`.
 
-**Contracts only, no reasoning behind them:** `AgentOutput` and
-`DecisionProposal`. They exist so the stages built later have a target, and so
-validation can already enforce evidence citation and the no-trade rule.
-
-**Deferred:** market-researcher / investment-analyst / portfolio-manager
-agents; the policy engine (runs record it as `unavailable`); knowledge-base
+**Deferred:** the market-researcher agent (`market_analyst_resources` data
+layer exists; no judgment stage built on top of it yet); knowledge-base
 promotion; migrating the `stock-data-prep → stock-analyst → kb-intake` chain.
 
 `run_metadata.available_components` records which of these were reachable for

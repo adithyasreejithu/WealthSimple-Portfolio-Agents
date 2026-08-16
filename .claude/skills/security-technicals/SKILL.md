@@ -57,9 +57,10 @@ Every invocation attaches to a run workspace, creating one if it does not
 exist. The artifact lands in that run's **`calculations/`** directory — not
 `evidence/` — because it is derived arithmetic over data the run already has,
 not a fact obtained from outside. It is registered in the evidence registry as
-`derived_calculation` so its provenance and content hash are tracked, an
-audit event is appended, and the completeness trace is written to
-`logs/SkillTrace.txt`/`.jsonl`.
+`security_technicals` (its own type, distinct from `security_status` and
+`policy_worksheet` — the run's other two `calculations/`-only producers) so
+its provenance and content hash are tracked, an audit event is appended, and
+the completeness trace is written to `logs/SkillTrace.txt`/`.jsonl`.
 
 `context_manifest.yaml` lists the artifact under `calculation_paths`, which is
 how a downstream stage finds it without being told the filename.

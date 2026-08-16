@@ -77,7 +77,7 @@ Updated Thesis edit). There is no `portfolio/decisions/` or
 | Skill | Purpose |
 |---|---|
 | `kb-search` | Front-matter-aware search (`kb_search.py`) and wiki validation/index-rebuild (`validate_kb.py`). |
-| `kb-sync-portfolio` | Regenerates the two generated portfolio pages from `exports/portfolio-classification/portfolio-classification.json`. |
+| `kb-sync-portfolio` | Regenerates the two generated portfolio pages from `exports/portfolio-classification/portfolio-classification.json`, scoped to owned holdings only -- `classify-portfolio` also classifies declared-wishlist tickers (`fields.ownership_status`), which this skill filters back out before rendering, since these pages describe current holdings. |
 | `kb-intake-document` | Converts an external document to markdown via `markitdown`, files it under `sources/`, optionally scaffolds a companion note. |
 | `kb-update-thesis` | Deterministic edges of the thesis lifecycle: create/validate/set-status, plus append-only log helpers. |
 

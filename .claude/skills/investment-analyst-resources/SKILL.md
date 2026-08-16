@@ -28,6 +28,44 @@ Run `uv run python .claude/skills/investment-analyst-resources/scripts/investmen
   see `references/resource-contract.md`. `--no-quote` is independent of
   `--no-live`: omitting it keeps the live current-price quote even in a
   `--no-live` (DB-only) run, since that's the case it matters most for.
+- `--register-wishlist` / `--wishlist-rationale TEXT` — declare an
+  unregistered or undeclared ticker a wishlist research candidate
+  automatically instead of failing with a gap naming the manual `database
+  status` command. See **Subject scope** below.
+
+## Subject scope: portfolio vs. research
+
+Every ticker resolves to a `subject.status`: `owned` (a real holding, past or
+present), `wishlist` (a declared research candidate), `avoid`/`retired` (a
+deliberate declaration that is not a research candidate), or `unknown` (no
+`tickers` row, or one with no declaration). `owned` and `wishlist` are
+**refreshable** — this skill persists real prices, earnings, dividends,
+financials, and stock/ETF details for both, scoped through `market_data.
+get_market_targets`'s `include_research` widening. `avoid`/`retired`/
+`unknown` are not: the bundle falls back to a live-only pull with a gap
+naming the fix.
+
+**A ticker with no transaction history is not a dead end.** Register it as a
+research candidate first:
+
+```powershell
+uv run python src/app.py database status --ticker MP --set wishlist --rationale "rare earths research candidate"
+```
+
+or pass `--register-wishlist` to this script and it does that step for you
+(refresh phase only — `--mode gate`/`--mode read` never write). Either way,
+`position`/`ledger_summary`/`portfolio_context` stay `null` for a research
+subject — those are ownership-only concepts, not a gap. `classification` is
+different: `classify-portfolio` now classifies declared-wishlist tickers
+alongside owned holdings (`fields.ownership_status: "wishlist"`), so a
+research subject's `classification` is `null` only until that skill has run
+and synced for it — once it has, this bundle returns the real
+`primary_group` the same as for an owned ticker.
+`prices`/`financials`/`earnings`/`stock_details`/`etf_details` get the same
+real, persisted data an owned ticker gets. `pipeline` and the standalone
+`yfinance-sync`/`earnings-dividends-sync`/`financial-snapshots-sync`
+commands never widen to research tickers on their own — a declared-wishlist
+ticker refreshes **only on demand**, through this skill.
 
 ## Run workspace: default-on
 
@@ -74,19 +112,24 @@ an actionable retry message rather than a raw DuckDB lock error.
 
 ## Sources at a glance
 
-| Data | Live or DB? | Notes |
-|---|---|---|
-| Positions, ledger | DB | portfolio-wide, not refreshed by this skill |
-| Prices | DB | refreshable |
-| Financials | DB | quarterly, refreshable |
-| Earnings | DB | refreshable |
-| Dividends | DB | refreshable |
-| Classification (role, account type) | DB (generated file) | portfolio-wide, not refreshed by this skill |
-| Stock/ETF details | DB | synced by the core pipeline, not this skill |
-| Weight, market value, cost basis, unrealized gain | DB + live price | computed fresh every run |
-| Current price quote | Live | every run unless `--no-quote` |
-| Overview, valuation, analyst, options, news, insider, institutional, funds | Live | every run unless `--no-live`; never persisted |
-| Derived metrics, completeness trace | Computed | pure math, no fetch |
+| Data | Live or DB? | Scope | Notes |
+|---|---|---|---|
+| Positions, ledger | DB | portfolio only | not refreshed by this skill |
+| Prices | DB | portfolio + research | refreshable |
+| Financials | DB | portfolio + research | quarterly, refreshable |
+| Earnings | DB | portfolio + research | refreshable |
+| Dividends | DB | portfolio + research | refreshable |
+| Classification (role, account type) | DB (generated file) | portfolio only | portfolio-wide, not refreshed by this skill |
+| Stock/ETF details | DB | portfolio + research | synced by `sync_market_data` (core pipeline or this skill's refresh) |
+| Weight, market value, cost basis, unrealized gain | DB + live price | portfolio only | computed fresh every run |
+| Current price quote | Live | any subject | every run unless `--no-quote` |
+| Overview, valuation, analyst, options, news, insider, institutional, funds | Live | any subject | every run unless `--no-live`; never persisted |
+| Derived metrics, completeness trace | Computed | any subject | pure math, no fetch |
+
+"Portfolio + research" means the domain refreshes for both an owned ticker
+and a declared-wishlist one; "portfolio only" is a concept a research subject
+never has, by design (see **Subject scope**, below). "Refreshable" always
+means "by this skill, on demand" — never the routine `pipeline` run.
 
 Full cadence rules, refresh commands, and field-level detail are in
 [resource-contract.md](references/resource-contract.md).

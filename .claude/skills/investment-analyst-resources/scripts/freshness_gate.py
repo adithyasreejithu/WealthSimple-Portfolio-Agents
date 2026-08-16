@@ -147,6 +147,13 @@ def compute_freshness(
     `connection` must already be open (read-only) -- this function never
     opens or closes one, so callers can share a single connection across
     several tickers in one `--mode gate` invocation.
+
+    A ticker is refreshable when it is owned *or* declared a research
+    candidate (`security_status.declared_status` in `market_data.
+    RESEARCH_STATUSES`, currently just `wishlist`) -- see `db_resources.
+    resolve_subject` for the owned > declared > unknown precedence. An
+    unregistered ticker (no `tickers` row) is not a silent failure: the gap
+    names the exact `database status` command to register it.
     """
     today = run_date or date.today()
     now = datetime.combine(today, datetime.min.time())
@@ -155,22 +162,36 @@ def compute_freshness(
     if identity is None:
         return {
             "ticker": ticker.upper(), "resolved": False, "owned": False,
-            "gaps": [f"'{ticker}' not found in tickers table"],
+            "subject": {
+                "registered": False, "owned": False, "declared_status": None,
+                "rationale": None, "declared_at": None, "status": "unknown", "scope": "research",
+            },
+            "gaps": [
+                f"'{ticker}' is not registered -- declare it first: "
+                f"uv run python src/app.py database status --ticker {ticker.upper()} --set wishlist"
+            ],
         }
 
     ticker_id = identity["ticker_id"]
     provider_symbol = identity["provider_symbol"]
+    subject = db_resources.resolve_subject(connection, ticker)
+    owned = subject["owned"]
     first_owned = db_resources.resolve_ownership(connection, ticker_id)
-    owned = first_owned is not None
+    is_research = subject["declared_status"] in market_data.RESEARCH_STATUSES
 
     gaps: list[str] = []
     if provider_symbol is None:
         gaps.append("no verified Yahoo provider_symbol -- live top-up and DB refresh unavailable")
-    if not owned:
-        gaps.append("ticker is not owned (no transactions) -- market_data sync is portfolio-scoped to owned tickers, so DB refresh is unavailable; falling back to a live-only bundle")
+    if not owned and not is_research:
+        gaps.append(
+            f"ticker status is '{subject['status']}' (not owned, not a declared research "
+            "candidate) -- DB refresh is unavailable; falling back to a live-only bundle. "
+            f"Run `uv run python src/app.py database status --ticker {ticker.upper()} "
+            "--set wishlist` to enable persisted research data."
+        )
 
     domains: dict[str, Any] = {}
-    can_refresh = owned and provider_symbol is not None
+    can_refresh = provider_symbol is not None and (owned or is_research)
     if can_refresh:
         domains["prices"] = _prices_domain(connection, ticker_id, today)
         domains["earnings"] = _fetched_at_domain(connection, "earnings_events", ticker_id, EARNINGS_CADENCE_DAYS, now)
@@ -198,6 +219,7 @@ def compute_freshness(
         "asset_class": "etf" if identity["security_type"] == "etf" else "stock",
         "owned": owned,
         "first_owned_date": first_owned,
+        "subject": subject,
         "earnings_window": earnings_window,
         "domains": domains,
         "due_domains": due_domains,
@@ -209,6 +231,8 @@ def compute_freshness(
 def refresh_domains(
     due_by_domain: dict[str, list[str]],
     db_path: str | Path = DATABASE_PATH,
+    *,
+    include_research: bool = True,
 ) -> dict[str, Any]:
     """The sole write path: batch-refresh each due domain for the symbols that need it.
 
@@ -217,31 +241,42 @@ def refresh_domains(
     batched call (market_data's sync functions accept multiple symbols), so
     an N-ticker `--mode refresh` invocation still does exactly one sync call
     per due domain, not N.
+
+    `include_research` defaults to True: this skill *is* the on-demand
+    research path, and the symbols passed in already cleared `compute_
+    freshness`'s owned-or-research `can_refresh` gate, so widening
+    `get_market_targets`'s scope here does not admit anything beyond what
+    was explicitly requested. `pipeline`'s own calls into `market_data.py`
+    never go through this function, so routine syncs are unaffected.
     """
     results: dict[str, Any] = {}
     try:
         prices_symbols = due_by_domain.get("prices") or []
         if prices_symbols:
-            result = market_data.sync_market_data(db_path, symbols=prices_symbols)
+            result = market_data.sync_market_data(
+                db_path, symbols=prices_symbols, include_research=include_research
+            )
             results["prices"] = {"tickers": result.tickers, "rows": result.rows, "error": result.error}
 
         earnings_symbols = due_by_domain.get("earnings") or []
         if earnings_symbols:
             result = market_data.sync_earnings_dividends(
-                db_path, symbols=earnings_symbols, skip_dividends=True
+                db_path, symbols=earnings_symbols, skip_dividends=True, include_research=include_research
             )
             results["earnings"] = {"tickers": result.tickers, "rows": result.earnings_rows, "error": result.error}
 
         dividend_symbols = due_by_domain.get("dividends") or []
         if dividend_symbols:
             result = market_data.sync_earnings_dividends(
-                db_path, symbols=dividend_symbols, skip_earnings=True
+                db_path, symbols=dividend_symbols, skip_earnings=True, include_research=include_research
             )
             results["dividends"] = {"tickers": result.tickers, "rows": result.dividend_rows, "error": result.error}
 
         financial_symbols = due_by_domain.get("financials") or []
         if financial_symbols:
-            result = market_data.sync_financial_snapshots(db_path, symbols=financial_symbols)
+            result = market_data.sync_financial_snapshots(
+                db_path, symbols=financial_symbols, include_research=include_research
+            )
             results["financials"] = {"tickers": result.tickers, "rows": result.snapshot_rows, "error": result.error}
     finally:
         close_connection()

@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / ".claude" / "skills" / "read-portfolio-classificat
 sys.path.insert(0, str(ROOT / ".claude" / "skills" / "fetch-yfinance-classification-data" / "scripts"))
 
 from config import BASE_DIR, DATABASE_PATH
-from read_classification_data import read_classification_data
+from read_classification_data import read_classification_data, read_wishlist_classification_data
 from fetch_classification_data import fetch_classification_data, mode_fields
 from portfolio_classifier import classify_holding, load_portfolio_grouping_bundle
 
@@ -85,7 +85,12 @@ def classify_portfolio(
     db_path: str | Path = DATABASE_PATH,
     fetcher: Callable[[Iterable[Mapping[str, Any]]], list[dict[str, Any]]] = fetch_classification_data,
 ) -> dict[str, Any]:
-    records = read_classification_data(db_path)
+    # Owned holdings plus declared wishlist tickers -- classifying both in one
+    # pass is what makes the full-replace sync in
+    # `database_command.upload_portfolio_classifications` safe (see that
+    # function's docstring): nothing legitimately classified is ever missing
+    # from a current export.
+    records = read_classification_data(db_path) + read_wishlist_classification_data(db_path)
     requests = build_enrichment_requests(records)
     enrichment = fetcher(requests) if requests else []
     merge_enrichment(records, enrichment)

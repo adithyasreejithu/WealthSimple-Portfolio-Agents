@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import state as state_module
 
@@ -234,6 +234,30 @@ class AgentOutput(StrictModel):
 
 # --- decision proposal -------------------------------------------------
 
+# Phase 11: the five portfolio actions the Portfolio Manager may propose for
+# an *owned* security. `Watchlist`/`Avoid` (decision-framework.yml's other
+# two actions) describe a not-held research outcome, not a portfolio action,
+# and are deliberately absent here -- they stay the legacy stock-analyst /
+# kb-intake path's vocabulary.
+PortfolioAction = Literal["Buy", "Hold", "Trim", "Sell", "Add"]
+
+# A second, narrower vocabulary for a *not-currently-owned* security --
+# Phase 0's vocabulary decision (`docs/plans/implementation/phase-0/HANDOFF.md`)
+# chose to reuse `PortfolioAction` unchanged for owned positions rather than
+# invent a synonym set; this is an addition alongside that decision, not a
+# reopening of it. Which vocabulary applies is re-derived from the on-disk
+# policy worksheet's `subject.currently_held`
+# (`decision_validation.check_action_matches_ownership_vocabulary`), never
+# left to the agent's own judgment.
+#
+# - Buy  -- policy checks pass and the thesis is attractive: enter now.
+# - Watch -- thesis is attractive but a policy check fails (e.g. the group is
+#   over its allocation cap): monitor for headroom, not a reason to pass.
+# - Wait -- policy checks pass but valuation/timing isn't attractive right
+#   now: a real candidate, just not today's price.
+# - Pass -- the thesis itself is unattractive.
+WishlistAction = Literal["Buy", "Watch", "Wait", "Pass"]
+
 
 class PolicyCheck(StrictModel):
     name: str
@@ -241,19 +265,118 @@ class PolicyCheck(StrictModel):
     detail: str | None = None
 
 
+class ArtifactRef(StrictModel):
+    """A path+hash pair identifying a specific artifact this run already
+    produced. Mirrors `analysis_models.WorksheetRef` -- re-declared here
+    rather than imported so this base schema module has no dependency on a
+    later-phase one -- and is re-checked byte-for-byte at save time the same
+    way (`decision_validation.check_thesis_ref` /
+    `check_policy_worksheet_ref`)."""
+
+    path: str
+    hash: str
+
+    @field_validator("hash")
+    @classmethod
+    def _hash_is_sha256(cls, value: str) -> str:
+        if not value.startswith("sha256:"):
+            raise ValueError(f"hash must be a sha256:... digest, got {value!r}")
+        return value
+
+
+class DecisionSizing(StrictModel):
+    """The Portfolio Manager's sizing recommendation, expressed as a weight
+    delta rather than shares or a dollar amount -- share/dollar fields are
+    what `analysis_models.FORBIDDEN_FIELD_NAMES` bans elsewhere in this
+    codebase, and a weight is what `src/analytics.py`'s exposure functions
+    and `policy_v1_1.yaml`'s caps are already expressed in."""
+
+    current_weight_pct: float | None = None
+    proposed_weight_pct: float | None = None
+    rationale: str
+
+
+# Phase 11 extension: advisory order-mechanics guidance. Market/Limit/
+# Stop-Limit/Stop-Market cover both buy-side (Buy/Add) and sell-side
+# (Trim/Sell) actions.
+OrderType = Literal["Market", "Limit", "Stop-Limit", "Stop-Market"]
+
+
+class PriceLevel(StrictModel):
+    """One price, always traced back to a value this run already computed --
+    never a new estimate. `source` is a dotted citation path rooted at either
+    `thesis.` (the cited `investment-thesis.v1` artifact -- e.g.
+    `thesis.valuation.methods[fcf_yield].resulting_equity_value_per_share.low`,
+    `thesis.scenarios.bear.fair_value_per_share`) or `policy_worksheet.` (the
+    cited policy worksheet -- e.g.
+    `policy_worksheet.price_and_market_context.week52_low`,
+    `policy_worksheet.price_and_market_context.latest_close`; this worksheet
+    carries no moving averages -- those live only in the `security-technicals`
+    artifact, which `DecisionProposal` does not cite).
+    `decision_validation.check_order_guidance_prices_are_grounded` re-derives
+    this path against the actual documents on disk and rejects a `price` that
+    doesn't match what `source` resolves to -- the citation is not free text,
+    it is checked.
+    """
+
+    price: float
+    source: str
+    rationale: str
+
+
+class OrderGuidance(StrictModel):
+    """Advisory order-mechanics guidance only -- never an instruction to
+    trade. This is the one deliberate, narrow exception to "no trade or
+    order language" in this schema family, and it does not weaken that
+    guarantee: `DecisionProposal.trade_executed`/`human_approval_required`
+    remain pinned, and every field name here was checked against both
+    forbidden-field scanners in this codebase and collides with neither --
+    `analysis_models.FORBIDDEN_FIELD_NAMES` (includes `order_type`) is
+    invoked only from `InvestmentThesis`'s own validator, never against a
+    `DecisionProposal`; `validation.FORBIDDEN_EXECUTION_KEYS` (which does
+    scan every `final/*.json` artifact, including this one) contains
+    `order_id`/`executed_at`/`execution_id`/`fill_price`/`fill_quantity`/
+    `filled_at`/`broker_*`/`fill_*`, none of which this model uses. See
+    `validation.py`'s comment beside `FORBIDDEN_EXECUTION_KEYS` for the other
+    half of this note.
+    """
+
+    order_type: OrderType
+    reference_price: PriceLevel
+    trigger_price: PriceLevel | None = None
+    limit_price: PriceLevel | None = None
+    notes: str | None = None
+
+    @model_validator(mode="after")
+    def _required_prices_for_order_type(self) -> "OrderGuidance":
+        if self.order_type in ("Stop-Limit", "Stop-Market") and self.trigger_price is None:
+            raise ValueError(f"{self.order_type} requires trigger_price")
+        if self.order_type in ("Limit", "Stop-Limit") and self.limit_price is None:
+            raise ValueError(f"{self.order_type} requires limit_price")
+        return self
+
+
 class DecisionProposal(StrictModel):
     """A proposal, never an order. `trade_executed` is pinned to False by the
     type system; `validation.py` additionally scans for broker/fill/order
     fields anywhere in the run, so the guarantee does not rest on this model
-    alone."""
+    alone. `order_guidance` (see `OrderGuidance`) is the one deliberate,
+    narrow, advisory exception to "no order language" -- it never changes
+    that guarantee."""
 
     schema_version: Literal["1.0"] = SCHEMA_VERSION
     proposal_id: str
     run_id: str
+    generated_at: datetime
     subject: Subject
-    proposed_action: str
+    proposed_action: PortfolioAction | WishlistAction
+    sizing: DecisionSizing
+    order_guidance: OrderGuidance | None = None
     confidence: str | None = None
     summary: str
+    thesis_ref: ArtifactRef
+    policy_worksheet_ref: ArtifactRef
+    policy_version: str
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
     policy_checks: list[PolicyCheck] = Field(default_factory=list)

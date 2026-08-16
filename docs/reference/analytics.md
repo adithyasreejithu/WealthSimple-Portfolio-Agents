@@ -600,7 +600,8 @@ before trusting a number at face value:
 | `missing_cost_basis` | Cost basis is zero or negative for a currently held position. |
 | `suspicious_gain` | `|unrealized gain %|` exceeds `SUSPICIOUS_UNREALIZED_GAIN_THRESHOLD` (95%) — usually a stale or wrong price/quantity, not a real gain/loss. |
 | `missing_sector` | No `stock_details.sector` recorded for a stock holding. |
-| `missing_classification` | No `portfolio_classifications` row, or the classifier flagged the ticker for manual review. |
+| `unclassified_holding` | No `portfolio_classifications` row for a currently held ticker (warning -- distorts group allocation until the next classify run). |
+| `classification_review` | A `portfolio_classifications` row exists but the classifier flagged the ticker for manual review. |
 | `position_engine_buy_missing_cost` | A BUY event had no cost amount from any source; quantity is correct but book value is understated. |
 | `position_engine_sell_missing_proceeds` | A SELL event had no proceeds amount; realized gain for that sale is approximated at cost (zero gain/loss). |
 | `position_engine_oversell_clamped` | Recorded sells exceeded recorded buys; the position engine clamped quantity at zero instead of going negative. |

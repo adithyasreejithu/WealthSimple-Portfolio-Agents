@@ -23,7 +23,9 @@ from . import audit as audit_module
 from . import evidence as evidence_module
 from . import manifest as manifest_module
 from . import state as state_module
-from .models import AgentOutput, DecisionProposal, Request, RunMetadata
+from . import decision_validation as decision_validation_module
+from . import thesis_validation as thesis_validation_module
+from .models import AgentOutput, Request, RunMetadata
 from .paths import (
     METADATA_FILENAME,
     REQUEST_FILENAME,
@@ -34,6 +36,14 @@ from .paths import (
 # Any of these appearing as a key anywhere in an agent output or proposal means
 # something is representing a placed order. The system is research-only, so
 # their presence fails the run rather than being ignored.
+#
+# `order_type`/`limit_price`/`trigger_price`/`reference_price` are
+# deliberately absent from this list: `models.DecisionProposal.order_guidance`
+# (`models.OrderGuidance`) uses them as advisory-only fields (Phase 11), never
+# as claims that an order was placed -- `trade_executed`/
+# `human_approval_required` remain the actual executable-intent guard. Do not
+# "fix" this by adding them; see `OrderGuidance`'s docstring for the full
+# reasoning.
 FORBIDDEN_EXECUTION_KEYS = frozenset(
     {"order_id", "executed_at", "execution_id", "fill_price", "fill_quantity",
      "filled_at", "broker_order_id", "broker_account", "broker_reference"}
@@ -190,6 +200,26 @@ def validate_run(run_dir: Path) -> dict[str, Any]:
             if load_error:
                 errors.append(load_error)
                 continue
+
+            if isinstance(raw, dict) and raw.get("schema") == "investment-thesis.v1":
+                # A separate typed artifact (`InvestmentThesis`, not
+                # `AgentOutput`) -- the generic parse below would hard-fail on
+                # every thesis, since the two shapes share no required fields.
+                scope, domain_status, warning = thesis_validation_module.scope_from_worksheet_ref(
+                    run_dir, raw
+                )
+                thesis_result = thesis_validation_module.validate_thesis(
+                    raw, run_dir=run_dir, scope=scope, domain_status=domain_status
+                )
+                errors.extend(f"agent_outputs/{path.name}: {msg}" for msg in thesis_result["errors"])
+                warning_list = thesis_result["warnings"] + ([warning] if warning else [])
+                warnings.extend(f"agent_outputs/{path.name}: {msg}" for msg in warning_list)
+                for forbidden in find_execution_keys(raw):
+                    errors.append(
+                        f"agent_outputs/{path.name}: forbidden trade-execution field {forbidden!r}"
+                    )
+                continue
+
             try:
                 output = AgentOutput.model_validate(raw)
             except ValidationError as exc:
@@ -215,10 +245,9 @@ def validate_run(run_dir: Path) -> dict[str, Any]:
                 continue
             if not isinstance(raw, dict) or "proposed_action" not in raw:
                 continue
-            try:
-                DecisionProposal.model_validate(raw)
-            except ValidationError as exc:
-                errors.append(f"final/{path.name}: {exc.error_count()} schema error(s): {exc}")
+            decision_result = decision_validation_module.validate_decision(raw, run_dir=run_dir)
+            errors.extend(f"final/{path.name}: {msg}" for msg in decision_result["errors"])
+            warnings.extend(f"final/{path.name}: {msg}" for msg in decision_result["warnings"])
             for forbidden in find_execution_keys(raw):
                 errors.append(f"final/{path.name}: forbidden trade-execution field {forbidden!r}")
 

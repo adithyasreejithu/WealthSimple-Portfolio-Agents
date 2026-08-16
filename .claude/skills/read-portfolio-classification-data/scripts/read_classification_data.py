@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from config import DATABASE_PATH, DATABASE_SCHEMA_VERSION
 from database import REQUIRED_TABLES, SCHEMA_COMPONENT
+from market_data import RESEARCH_STATUSES
 from position_engine import FINGERPRINT_COMPONENT, compute_fingerprint
 
 
@@ -157,6 +158,7 @@ def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[s
         record["market_cap"] = None
         record["user_thesis"] = None
         record["target_weight_percent"] = None
+        record["ownership_status"] = "owned"
         market_value = record.get("position_market_value")
         cost_basis = record.get("cost_basis")
         record["unrealized_gain_loss_percent"] = (
@@ -174,21 +176,109 @@ def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[s
         # is still sourced from an unmatched email trade, not yet confirmed by
         # a statement or activities export (see ingestion_and_reconciliation.md).
         record["has_provisional_activity"] = bool(record.get("provisional_quantity"))
-        record["field_provenance"] = {
-            key: (
-                "derived"
-                if key in {
-                    "position_market_value", "current_weight_percent",
-                    "has_provisional_activity", "unrealized_gain_loss_percent",
-                }
-                else "database"
-            )
-            for key, value in record.items()
-            if key != "field_provenance" and not _is_missing(value)
-        }
-        for key, value in record.items():
-            if key != "field_provenance" and _is_missing(value):
-                record["field_provenance"][key] = "missing"
+        record["field_provenance"] = _build_field_provenance(record)
+    return [_json_value(record) for record in records]
+
+
+def _build_field_provenance(record: dict[str, Any]) -> dict[str, str]:
+    """Shared by both `read_classification_data` and
+    `read_wishlist_classification_data`: `"derived"` for the small set of
+    Python-computed fields, `"database"` for everything else populated,
+    `"missing"` for anything absent."""
+    provenance = {
+        key: (
+            "derived"
+            if key in {
+                "position_market_value", "current_weight_percent",
+                "has_provisional_activity", "unrealized_gain_loss_percent",
+            }
+            else "database"
+        )
+        for key, value in record.items()
+        if key != "field_provenance" and not _is_missing(value)
+    }
+    for key, value in record.items():
+        if key != "field_provenance" and _is_missing(value):
+            provenance[key] = "missing"
+    return provenance
+
+
+def read_wishlist_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[str, Any]]:
+    """Read declared-wishlist tickers (`security_status.declared_status` in
+    `RESEARCH_STATUSES`) using the same read-only connection discipline as
+    `read_classification_data`, so `classify_portfolio()` can classify them
+    alongside owned holdings instead of requiring a one-off script.
+
+    Excludes any ticker currently owned (`position_snapshots.quantity <> 0`)
+    even if it still carries a stale `wishlist` declaration -- ownership
+    always wins over any declaration (see `database._create_security_status_table`'s
+    docstring and `analytics.resolve_security_status`), so such a ticker is
+    already covered by `read_classification_data` and must not be classified
+    twice. Every ownership-derived field (`quantity`, `cost_basis`,
+    `position_market_value`, ledger/dividend/account summaries, ...) is a
+    fixed "not owned" default -- a wishlist ticker has no position to compute
+    them from, by construction, not because data is missing.
+
+    Does not call `_validate_positions_fresh`: this function reads
+    `position_snapshots` only as a live exclusion filter, never for cached
+    position pricing, so a stale ledger fingerprint (which
+    `read_classification_data` must guard against for its owned-holding
+    pricing) has no bearing on correctness here.
+    """
+    path = Path(db_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Configured database does not exist: {path}")
+    connection = duckdb.connect(str(path), read_only=True)
+    try:
+        _validate_database(connection)
+        placeholders = ", ".join("?" for _ in RESEARCH_STATUSES)
+        rows = connection.execute(
+            f"""
+            SELECT t.ticker_id, t.ticker_symbol ticker, t.security_name company_name,
+                   t.security_type asset_class, t.currency, t.financial_currency, t.exchange,
+                   sd.sector, sd.industry, ed.fund_family, ed.yield dividend_yield,
+                   ed.expense_ratio, ed.aum, ed.nav, ed.top_holdings, ed.sector_weights,
+                   m.provider_symbol
+            FROM tickers t
+            JOIN security_status ss USING (ticker_id)
+            LEFT JOIN stock_details sd USING (ticker_id)
+            LEFT JOIN etf_details ed USING (ticker_id)
+            LEFT JOIN ticker_provider_mappings m ON m.ticker_id = t.ticker_id
+                AND m.provider = 'yahoo' AND m.verification_status = 'verified'
+            WHERE ss.declared_status IN ({placeholders})
+              AND t.ticker_id NOT IN (
+                  SELECT ticker_id FROM position_snapshots WHERE quantity <> 0
+              )
+            ORDER BY ticker, exchange
+            """,
+            list(RESEARCH_STATUSES),
+        )
+        columns = [item[0] for item in rows.description]
+        records = [dict(zip(columns, row)) for row in rows.fetchall()]
+    finally:
+        connection.close()
+
+    for record in records:
+        record["etf_category"] = None
+        record["market_cap"] = None
+        record["user_thesis"] = None
+        record["target_weight_percent"] = None
+        record["ownership_status"] = "wishlist"
+        record["quantity"] = 0
+        record["cost_basis"] = None
+        record["provisional_quantity"] = 0
+        record["position_market_value"] = None
+        record["current_weight_percent"] = None
+        record["unrealized_gain_loss_percent"] = None
+        record["has_provisional_activity"] = False
+        record["data_quality_flags"] = []
+        record["first_purchase_date"] = None
+        record["latest_purchase_date"] = None
+        record["number_of_buys"] = 0
+        record["number_of_sells"] = 0
+        record["dividends_received"] = 0
+        record["account_type"] = None
+        record["field_provenance"] = _build_field_provenance(record)
     return [_json_value(record) for record in records]
 
 

@@ -159,6 +159,75 @@ def resolve_ownership(connection: duckdb.DuckDBPyConnection, ticker_id: int) -> 
     return row[0] if row and row[0] is not None else None
 
 
+def read_security_status(connection: duckdb.DuckDBPyConnection, ticker_id: int) -> dict[str, Any] | None:
+    """Read-only declared-status lookup.
+
+    Mirrors `analytics.resolve_security_status`'s read half without its
+    write-path `ensure_positions_fresh` call or read-write shared connection
+    -- safe for the parallel `--mode gate`/`--mode read` paths, the same
+    reason `resolve_ownership` exists instead of calling the analytics
+    function directly.
+    """
+    row = connection.execute(
+        """
+        SELECT declared_status, rationale, declared_at, declared_by
+        FROM security_status WHERE ticker_id = ?
+        """,
+        [ticker_id],
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "declared_status": row[0],
+        "rationale": row[1],
+        "declared_at": row[2],
+        "declared_by": row[3],
+    }
+
+
+def resolve_subject(connection: duckdb.DuckDBPyConnection, ticker: str) -> dict[str, Any]:
+    """Fold identity + ownership + declared status into one scope verdict.
+
+    `status` follows the same owned > declared > unknown precedence as
+    `analytics.resolve_security_status` (which stays the write-path/CLI
+    authority); `scope` is `portfolio` when owned, `research` otherwise --
+    the axis `get_market_targets(include_research=True)` and this skill's
+    trace manifest key off of. Returns `registered: False` for a ticker with
+    no `tickers` row at all, rather than raising -- the unregistered case
+    `freshness_gate.compute_freshness` turns into an actionable gap message.
+    """
+    identity = resolve_ticker(connection, ticker)
+    if identity is None:
+        return {
+            "registered": False,
+            "owned": False,
+            "declared_status": None,
+            "rationale": None,
+            "declared_at": None,
+            "status": "unknown",
+            "scope": "research",
+        }
+    owned_since = resolve_ownership(connection, identity["ticker_id"])
+    owned = owned_since is not None
+    declaration = read_security_status(connection, identity["ticker_id"])
+    declared_status = declaration["declared_status"] if declaration else None
+    if owned:
+        status = "owned"
+    elif declared_status is not None:
+        status = declared_status
+    else:
+        status = "unknown"
+    return {
+        "registered": True,
+        "owned": owned,
+        "declared_status": declared_status,
+        "rationale": declaration["rationale"] if declaration else None,
+        "declared_at": declaration["declared_at"] if declaration else None,
+        "status": status,
+        "scope": "portfolio" if owned else "research",
+    }
+
+
 def read_position(connection: duckdb.DuckDBPyConnection, ticker_id: int) -> dict[str, Any] | None:
     row = connection.execute(
         """

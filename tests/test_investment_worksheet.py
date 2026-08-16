@@ -255,7 +255,7 @@ class BuildWorksheetForRunTest(unittest.TestCase):
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_text((FIXTURES / "pltr_technicals.json").read_text(encoding="utf-8"), encoding="utf-8")
         return evidence_module.register(
-            self.run_dir, run_id=self.run_id, evidence_type="derived_calculation",
+            self.run_dir, run_id=self.run_id, evidence_type="security_technicals",
             source_name="security-technicals", status="available", artifact=artifact,
         )
 
@@ -285,12 +285,141 @@ class BuildWorksheetForRunTest(unittest.TestCase):
         self.assertTrue(any(event["event"] == "worksheet_built" for event in events))
         self.assertIsNotNone(worksheet["identity"]["ticker"])
 
+    def test_cached_db_payload_is_resolved_before_building(self):
+        """`investment_analyst_resources.build_bundle` may replace the bundle's
+        `db`/`live` fields with a `cache/`-pointer instead of embedding them
+        (see `workspace/cache.py`). The worksheet must still see the full
+        payload -- resolved transparently in the I/O wrapper, not silently
+        treated as empty."""
+        bundle = json.loads((FIXTURES / "pltr_bundle.json").read_text(encoding="utf-8"))
+        real_db = bundle["db"]
+
+        cache_path = self.run_dir / "cache" / "PLTR-db.json"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(real_db), encoding="utf-8")
+        bundle["db"] = {"cached": True, "cache_path": "cache/PLTR-db.json"}
+
+        artifact = self.run_dir / "evidence" / "PLTR-2026-08-10-resources.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps(bundle), encoding="utf-8")
+        evidence_module.register(
+            self.run_dir, run_id=self.run_id, evidence_type="market_data_bundle",
+            source_name="investment-analyst-resources", status="partial", artifact=artifact,
+        )
+        self._register_technicals()
+
+        cached_worksheet, _, _ = iw.build_worksheet_for_run(
+            self.run_dir, run_id=self.run_id, ticker="PLTR", scope=self.scope
+        )
+
+        # A second, otherwise-identical run built straight from the plain
+        # (uncached) fixture must produce the same financial_trajectory --
+        # proof the cache pointer was resolved to the real data, not an
+        # empty dict (which would report every field as a gap instead).
+        self.temp_dir2 = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir2.cleanup)
+        plain_run_dir = Path(self.temp_dir2.name)
+        plain_artifact = plain_run_dir / "evidence" / "PLTR-2026-08-10-resources.json"
+        plain_artifact.parent.mkdir(parents=True, exist_ok=True)
+        plain_artifact.write_text((FIXTURES / "pltr_bundle.json").read_text(encoding="utf-8"), encoding="utf-8")
+        evidence_module.register(
+            plain_run_dir, run_id=self.run_id, evidence_type="market_data_bundle",
+            source_name="investment-analyst-resources", status="partial", artifact=plain_artifact,
+        )
+        technicals_artifact = plain_run_dir / "calculations" / "security-technicals-PLTR-2026-08-10.json"
+        technicals_artifact.parent.mkdir(parents=True, exist_ok=True)
+        technicals_artifact.write_text(
+            (FIXTURES / "pltr_technicals.json").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        evidence_module.register(
+            plain_run_dir, run_id=self.run_id, evidence_type="security_technicals",
+            source_name="security-technicals", status="available", artifact=technicals_artifact,
+        )
+        plain_worksheet, _, _ = iw.build_worksheet_for_run(
+            plain_run_dir, run_id=self.run_id, ticker="PLTR", scope=self.scope
+        )
+
+        self.assertEqual(
+            cached_worksheet["financial_history_and_metrics"], plain_worksheet["financial_history_and_metrics"]
+        )
+        self.assertTrue(cached_worksheet["financial_history_and_metrics"])
+
     def test_missing_technicals_artifact_is_tolerated(self):
         self._register_bundle()
         worksheet, _, _ = iw.build_worksheet_for_run(
             self.run_dir, run_id=self.run_id, ticker="PLTR", scope=self.scope
         )
         self.assertIsNone(worksheet["price_and_market_context"]["technicals"])
+
+    def _register_status_artifact(self):
+        """A `security-status` artifact for PLTR -- shaped like the real
+        skill's output, registered under its own `security_status` evidence
+        type (not `security_technicals`)."""
+        payload = {
+            "schema": "security-status.v1", "ticker": "PLTR", "as_of": "2026-08-10",
+            "actor": "investment-analyst", "resolved": True, "security_name": "Palantir",
+            "status": "owned",
+        }
+        artifact = self.run_dir / "calculations" / "security-status-PLTR-2026-08-10.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps(payload), encoding="utf-8")
+        return evidence_module.register(
+            self.run_dir, run_id=self.run_id, evidence_type="security_status",
+            source_name="security-status", status="available", artifact=artifact,
+        )
+
+    def test_status_artifact_is_not_mistaken_for_technicals(self):
+        """Regression for the post-mortem's F1: before `evidence_type` was
+        split per-producer, a `security-status` artifact registered before
+        `build-worksheet` was the most recent record matching a shared
+        `derived_calculation` type, so it was silently treated as the
+        technicals artifact -- its `technicals`/`benchmark` keys are absent,
+        so `technicals_gap` was never set and `unknowns` stayed silent about
+        the missing technicals. With `security_status`/`security_technicals`
+        as distinct types, a status artifact can no longer satisfy the
+        technicals lookup at all, regardless of registration order."""
+        self._register_bundle()
+        self._register_status_artifact()  # registered before build-worksheet, like the real workflow
+        worksheet, _, _ = iw.build_worksheet_for_run(
+            self.run_dir, run_id=self.run_id, ticker="PLTR", scope=self.scope
+        )
+        self.assertIsNone(worksheet["price_and_market_context"]["technicals"])
+        self.assertEqual(
+            worksheet["price_and_market_context"]["technicals_gap"],
+            "no security-technicals artifact registered in this run",
+        )
+        self.assertIn(
+            "no security-technicals artifact registered in this run", worksheet["unknowns"]
+        )
+        self.assertIsNone(worksheet["source_evidence"]["technicals_evidence_id"])
+
+    def test_wrong_schema_registered_as_technicals_raises(self):
+        """Defense in depth behind the type split (rec 02): even if some
+        future producer mistakenly registers a non-technicals artifact under
+        the `security_technicals` evidence type, `build_worksheet_for_run`
+        must fail loudly rather than silently presenting it as
+        present-but-empty."""
+        self._register_bundle()
+        payload = {"schema": "security-status.v1", "ticker": "PLTR", "status": "owned"}
+        artifact = self.run_dir / "calculations" / "security-technicals-PLTR-2026-08-10.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps(payload), encoding="utf-8")
+        evidence_module.register(
+            self.run_dir, run_id=self.run_id, evidence_type="security_technicals",
+            source_name="security-status", status="available", artifact=artifact,
+        )
+        with self.assertRaises(WorkspaceError):
+            iw.build_worksheet_for_run(self.run_dir, run_id=self.run_id, ticker="PLTR", scope=self.scope)
+
+    def test_source_evidence_cites_the_real_technicals_evidence_id(self):
+        self._register_bundle()
+        record = self._register_technicals()
+        worksheet, _, _ = iw.build_worksheet_for_run(
+            self.run_dir, run_id=self.run_id, ticker="PLTR", scope=self.scope
+        )
+        self.assertEqual(worksheet["source_evidence"]["technicals_evidence_id"], record.evidence_id)
+        self.assertIsNone(worksheet["price_and_market_context"]["technicals_gap"])
+        self.assertIsNotNone(worksheet["price_and_market_context"]["technicals"])
 
 
 if __name__ == "__main__":

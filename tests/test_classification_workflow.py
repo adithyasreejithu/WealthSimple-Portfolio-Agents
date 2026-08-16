@@ -133,6 +133,40 @@ class ClassificationWorkflowTest(unittest.TestCase):
         self.assertEqual(payload["summary"]["holding_count"], 1)
         self.assertEqual(payload["holdings"][0]["primary_group"], "Quality")
 
+    def test_wishlist_ticker_is_classified_alongside_owned_holdings(self):
+        connection = duckdb.connect(str(self.db_path))
+        connection.execute(
+            "INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type) "
+            "VALUES ('MP', 'NYSE', 'USD', 'MP Materials', 'EQUITY')"
+        )
+        wishlist_id = connection.execute(
+            "SELECT ticker_id FROM tickers WHERE ticker_symbol = 'MP'"
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO security_status (ticker_id, declared_status, rationale, declared_at, declared_by) "
+            "VALUES (?, 'wishlist', 'test', CURRENT_TIMESTAMP, 'test')",
+            [wishlist_id],
+        )
+        connection.close()
+
+        def fetcher(requests):
+            return [
+                {
+                    "ticker": r["ticker"], "mode": r["mode"], "attempted_fields": list(r["fields"]),
+                    "fields": {"industry": "Metal Mining", "market_cap": 1_000_000},
+                    "error": None,
+                }
+                for r in requests
+            ]
+
+        payload = workflow.classify_portfolio(self.db_path, fetcher=fetcher)
+        workflow.validate_output(payload)
+        self.assertEqual(payload["summary"]["holding_count"], 2)
+        by_ticker = {h["ticker"]: h for h in payload["holdings"]}
+        self.assertEqual(by_ticker["AAPL"]["fields"]["ownership_status"], "owned")
+        self.assertEqual(by_ticker["MP"]["fields"]["ownership_status"], "wishlist")
+        self.assertIn("review_needed", by_ticker["MP"])
+
 
 if __name__ == "__main__":
     unittest.main()

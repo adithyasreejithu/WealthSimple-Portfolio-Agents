@@ -27,7 +27,28 @@ POLICY_FILE = PORTFOLIO_GROUPING_FOLDER / "policy_v1_1.yaml"
 
 
 def load_classification(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+    """Load the classification JSON, scoped to owned holdings only.
+
+    `classify-portfolio` now classifies declared-wishlist tickers alongside
+    owned holdings (`fields.ownership_status: "owned" | "wishlist"`, see
+    `classify_portfolio`'s wishlist widening). This page renders *current
+    holdings* -- a wishlist ticker has no position, weight, or market value,
+    so it is filtered out here, once, rather than at every call site that
+    reads `data["holdings"]`. `summary.holding_count`/`review_count` are
+    recomputed against the filtered set for the same reason: `data["summary"]`
+    as produced by `classify_portfolio()` counts owned + wishlist together.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["holdings"] = [
+        h for h in data["holdings"] if h.get("fields", {}).get("ownership_status", "owned") == "owned"
+    ]
+    data["summary"] = {
+        **data["summary"],
+        "holding_count": len(data["holdings"]),
+        "review_count": sum(1 for h in data["holdings"] if h.get("review_needed")),
+        "classified_count": sum(1 for h in data["holdings"] if not h.get("review_needed")),
+    }
+    return data
 
 
 def load_policy(path: Path) -> dict:

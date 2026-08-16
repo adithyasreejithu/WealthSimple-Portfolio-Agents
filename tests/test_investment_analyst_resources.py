@@ -87,6 +87,13 @@ class FixtureDatabaseTest(unittest.TestCase):
         """Reacquire the read-write shared connection after a read-only detour."""
         self.connection = database.get_shared_connection(self.db_path)
 
+    def _declare_status(self, ticker_id, status, *, rationale=None, declared_by="test"):
+        self.connection.execute(
+            """INSERT INTO security_status (ticker_id, declared_status, rationale, declared_at, declared_by)
+               VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)""",
+            [ticker_id, status, rationale, declared_by],
+        )
+
 
 class FreshnessGateCadenceTest(FixtureDatabaseTest):
     def test_prices_stale_when_no_history_row(self):
@@ -158,6 +165,38 @@ class FreshnessGateCadenceTest(FixtureDatabaseTest):
         self.assertFalse(result["can_refresh"])
         self.assertEqual(result["due_domains"], [])
         self.assertTrue(any("not owned" in gap for gap in result["gaps"]))
+        self.assertEqual(result["subject"]["status"], "unknown")
+        self.assertEqual(result["subject"]["scope"], "research")
+
+    def test_declared_wishlist_ticker_can_refresh(self):
+        ticker_id = self._seed_ticker("WATCH", owned=False)
+        self._declare_status(ticker_id, "wishlist", rationale="research candidate")
+        connection = self._reopen_read_only()
+        result = freshness_gate.compute_freshness(connection, "WATCH", run_date=TODAY)
+        self.assertFalse(result["owned"])
+        self.assertTrue(result["can_refresh"])
+        self.assertIn("prices", result["due_domains"])
+        self.assertEqual(result["gaps"], [])
+        self.assertEqual(result["subject"]["status"], "wishlist")
+        self.assertEqual(result["subject"]["scope"], "research")
+
+    def test_declared_avoid_ticker_cannot_refresh(self):
+        ticker_id = self._seed_ticker("WATCH", owned=False)
+        self._declare_status(ticker_id, "avoid")
+        connection = self._reopen_read_only()
+        result = freshness_gate.compute_freshness(connection, "WATCH", run_date=TODAY)
+        self.assertFalse(result["can_refresh"])
+        self.assertEqual(result["subject"]["status"], "avoid")
+
+    def test_unregistered_ticker_gap_names_the_registration_command(self):
+        self._seed_ticker("PLTR")  # some other ticker exists; NOPE does not
+        connection = self._reopen_read_only()
+        result = freshness_gate.compute_freshness(connection, "NOPE", run_date=TODAY)
+        self.assertFalse(result["resolved"])
+        self.assertEqual(result["subject"]["status"], "unknown")
+        self.assertTrue(
+            any("database status --ticker NOPE --set wishlist" in gap for gap in result["gaps"])
+        )
 
     def test_classification_and_positions_are_never_in_due_domains(self):
         self._seed_ticker()
@@ -396,6 +435,125 @@ class OrchestratorModeTest(FixtureDatabaseTest):
         self.assertFalse(trace_log_path.exists())
 
 
+class RegisterWishlistTest(FixtureDatabaseTest):
+    """`--register-wishlist`'s write path: `_register_wishlist_candidates`.
+
+    Every ticker here is pre-seeded with a `tickers` row (via `_seed_ticker`)
+    rather than left to `set_security_status`'s own `ensure_tickers` ->
+    live-yfinance creation path for a genuinely brand-new symbol -- that
+    network path belongs to `database_command.py`'s own test coverage, not
+    this skill's. `db_resources.resolve_subject` folds "no `tickers` row at
+    all" and "a row with no declaration" into the identical `unknown`
+    verdict (see `FreshnessGateCadenceTest.
+    test_unregistered_ticker_gap_names_the_registration_command` for the
+    former), so a seeded-but-undeclared ticker exercises the same
+    `_register_wishlist_candidates` branch a truly-unregistered one would.
+
+    Exercised at the function level (not through `main()`/`_dispatch`) so
+    these tests never touch the network -- the CLI-level wiring
+    (`--register-wishlist` triggering this during the refresh phase, and the
+    `--mode gate`/`--mode read` parser rejection) is covered separately in
+    `RegisterWishlistCliWiringTest` below.
+    """
+
+    def test_registers_a_ticker_that_exists_but_has_no_declaration(self):
+        """The case that matters most: a `tickers` row already exists (e.g.
+        from an unrelated ticker-map resolution) but nothing was ever
+        declared, so the gate still reports `resolved: true` /
+        `subject.status: "unknown"` -- not the `resolved: false` case."""
+        ticker_id = self._seed_ticker("HALFWAY", owned=False)
+        connection = self._reopen_read_only()
+        gate_result = freshness_gate.compute_freshness(connection, "HALFWAY", run_date=TODAY)
+        connection.close()
+        self.assertTrue(gate_result["resolved"])
+        self.assertEqual(gate_result["subject"]["status"], "unknown")
+
+        self._reopen_write()
+        registered = iar._register_wishlist_candidates([gate_result], self.db_path, "new research idea")
+        self.assertTrue(registered)
+
+        self._reopen_write()
+        declared = self.connection.execute(
+            "SELECT declared_status, rationale, declared_by FROM security_status WHERE ticker_id = ?",
+            [ticker_id],
+        ).fetchone()
+        self.assertEqual(declared, ("wishlist", "new research idea", iar.SKILL_NAME))
+
+    def test_does_not_touch_a_ticker_declared_avoid(self):
+        ticker_id = self._seed_ticker("SKIP", owned=False)
+        self._declare_status(ticker_id, "avoid", rationale="deliberately avoiding")
+        connection = self._reopen_read_only()
+        gate_result = freshness_gate.compute_freshness(connection, "SKIP", run_date=TODAY)
+        connection.close()
+
+        self._reopen_write()
+        registered = iar._register_wishlist_candidates([gate_result], self.db_path, None)
+        self.assertFalse(registered)
+
+        self._reopen_write()
+        declared = self.connection.execute(
+            "SELECT declared_status, rationale FROM security_status WHERE ticker_id = ?", [ticker_id]
+        ).fetchone()
+        self.assertEqual(declared, ("avoid", "deliberately avoiding"))
+
+    def test_does_not_touch_an_owned_or_already_wishlist_ticker(self):
+        self._seed_ticker("HELD", owned=True)
+        wishlist_id = self._seed_ticker("WISH", owned=False)
+        self._declare_status(wishlist_id, "wishlist")
+        connection = self._reopen_read_only()
+        gate_results = [
+            freshness_gate.compute_freshness(connection, "HELD", run_date=TODAY),
+            freshness_gate.compute_freshness(connection, "WISH", run_date=TODAY),
+        ]
+        connection.close()
+
+        self._reopen_write()
+        registered = iar._register_wishlist_candidates(gate_results, self.db_path, None)
+        self.assertFalse(registered)
+
+        self._reopen_write()
+        count = self.connection.execute("SELECT COUNT(*) FROM security_status").fetchone()[0]
+        self.assertEqual(count, 1)  # only the pre-existing WISH declaration
+
+    def test_closes_the_write_connection_so_a_read_only_regate_does_not_lock(self):
+        """Regression: `set_security_status` writes through the shared
+        read-write connection; leaving it open made the immediate re-gate
+        (`db_resources.connect_read_only`) fail with a DuckDB lock error."""
+        self._seed_ticker("FRESH", owned=False)
+        connection = self._reopen_read_only()
+        gate_result = freshness_gate.compute_freshness(connection, "FRESH", run_date=TODAY)
+        connection.close()
+
+        self._reopen_write()
+        iar._register_wishlist_candidates([gate_result], self.db_path, None)
+
+        connection = db_resources.connect_read_only(self.db_path)  # must not raise
+        try:
+            regated = freshness_gate.compute_freshness(connection, "FRESH", run_date=TODAY)
+        finally:
+            connection.close()
+        self.assertTrue(regated["can_refresh"])
+
+
+class RegisterWishlistCliWiringTest(unittest.TestCase):
+    def test_register_wishlist_rejected_with_mode_gate(self):
+        with self.assertRaises(SystemExit):
+            iar.parse_args(["--ticker", "X", "--register-wishlist", "--mode", "gate"])
+
+    def test_register_wishlist_rejected_with_mode_read(self):
+        with self.assertRaises(SystemExit):
+            iar.parse_args(["--ticker", "X", "--register-wishlist", "--mode", "read"])
+
+    def test_register_wishlist_allowed_with_mode_refresh(self):
+        args = iar.parse_args(["--ticker", "X", "--register-wishlist", "--mode", "refresh"])
+        self.assertTrue(args.register_wishlist)
+
+    def test_register_wishlist_allowed_in_default_mode(self):
+        args = iar.parse_args(["--ticker", "X", "--register-wishlist"])
+        self.assertTrue(args.register_wishlist)
+        self.assertIsNone(args.mode)
+
+
 class RunWorkspaceIntegrationTest(FixtureDatabaseTest):
     """`--run-id` routes the bundle into a run workspace instead of exports/.
 
@@ -468,6 +626,43 @@ class RunWorkspaceIntegrationTest(FixtureDatabaseTest):
         kinds = [event["event"] for event in audit.read_events(run_dir)]
         self.assertIn("trace_recorded", kinds)
         self.assertIn("evidence_registered", kinds)
+
+    def test_run_id_routes_raw_db_payload_to_cache_not_the_bundle(self):
+        """The bundle persisted to `evidence/` must not embed the full raw
+        `db` payload when run-attached -- it should be a small pointer into
+        `cache/`, with the actual price/financials/ledger rows written there
+        instead (never registered as evidence, so `cache/` can be purged
+        without breaking `run validate`)."""
+        from workspace import evidence as evidence_module
+
+        self._seed_ticker()
+        run_id, run_dir = self._make_run()
+        gate_result = self._gate()
+
+        with patch.object(iar, "fetch_stock_research_data", return_value=[
+            {"ticker": "PLTR", "provider_symbol": "PLTR", "data": {}, "errors": {}}
+        ]):
+            result = iar.process_ticker(
+                "PLTR", gate_result, {}, self.db_path,
+                no_live=True, no_bundle=False, no_trace=False, no_quote=True, output=None,
+                classification_json=Path("/nonexistent.json"),
+                trace_log_path=Path(self.temp_dir.name) / "trace.txt",
+                today=TODAY, pretty=False, run_dir=run_dir, run_id=run_id,
+            )
+
+        bundle_path = Path(result["bundle_path"])
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        self.assertTrue(bundle["db"]["cached"])
+        cache_path = run_dir / bundle["db"]["cache_path"]
+        self.assertTrue(cache_path.is_file())
+        cached_db = json.loads(cache_path.read_text(encoding="utf-8"))
+        self.assertIn("rows", cached_db["prices"])
+
+        # The cache payload is never registered as evidence -- only the small
+        # bundle that points at it is.
+        records = evidence_module.read_records(run_dir)
+        cached_relpath = bundle["db"]["cache_path"]
+        self.assertFalse(any(r.get("artifact_path") == cached_relpath for r in records))
 
     def test_run_stays_valid_after_the_skill_writes_into_it(self):
         from workspace import run as run_module, validation
@@ -1005,6 +1200,58 @@ class CompletenessTraceTest(FixtureDatabaseTest):
         # Not a gap: an unheld ticker has no position to be missing.
         self.assertIn("position.quantity", trace.not_applicable_fields())
         self.assertGreater(trace.domains_not_applicable, 0)
+
+    def test_declared_wishlist_ticker_grades_prices_but_not_portfolio_domains(self):
+        """The regression this whole change exists for: a research ticker's
+        real, persisted prices count as ok, while position/portfolio_context
+        -- genuinely ownership-only concepts -- stay not-applicable rather
+        than dragging completeness down. `classification` is different from
+        those two: `classify-portfolio` now classifies declared-wishlist
+        tickers too (see `classify_portfolio`'s wishlist widening), so it is
+        `_refreshable` like prices/financials -- graded `missing` here (not
+        `not_applicable`) because this fixture has no `portfolio_classifications`
+        row for WISH yet, a real, actionable gap until that skill runs and
+        syncs for it."""
+        ticker_id = self._seed_ticker("WISH", owned=False)
+        self._declare_status(ticker_id, "wishlist")
+        self.connection.execute(
+            "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [ticker_id, date(2025, 1, 3), 100.0, 100.0, 100.0, 100.0, 100.0, 1000],
+        )
+        connection = self._reopen_read_only()
+        digest, gate_result = self._digest_for(connection, ticker_id, "WISH")
+        self.assertEqual(digest["subject"]["status"], "wishlist")
+        self.assertEqual(digest["subject"]["scope"], "research")
+        trace = iar.build_trace(digest, gate_result, "WISH")
+        prices_domain = next(d for d in trace.domains if d.name == "prices")
+        self.assertIn("latest_close", prices_domain.ok)
+        self.assertNotIn("prices.latest_close", trace.not_applicable_fields())
+        self.assertNotIn("prices.latest_close", trace.missing_fields())
+        # Portfolio-only domains stay not-applicable -- not a gap.
+        self.assertIn("position.quantity", trace.not_applicable_fields())
+        self.assertIn("portfolio_context.role", trace.not_applicable_fields())
+        # Classification is refreshable for a wishlist ticker; absent here
+        # only because no classify-portfolio sync has populated it yet.
+        self.assertIn("classification.primary_group", trace.missing_fields())
+        self.assertNotIn("classification.primary_group", trace.not_applicable_fields())
+
+    def test_declared_wishlist_ticker_with_a_synced_classification_grades_ok(self):
+        ticker_id = self._seed_ticker("WISH", owned=False)
+        self._declare_status(ticker_id, "wishlist")
+        self.connection.execute(
+            "INSERT INTO portfolio_classifications "
+            "(ticker_id, primary_group, secondary_tags, confidence, reasoning, "
+            "evidence_used, missing_data, review_needed, fields, field_provenance, "
+            "enrichment, generated_at) VALUES (?, 'Growth', '[]', 'medium', 'test', "
+            "'[]', '[]', false, '{}', '{}', '{}', CURRENT_TIMESTAMP)",
+            [ticker_id],
+        )
+        connection = self._reopen_read_only()
+        digest, gate_result = self._digest_for(connection, ticker_id, "WISH")
+        trace = iar.build_trace(digest, gate_result, "WISH")
+        classification_domain = next(d for d in trace.domains if d.name == "classification")
+        self.assertIn("primary_group", classification_domain.ok)
+        self.assertNotIn("classification.primary_group", trace.missing_fields())
 
     def test_owned_ticker_with_full_position_scores_full_completeness_for_those_domains(self):
         ticker_id = self._seed_ticker()  # owned, position_snapshots populated

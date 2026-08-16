@@ -465,7 +465,7 @@ class CliWorkspaceTest(FixtureDatabaseTest):
         run_dir = runs_root / "technicals-run"
         records = evidence_module.read_records(run_dir)
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["evidence_type"], "derived_calculation")
+        self.assertEqual(records[0]["evidence_type"], "security_technicals")
         self.assertEqual(records[0]["status"], "available")
         self.assertTrue(records[0]["artifact_path"].startswith("calculations/"))
 

@@ -45,9 +45,13 @@ from .analysis_models import (
     EvidenceCompleteness,
     get_mode_section_map,
 )
-from .paths import WorkspaceError, relative_to_run, resolve_in_run, utc_now_iso
+from .paths import PathEscapeError, WorkspaceError, relative_to_run, resolve_in_run, utc_now_iso
 
 WORKSHEET_SCHEMA = "investment-worksheet.v1"
+
+# Must match `security_technicals_cli.SCHEMA` -- duplicated rather than
+# imported because `src/` never imports `.claude/` (see CLAUDE.md).
+TECHNICALS_SCHEMA = "security-technicals.v1"
 
 # Calibrated against the PLTR fixture's rendered context
 # (tests/fixtures/investment_analyst/); see design-decisions.md.
@@ -462,7 +466,14 @@ def _find_latest_evidence(run_dir: Path, evidence_type: str, ticker: str) -> dic
     `EvidenceRecord` carries no `ticker` field, so this matches on the
     ticker appearing in `artifact_path` -- true for every producer this
     module reads from (`<TICKER>-<date>-resources.json`,
-    `security-technicals-<TICKER>-<date>.json`)."""
+    `<TICKER>-<date>-security-technicals.json`). `evidence_type` values are
+    now distinct per producer (`market_data_bundle`, `security_technicals`,
+    `security_status`, `policy_worksheet`) -- before this was split, three
+    producers shared `derived_calculation`, and this filter alone could not
+    tell them apart (a `security-status`/`policy_worksheet` artifact would be
+    mistaken for technicals whenever it was registered more recently; see
+    the schema check in `build_worksheet_for_run`, which is the remaining
+    defense against a fourth producer ever reusing a type by mistake)."""
     candidates = [
         record
         for record in evidence_module.read_records(run_dir)
@@ -472,6 +483,37 @@ def _find_latest_evidence(run_dir: Path, evidence_type: str, ticker: str) -> dic
         return None
     candidates.sort(key=lambda record: record.get("retrieved_at") or "")
     return candidates[-1]
+
+
+def _resolve_cached_payload(run_dir: Path, value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Resolve an `investment-analyst-resources` cache pointer back into the
+    full payload it points at.
+
+    `investment_analyst_resources.build_bundle` replaces the bulky raw
+    `db`/`live` payloads with `{"cached": true, "cache_path": "cache/..."}`
+    rather than embedding them in the persisted bundle (see
+    `workspace/cache.py`). `build_worksheet` still needs the full payload, so
+    the pointer is resolved here, in the I/O wrapper -- never inside
+    `build_worksheet` itself, which stays a pure function over already-loaded
+    dicts, unaware that the bundle it is handed might have come from a cache
+    lookup. A cache file that no longer exists (already purged, or never
+    written -- direct callers of `build_worksheet` still pass a plain dict)
+    resolves to an empty payload, which `build_worksheet` already reports as
+    gaps, rather than raising: this module never invents data, but it also
+    does not crash on data that is legitimately gone.
+    """
+    if not value or not value.get("cached"):
+        return value
+    cache_path = value.get("cache_path")
+    if not cache_path:
+        return {}
+    try:
+        resolved = resolve_in_run(run_dir, cache_path)
+        if not resolved.is_file():
+            return {}
+        return json.loads(resolved.read_text(encoding="utf-8"))
+    except (PathEscapeError, OSError, json.JSONDecodeError):
+        return {}
 
 
 def build_worksheet_for_run(
@@ -503,13 +545,29 @@ def build_worksheet_for_run(
         )
     bundle_path = resolve_in_run(run_dir, bundle_record["artifact_path"])
     bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bundle["db"] = _resolve_cached_payload(run_dir, bundle.get("db"))
+    bundle["live"] = _resolve_cached_payload(run_dir, bundle.get("live"))
 
-    technicals_record = _find_latest_evidence(run_dir, "derived_calculation", ticker)
+    technicals_record = _find_latest_evidence(run_dir, "security_technicals", ticker)
     technicals: dict[str, Any] | None = None
     if technicals_record and technicals_record.get("artifact_path"):
         technicals_path = resolve_in_run(run_dir, technicals_record["artifact_path"])
         if technicals_path.is_file():
             technicals = json.loads(technicals_path.read_text(encoding="utf-8"))
+            # A missing technicals artifact is a declared gap (the `else`
+            # branch of `_build_price_and_market_context` below); an artifact
+            # that exists but isn't actually a security-technicals document
+            # must fail loudly instead of silently presenting as
+            # present-but-empty -- that silent case is exactly what let a
+            # `security-status`/`policy_worksheet` artifact get mistaken for
+            # technicals before `evidence_type` was split per-producer.
+            if technicals.get("schema") != TECHNICALS_SCHEMA:
+                raise WorkspaceError(
+                    f"evidence {technicals_record.get('evidence_id')!r} "
+                    f"({technicals_record['artifact_path']}) is registered as "
+                    f"security_technicals for {ticker!r} but its schema is "
+                    f"{technicals.get('schema')!r}, not {TECHNICALS_SCHEMA!r}"
+                )
         else:
             technicals_record = None
 
@@ -533,8 +591,14 @@ def build_worksheet_for_run(
     context_path = calculations_dir / f"{ticker}-{stamp}-analyst-context.md"
 
     worksheet_json = json.dumps(worksheet, indent=2, sort_keys=False, ensure_ascii=False)
-    worksheet_path.write_text(worksheet_json, encoding="utf-8")
-    context_path.write_text(render_analyst_context(worksheet), encoding="utf-8")
+    # `write_bytes`, not `write_text`: on Windows, `write_text` silently
+    # translates `\n` -> `\r\n`, which would make the sha256 computed here
+    # from the in-memory string not match the bytes actually on disk --
+    # exactly the mismatch `thesis_validation.check_worksheet_ref` (Phase 4)
+    # exists to catch. Writing the exact encoded bytes keeps the two in sync
+    # on every platform.
+    worksheet_path.write_bytes(worksheet_json.encode("utf-8"))
+    context_path.write_bytes(render_analyst_context(worksheet).encode("utf-8"))
     worksheet_hash = "sha256:" + hashlib.sha256(worksheet_json.encode("utf-8")).hexdigest()
 
     evidence_module.register(
@@ -556,5 +620,42 @@ def build_worksheet_for_run(
             "blocking": worksheet["evidence_health"]["blocking"],
         },
     )
+    _emit_worksheet_trace(
+        run_dir, run_id=run_id, ticker=ticker, technicals_record=technicals_record,
+        prior_thesis=prior_thesis, market_context=market_context,
+    )
 
     return worksheet, worksheet_path, worksheet_hash
+
+
+def _emit_worksheet_trace(
+    run_dir: Path, *, run_id: str, ticker: str, technicals_record: dict[str, Any] | None,
+    prior_thesis: dict[str, Any] | None, market_context: dict[str, Any] | None,
+) -> None:
+    """Record, at worksheet-build time, whether the three optional inputs a
+    worksheet can carry were present or absent -- this is what would have
+    surfaced the post-mortem's F1 (technicals silently mistaken for a
+    different artifact) and F2 (`security-technicals` never invoked) on the
+    very first run, instead of three runs later. `prior_thesis`/
+    `market_context` grade `not_applicable` rather than `missing`: no loader
+    for either exists yet (Phase 5/7 and Phase 10 respectively), so their
+    absence is not yet an actionable gap for any caller to fix.
+
+    Best-effort, matching every other trace emitter in this codebase: a
+    logging failure must never sink a worksheet that otherwise built
+    successfully."""
+    try:
+        import skill_trace
+
+        optional_context = {"prior_thesis": prior_thesis, "market_context": market_context}
+        trace = skill_trace.Trace(skill="investment_worksheet", subject=ticker, kind="worksheet")
+        trace.add(
+            "optional_inputs",
+            ok=(["technicals"] if technicals_record else [])
+            + [name for name, value in optional_context.items() if value is not None],
+            missing=[] if technicals_record else ["technicals"],
+            not_applicable=[name for name, value in optional_context.items() if value is None],
+        )
+        skill_trace.emit(trace, run_dir=run_dir, run_id=run_id)
+    except Exception:  # noqa: BLE001 -- never sink a successful worksheet build
+        pass

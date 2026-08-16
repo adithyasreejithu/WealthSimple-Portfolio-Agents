@@ -18,15 +18,24 @@ import config
 
 RUN_ID_TIMESTAMP_FORMAT = "%Y-%m-%dT%H%M%SZ"
 
-# Directories created inside every run. `tmp/` is the only disposable one --
-# see `docs/architecture/run_workspace.md`'s retention section.
-RUN_SUBDIRS = ("inputs", "evidence", "calculations", "agent_outputs", "final", "tmp")
+# Directories created inside every run. `tmp/` and `cache/` are the two
+# disposable ones -- see `docs/architecture/run_workspace.md`'s retention
+# section. `tmp/` holds agent drafts, purged only at archive time; `cache/`
+# holds bulk fetched payloads (raw price history, financials) a data-pull
+# skill deposits for the life of the run and that `workspace.cache.purge`
+# clears the moment the run reaches a terminal status -- well before archive.
+RUN_SUBDIRS = ("inputs", "evidence", "calculations", "agent_outputs", "final", "tmp", "cache")
 
 REQUEST_FILENAME = "request.yaml"
 METADATA_FILENAME = "run_metadata.json"
 MANIFEST_FILENAME = "context_manifest.yaml"
 AUDIT_FILENAME = "audit_log.jsonl"
 EVIDENCE_REGISTRY_RELPATH = "evidence/sources.jsonl"
+# Written by `workspace.cache.purge` in place of the deleted payloads --
+# retains {filename, sha256, bytes, source, fetched_at, purged_at} per file
+# so provenance survives even though the bytes do not. Never registered as
+# evidence (see `workspace/cache.py`'s module docstring for why).
+CACHE_MANIFEST_RELPATH = "cache/cache_manifest.json"
 
 # Run IDs become directory names, so the character class is deliberately
 # narrower than the filesystem allows: no spaces, no path separators, nothing

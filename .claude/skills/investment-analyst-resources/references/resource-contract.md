@@ -28,11 +28,65 @@ has a `report_date` within 2 days of today, `prices`, `earnings`, and
 `"earnings_window": true`. This exists so analysis run on or near an
 earnings date never scores against pre-earnings data.
 
-A ticker that is not owned (no rows in `transactions` /
-`email_transactions` / `activities`) cannot be refreshed through this skill
--- `market_data`'s sync functions are scoped to owned tickers with a
-verified Yahoo mapping. The gate reports `can_refresh: false` and a gap
-naming this; the read phase still produces a live-only bundle.
+A ticker is refreshable when it is **owned** (rows in `transactions` /
+`email_transactions` / `activities`) or declared a **research** candidate
+(`security_status.declared_status` in `market_data.RESEARCH_STATUSES` --
+currently just `wishlist`). Anything else -- unregistered, or declared
+`avoid`/`retired` -- cannot be refreshed through this skill: the gate reports
+`can_refresh: false` and a gap naming the fix, and the read phase falls back
+to a live-only bundle. See **Subject scope** below.
+
+## Subject scope (`subject`, in digest + bundle)
+
+Every digest and bundle carries a `subject` block naming where the ticker
+sits on the portfolio/research axis, computed by `db_resources.
+resolve_subject`:
+
+```json
+{"registered": true, "owned": false, "declared_status": "wishlist",
+ "rationale": "AI server infra research", "declared_at": "2026-08-14T...",
+ "status": "wishlist", "scope": "research"}
+```
+
+`status` follows **owned > declared > unknown** precedence, matching
+`analytics.resolve_security_status` (the write-path/CLI authority this
+read-only skill never calls directly -- see `db_resources.
+read_security_status`'s docstring for why). `scope` is `portfolio` when
+owned, `research` otherwise -- the same axis `market_data.get_market_targets`
+keys its `include_research` widening on.
+
+| `subject.status` | Meaning | Refreshable? |
+|---|---|---|
+| `owned` | held now or in the past (any transaction) | yes |
+| `wishlist` | declared a research candidate via `database status` | yes |
+| `avoid`, `retired` | a deliberate declaration, not a research candidate | no |
+| `unknown` | no `tickers` row, or a row with no declaration | no |
+
+An `unknown` subject is not a silent dead end: the gate's message names the
+exact fix --
+`uv run python src/app.py database status --ticker TICKER --set wishlist`.
+Pass `--register-wishlist` (optionally with `--wishlist-rationale TEXT`) to
+have this skill declare it automatically instead of requiring that manual
+step first -- it is the **one write this skill performs outside
+`refresh_domains`**, gated the same way: only during the write/refresh phase
+(`--mode refresh` or the default sequence), never `--mode gate`/`--mode
+read`. It does not touch a ticker already declared `avoid`/`retired` --
+that is a considered decision this flag must not silently override.
+
+Once a subject is `wishlist`, `market_data.get_market_targets(...,
+include_research=True)` admits it and this skill's refresh phase persists
+real `historical_records`/`earnings_events`/`dividend_events`/
+`financial_snapshots`/`stock_details`/`etf_details` rows for it, exactly
+like an owned ticker -- enough for `security-technicals`' SMA-200/beta/
+relative-strength to work on a name you've never bought. `pipeline` and the
+standalone `yfinance-sync`/`earnings-dividends-sync`/
+`financial-snapshots-sync` commands never pass `include_research`, so a
+declared-wishlist ticker is refreshed **only on demand** through this skill,
+never by the routine pipeline run.
+
+`position`, `ledger_summary`, `portfolio_context`, and `classification` stay
+portfolio-only concepts: for a research or unknown subject they are `null`
+in the digest and graded `not_applicable` in the trace, never a gap.
 
 ## Live quote (`quote`, in digest + bundle)
 
@@ -105,7 +159,8 @@ group-by-group coverage comparison against v1's 12-group pull.
 ## Digest (stdout)
 
 Aggregates only, never raw series -- this is what a calling agent reads
-inline. Keys: `schema`, `ticker`, `asset_class`, `as_of`, `earnings_window`,
+inline. Keys: `schema`, `ticker`, `subject` (see Subject scope, above),
+`asset_class`, `as_of`, `earnings_window`,
 `freshness` (per-domain stale/last), `refreshed` (domains actually
 refreshed this run and their result), `position`, `ledger_summary`,
 `portfolio_context` (role/account_type from the export; weight, market
@@ -205,9 +260,11 @@ per field group against *this run's* data, not just asset class:
 
 | Group | Applicable when |
 |---|---|
-| `position`, `ledger_summary`, `portfolio_context`, `prices`, `classification` | the ticker is owned |
-| `financials`, `earnings`, `stock_details`, `derived.financials` | owned and not an ETF |
-| `etf_details` | owned and not a stock |
+| `position`, `ledger_summary`, `portfolio_context`, `classification` | the ticker is owned (portfolio-only concepts) |
+| `prices` | the ticker is owned or a declared research candidate (refreshable) |
+| `financials`, `earnings`, `stock_details` | refreshable and not an ETF |
+| `derived.financials` | not an ETF and financials data is present |
+| `etf_details` | refreshable and not a stock |
 | `derived.options` (7 fields) | the `options` live group returned a chain |
 | `derived.analyst` (3 fields) | the `analyst` live group returned coverage |
 | `derived.insider` (1 field) | the `insider` live group returned filings |
@@ -305,6 +362,8 @@ successful pull are warned about on stderr, never fatal.
 {
   "schema": "investment-analyst-resources.v1",
   "ticker": "PLTR",
+  "subject": {"registered": true, "owned": true, "declared_status": null,
+              "rationale": null, "declared_at": null, "status": "owned", "scope": "portfolio"},
   "provider_symbol": "PLTR",
   "asset_class": "stock",
   "as_of": "2026-08-04",

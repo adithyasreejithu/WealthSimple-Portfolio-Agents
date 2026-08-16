@@ -19,27 +19,44 @@ See `docs/architecture/run_workspace.md`.
 
 from __future__ import annotations
 
-from . import analysis_models, audit, evidence, manifest, models, paths, run, state, thesis_validation, validation
+from . import (
+    analysis_models,
+    audit,
+    decision_validation,
+    evidence,
+    manifest,
+    models,
+    paths,
+    policy_worksheet,
+    run,
+    state,
+    thesis_validation,
+    validation,
+)
 from .analysis_models import AnalysisScope, InvestmentThesis
 from .models import (
     AgentOutput,
+    ArtifactRef,
     ContextManifest,
     DecisionProposal,
+    DecisionSizing,
     EvidenceRecord,
+    PolicyCheck,
     Request,
     RunMetadata,
 )
 from .paths import PathEscapeError, WorkspaceError, resolve_in_run
 from .run import RunExistsError, RunNotFoundError, archive_run, create_run, resolve_run
 from .state import InvalidTransitionError
+from .decision_validation import validate_decision
 from .thesis_validation import validate_thesis
 
 __all__ = [
-    "analysis_models", "audit", "evidence", "manifest", "models", "paths", "run", "state",
-    "thesis_validation", "validation",
-    "AgentOutput", "AnalysisScope", "ContextManifest", "DecisionProposal", "EvidenceRecord",
-    "InvestmentThesis", "Request", "RunMetadata",
+    "analysis_models", "audit", "decision_validation", "evidence", "manifest", "models", "paths",
+    "policy_worksheet", "run", "state", "thesis_validation", "validation",
+    "AgentOutput", "AnalysisScope", "ArtifactRef", "ContextManifest", "DecisionProposal",
+    "DecisionSizing", "EvidenceRecord", "InvestmentThesis", "PolicyCheck", "Request", "RunMetadata",
     "WorkspaceError", "PathEscapeError", "InvalidTransitionError",
     "RunExistsError", "RunNotFoundError",
-    "create_run", "resolve_run", "archive_run", "resolve_in_run", "validate_thesis",
+    "create_run", "resolve_run", "archive_run", "resolve_in_run", "validate_decision", "validate_thesis",
 ]

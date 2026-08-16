@@ -91,7 +91,13 @@ module:
   Because the connection is read-only, it cannot recompute a stale
   `position_snapshots` itself; it checks the same ledger fingerprint the
   engine uses and raises a `RuntimeError` naming `recompute-positions`
-  instead of silently reading stale holdings.
+  instead of silently reading stale holdings. The same module also exposes
+  `read_wishlist_classification_data`, a second query scoped to tickers
+  declared `wishlist` (`security_status.declared_status`, via
+  `market_data.RESEARCH_STATUSES`) and excluding anything already owned.
+  `classify_portfolio()` concatenates both result sets, so a holding's
+  `fields.ownership_status` is `"owned"` or `"wishlist"` and a not-yet-owned
+  candidate gets a real `primary_group` without a manual workaround.
 - `.claude/skills/fetch-yfinance-classification-data/scripts/fetch_classification_data.py`
   owns the yfinance field allowlists and fetch logic itself, with **no
   imports from `src/` at all** — it calls `yfinance` directly.
@@ -110,20 +116,25 @@ they only ever produce the JSON file. Persisting that JSON into the database
 is handled by a separate, decoupled pipeline stage, not by the agent:
 
 - `src/database_command.py::upload_portfolio_classifications()` reads the
-  classification JSON file, resolves each holding's `ticker_id` via its
-  `ticker` and `fields.exchange` (a lookup against `tickers`, since the JSON
-  output deliberately never exposes internal DB primary keys), and fully
+  classification JSON file, resolves each holding's `ticker_id` by its
+  `ticker` symbol alone (a lookup against `tickers`, since the JSON output
+  deliberately never exposes internal DB primary keys; it raises -- rolling
+  back the whole sync -- if a ticker resolves to zero or more than one row,
+  rather than silently dropping that holding's classification), and fully
   replaces the contents of the `portfolio_classifications` table (delete
   then re-insert, in one transaction) every run.
 - `uv run python src/app.py classification-sync` is the CLI entry point for this
   step, following the same "extract, then separately sync" split already
   used for market data (`src/yfinance_extractor.py` fetches;
   `src/market_data.py` + `src/database_command.py` persist).
+- `uv run python src/app.py classify` wraps the read-only workflow and this
+  sync step into one command, and is the standalone entry point for
+  triggering classification -- from the CLI, the dashboard's "Run
+  Classification" action, or after resolving a pending ticker.
 
 This keeps the "read-only agent" guarantee intact — `classification-sync` is
 a distinct, explicitly-invoked pipeline command, never run implicitly as
-part of "Classify my portfolio." (`uv run python src/app.py pipeline`, a separate,
-human-invoked ingestion command unrelated to the agent, does run classify +
-sync automatically as its final step for a full run — see `docs/reference/cli.md`
-— but that is orthogonal to this guarantee: the agent itself still never
-triggers a database write.)
+part of "Classify my portfolio." **`uv run python src/app.py pipeline` never
+runs classification** — ingestion and classification are fully separate
+commands (see `docs/reference/cli.md`); this is orthogonal to the read-only
+guarantee regardless, since the agent itself never triggers a database write.

@@ -114,8 +114,10 @@ class RunCreationTest(WorkspaceTestCase):
         _, directory = self.create()
         components = run.read_metadata(directory).available_components
         # An absent stage is reported, never silently omitted.
-        self.assertEqual(components["policy_engine"], "unavailable")
-        self.assertEqual(components["portfolio_manager_agent"], "deferred")
+        self.assertEqual(components["market_researcher_agent"], "deferred")
+        # Phase 11: the policy engine and Portfolio Manager agent are now available.
+        self.assertEqual(components["policy_engine"], "available")
+        self.assertEqual(components["portfolio_manager_agent"], "available")
 
     def test_failed_initialization_leaves_no_partial_run(self):
         # Fail at the last step; the staging directory must be removed and the
@@ -472,6 +474,25 @@ class StateTransitionTest(WorkspaceTestCase):
         self.assertEqual(metadata.status, state.FAILED)
         self.assertIn("synthetic failure", metadata.errors)
 
+    def test_created_and_in_progress_can_reach_insufficient_evidence(self):
+        _, directory = self.create()
+        run.set_status(directory, state.INSUFFICIENT_EVIDENCE, note="required domain failed TRACE")
+        metadata = run.read_metadata(directory)
+        self.assertEqual(metadata.status, state.INSUFFICIENT_EVIDENCE)
+        self.assertIn("required domain failed TRACE", metadata.errors)
+        self.assertIsNotNone(metadata.completed_at)
+
+    def test_insufficient_evidence_reopens_to_in_progress_or_archives(self):
+        _, directory = self.create()
+        run.set_status(directory, state.INSUFFICIENT_EVIDENCE)
+        run.set_status(directory, state.IN_PROGRESS)
+        self.assertEqual(run.read_metadata(directory).status, state.IN_PROGRESS)
+
+    def test_insufficient_evidence_is_terminal_for_archiving_purposes(self):
+        self.assertIn(state.INSUFFICIENT_EVIDENCE, state.TERMINAL_STATUSES)
+        with self.assertRaises(state.InvalidTransitionError):
+            state.assert_transition(state.INSUFFICIENT_EVIDENCE, state.COMPLETED)
+
 
 # --- 11. validation of an incomplete run -------------------------------
 
@@ -598,24 +619,38 @@ class ArchiveTest(WorkspaceTestCase):
 # --- 14. no trade execution --------------------------------------------
 
 
+def _valid_decision_proposal_fields(**overrides):
+    """A complete, otherwise-valid `DecisionProposal` payload, so tests that
+    expect one specific field to fail validation aren't also (accidentally,
+    silently) exercising missing-required-field errors instead."""
+    fields = {
+        "proposal_id": "p1",
+        "run_id": "r",
+        "generated_at": "2026-08-08T12:00:00Z",
+        "subject": {"type": "security", "identifiers": {"ticker": "SYNTH"}},
+        "proposed_action": "Trim",
+        "sizing": {"rationale": "synthetic"},
+        "summary": "synthetic",
+        "thesis_ref": {"path": "agent_outputs/x-thesis.json", "hash": "sha256:" + "0" * 64},
+        "policy_worksheet_ref": {"path": "calculations/x-policy-worksheet.json", "hash": "sha256:" + "0" * 64},
+        "policy_version": "v1.1",
+    }
+    fields.update(overrides)
+    return fields
+
+
 class NoTradeExecutionTest(WorkspaceTestCase):
     def test_decision_proposal_cannot_claim_a_trade_was_executed(self):
         from pydantic import ValidationError
 
         with self.assertRaises(ValidationError):
-            workspace.DecisionProposal(
-                proposal_id="p1", run_id="r", subject={"type": "security"},
-                proposed_action="trim", summary="synthetic", trade_executed=True,
-            )
+            workspace.DecisionProposal(**_valid_decision_proposal_fields(trade_executed=True))
 
     def test_decision_proposal_cannot_waive_human_approval(self):
         from pydantic import ValidationError
 
         with self.assertRaises(ValidationError):
-            workspace.DecisionProposal(
-                proposal_id="p1", run_id="r", subject={"type": "security"},
-                proposed_action="trim", summary="synthetic", human_approval_required=False,
-            )
+            workspace.DecisionProposal(**_valid_decision_proposal_fields(human_approval_required=False))
 
     def test_execution_fields_in_an_agent_output_fail_validation(self):
         run_id, directory = self.create()

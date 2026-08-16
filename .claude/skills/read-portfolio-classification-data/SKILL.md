@@ -6,3 +6,8 @@ description: Read normalized portfolio classification inputs from the configured
 # Read Portfolio Classification Data
 
 Use `scripts/read_classification_data.py` only through the classify-portfolio orchestrator. Do not add SQL, ticker, or database-path arguments. Read [database-contract.md](references/database-contract.md) for the executable boundary.
+
+Exposes two read functions, both called by `classify_portfolio()`:
+`read_classification_data` (owned holdings, `ownership_status: "owned"`) and
+`read_wishlist_classification_data` (declared-`wishlist` tickers,
+`ownership_status: "wishlist"`, excluding anything already owned).

@@ -20,6 +20,7 @@ import yaml
 from pydantic import ValidationError
 
 from . import audit as audit_module
+from . import cache as cache_module
 from . import evidence as evidence_module
 from . import manifest as manifest_module
 from . import state as state_module
@@ -52,10 +53,10 @@ KNOWN_COMPONENTS: dict[str, str] = {
     "market_analyst_resources": "available",
     "portfolio_database": "available",
     "knowledge_base": "available",
-    "policy_engine": "unavailable",
+    "policy_engine": "available",
     "market_researcher_agent": "deferred",
-    "investment_analyst_agent": "deferred",
-    "portfolio_manager_agent": "deferred",
+    "investment_analyst_agent": "available",
+    "portfolio_manager_agent": "available",
 }
 
 
@@ -313,7 +314,24 @@ def set_status(
     actor: str = "workflow_cli",
     note: str | None = None,
 ) -> RunMetadata:
-    """Move a run to a new state, refusing transitions the lifecycle forbids."""
+    """Move a run to a new state, refusing transitions the lifecycle forbids.
+
+    Entering any `state.TERMINAL_STATUSES` member purges `cache/` (see
+    `workspace/cache.py`) -- `completed`/`failed`/`insufficient_evidence`
+    all mean no further data-pull work is expected on this run without an
+    explicit reopen, so any bulk payload a skill cached for this run's
+    lifetime is no longer needed. `awaiting_human_review` is deliberately
+    NOT terminal (see `state.py`): the analyst's cache must survive for the
+    portfolio-manager stage that follows it in the same run. `archived` is
+    also terminal and covered here even though `archive_run` already clears
+    `tmp/` -- `purge` is idempotent, so this is a no-op if `set_status` was
+    already called with a prior terminal status for this run.
+
+    A run shared by a ticker fan-out has one status for the whole run, not
+    one per ticker -- callers must not set a terminal status until every
+    ticker in the fan-out has finished, or the first to finish purges cache
+    the others still need.
+    """
     metadata = read_metadata(directory)
     previous = metadata.status
     state_module.assert_transition(previous, target_status)
@@ -323,10 +341,11 @@ def set_status(
     metadata.updated_at = stamp
     if target_status == state_module.IN_PROGRESS and metadata.started_at is None:
         metadata.started_at = stamp
-    if target_status in (state_module.COMPLETED, state_module.FAILED):
+    if target_status in (state_module.COMPLETED, state_module.FAILED, state_module.INSUFFICIENT_EVIDENCE):
         metadata.completed_at = stamp
     if note:
-        (metadata.errors if target_status == state_module.FAILED else metadata.warnings).append(note)
+        error_statuses = (state_module.FAILED, state_module.INSUFFICIENT_EVIDENCE)
+        (metadata.errors if target_status in error_statuses else metadata.warnings).append(note)
 
     _write_metadata(directory, metadata)
     audit_module.append_event(
@@ -336,6 +355,10 @@ def set_status(
         actor=actor,
         details={"from": previous, "to": target_status, **({"note": note} if note else {})},
     )
+
+    if target_status in state_module.TERMINAL_STATUSES:
+        cache_module.purge(directory, metadata.run_id)
+
     return metadata
 
 
@@ -423,6 +446,13 @@ def archive_run(
     if tmp_dir.is_dir():
         shutil.rmtree(tmp_dir, ignore_errors=True)
         tmp_dir.mkdir(exist_ok=True)
+
+    # `cache/` should already be empty from a prior terminal `set_status`
+    # call (`purge` is idempotent either way), but a run archived directly
+    # from a non-terminal status (e.g. `awaiting_input`) never passed through
+    # that hook -- cover it here too so no run can reach the archive with an
+    # unpurged cache.
+    cache_module.purge(directory, metadata.run_id)
 
     state_module.assert_transition(metadata.status, state_module.ARCHIVED)
     stamp = utc_now_iso()
