@@ -73,6 +73,22 @@ Key points:
   no owning transactions, so it never appears in `position_snapshots`,
   `get_market_targets`, or classification output.
 
+**Portfolio vs. research scope.** `get_market_targets` (`market_data.py`)
+resolves its ticker set from a `LEFT JOIN` against `owned_dates`, kept to
+owned-only by default (`include_research=False`) -- `pipeline` and every
+routine sync command never pass anything else, so a ticker with zero
+transactions is never touched by a routine run, exactly as before this
+parameter existed. Passing `include_research=True` additionally admits a
+ticker with a `security_status.declared_status` of `wishlist` (`market_data.
+RESEARCH_STATUSES`) even though it has no transactions, tagging each
+returned `MarketTarget.scope` as `"portfolio"` or `"research"`. Only the
+`investment-analyst-resources` skill's on-demand refresh phase passes this
+-- see `.claude/skills/investment-analyst-resources/SKILL.md`'s Subject
+scope section for why a research ticker needs real, persisted DB history (an
+SMA-200 or 365-day relative-strength window cannot be built from a single
+live yfinance pull). `avoid`/`retired` declarations are deliberately never
+admitted by either scope.
+
 ## Reconciliation Passes
 
 Precedence: **activities > transactions (statements) > email_transactions**.

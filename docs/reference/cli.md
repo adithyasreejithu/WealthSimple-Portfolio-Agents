@@ -185,6 +185,14 @@ uv run python src/app.py yfinance-sync --full
 - Missing ticker identities must first be created through ingestion or the
   `ticker-map` workflow; unexpected metadata returned by Yahoo is skipped.
 - The command exits nonzero when fetching or database publication fails.
+- **Owned tickers only, always.** `yfinance-sync` (like `earnings-dividends`
+  and `financial-snapshots` below) never syncs a declared-wishlist research
+  ticker — `market_data.get_market_targets`'s `include_research` widening is
+  used only by the `investment-analyst-resources` skill's own on-demand
+  refresh, never by this CLI command or the routine `pipeline` run. To pull
+  and persist real DB data for a ticker you don't own, declare it first with
+  `database status --ticker TICKER --set wishlist` (see below), then run
+  `investment-analyst-resources` for it — not this command.
 
 ## Earnings & Dividends
 
@@ -428,33 +436,50 @@ nonzero if resolution or the retry fails.
 ## Portfolio Classification
 
 ```powershell
+uv run python src/app.py classify
+uv run python src/app.py classify --database Data/PRD_WealthSimple.duckdb
+```
+
+`classify` is the standalone command that classifies current holdings **and**
+every ticker declared `wishlist` (`database status --set wishlist`) and
+persists the result into the `portfolio_classifications` table in one step —
+the classification workflow's read-only pass (approved YAML rules, ephemeral
+allowlisted yfinance enrichment) followed by the sync. Each row's
+`fields.ownership_status` is `"owned"` or `"wishlist"`. Run it explicitly
+whenever holdings change outside a full pipeline run, e.g. after resolving a
+new ticker or after declaring/clearing a wishlist ticker.
+
+- `--database PATH` selects the DuckDB database.
+
+The two lower-level steps `classify` wraps remain available independently for
+ad hoc use, e.g. reviewing the JSON before deciding whether to persist it:
+
+```powershell
 uv run python src/app.py portfolio-classify
 uv run python src/app.py portfolio-classify --output exports/portfolio-classification/latest.json --pretty
 uv run python src/app.py classification-sync
 uv run python src/app.py classification-sync --input exports/portfolio-classification/latest.json
 ```
 
-`portfolio-classify` runs the read-only, deterministic classification workflow
-(read-only DuckDB connection, approved YAML rules, ephemeral allowlisted
-yfinance enrichment) and writes the result as JSON.
-
-- `--output PATH` selects the JSON destination inside
-  `exports/portfolio-classification/`; a default path is used if omitted.
-- `--pretty` indents and sorts the JSON output.
-
-`classification-sync` is a separate, explicitly-invoked step that persists the
-latest classification JSON into the `portfolio_classifications` table
-(delete-then-reinsert, one transaction) — running `portfolio-classify` alone
-never syncs to the database, keeping that workflow itself read-only. (A full
-`pipeline` run does both automatically as its final step — see "Pipeline"
-above — but the standalone `portfolio-classify`/`classification-sync`
-commands remain independent for ad hoc use, e.g. reviewing the JSON before
-deciding whether to persist it.)
-
-- `--input PATH` selects the JSON file to sync; defaults to
-  `exports/portfolio-classification/portfolio-classification.json`, the same
-  path `portfolio-classify` writes to when `--output` is omitted.
-- `--database PATH` selects the DuckDB database.
+`portfolio-classify` runs the read-only workflow alone and writes the result
+as JSON (`--output PATH` selects the destination inside
+`exports/portfolio-classification/`, `--pretty` indents and sorts it).
+`classification-sync` persists an already-written classification JSON into
+the database (delete-then-reinsert, one transaction; matches each holding by
+`ticker_symbol` alone and raises — rolling back the whole sync — if a ticker
+resolves to zero or more than one `tickers` row, rather than silently
+dropping that holding's classification). It also refuses to sync a **stale**
+export: one covering a strict subset of the tickers already classified in the
+database *and* generated before the most recent wishlist declaration — the
+signature of syncing an export from before a wishlist ticker was declared (or
+before this widening existed at all), which would otherwise silently erase
+that ticker's classification. Run `classify` (or `portfolio-classify`) again
+to regenerate a current export. `--input PATH` selects the JSON file to sync,
+defaulting to the same path `portfolio-classify` writes to when `--output` is
+omitted; `--database PATH` selects the DuckDB database. (A full `pipeline`
+run also classifies current holdings automatically as its final step — see
+"Pipeline" above — but these standalone commands remain independent for ad
+hoc use.)
 
 See `docs/agents/portfolio-classifier/architecture.md` for the full workflow
 design and the `classify-portfolio` skill for the underlying scripts.
@@ -526,9 +551,16 @@ uv run python src/app.py run show --run-id <run-id>
 uv run python src/app.py run register-evidence --run-id <run-id> --file workspace/runs/<run-id>/evidence/bundle.json --type market_data_bundle --source yfinance
 uv run python src/app.py run register-evidence --run-id <run-id> --missing --type price_quote --source yfinance --status missing
 uv run python src/app.py run build-manifest --run-id <run-id> --target-stage investment_analyst
+uv run python src/app.py run build-worksheet --run-id <run-id> --ticker PLTR --mode initial_research --horizon Long-term
+uv run python src/app.py run check-thesis --run-id <run-id> --path tmp/PLTR-thesis-draft.json
+uv run python src/app.py run save-thesis --run-id <run-id> --path tmp/PLTR-thesis-draft.json --ticker PLTR
+uv run python src/app.py run build-policy-context --run-id <run-id> --ticker PLTR
+uv run python src/app.py run check-decision --run-id <run-id> --path tmp/PLTR-decision-draft.json
+uv run python src/app.py run save-decision --run-id <run-id> --path tmp/PLTR-decision-draft.json --ticker PLTR
 uv run python src/app.py run validate --run-id <run-id>
 uv run python src/app.py run set-status --run-id <run-id> --status in_progress
 uv run python src/app.py run archive --run-id <run-id>
+uv run python src/app.py run gc --older-than-days 7 --dry-run
 ```
 
 Creates and manages **run workspaces** — one directory per investment-research
@@ -588,31 +620,206 @@ regenerated, never hand-edited.
 - `--target-stage TEXT` — which stage will consume it.
 - `--prior-thesis PATH` — run-relative path to a prior thesis, if any.
 
+### `run build-worksheet`
+
+Builds this run's `investment-worksheet.v1` JSON and compact
+`analyst-context.md` from an already-registered `investment-analyst-resources`
+bundle (and, if present, a `security-technicals` artifact) — see
+`docs/architecture/investment_thesis_schema.md` and
+`docs/architecture/analysis_scope_schema.md`. Deterministic; no network or
+database access; safe to re-run. Prints the worksheet/context paths, the
+worksheet's sha256 hash, and `evidence_health` (including `blocking` — a
+caller must check this before drafting a thesis; see the
+`investment-analyst` agent's halt-on-blocking rule).
+
+- `--run-id ID` (required), `--ticker TICKER` (required)
+- `--mode {initial_research,scheduled_review,earnings_update,material_event,price_move_review,thesis_monitor,portfolio_decision}` (required)
+- `--horizon {Short-term,Medium-term,Long-term}` (required)
+- `--asset-track {equity,etf}` (default `equity`)
+- `--trigger-type {schedule,earnings,material_event,price_move,user_request,monitor_trigger}` (default `user_request`)
+- `--trigger-detail TEXT`, `--trigger-occurred-at TEXT`
+
+### `run check-thesis`
+
+Dry-run validates a draft `investment-thesis.v1` file against schema, forbidden
+fields, evidence citations, the `worksheet_ref` hash, section/scope coverage,
+and the TRACE-driven confidence cap — **writes nothing**. Meant to be called
+repeatedly while iterating on a draft. Prints `{ok, status, errors, warnings}`
+and exits 1 when not ok.
+
+- `--run-id ID` (required)
+- `--path PATH` (required) — run-relative path to the draft JSON, e.g.
+  `tmp/PLTR-thesis-draft.json`.
+
+### `run save-thesis`
+
+Re-validates the draft independently (never trusts a prior `check-thesis`
+call saw the same bytes). Only if valid or valid-with-warnings: overwrites
+`policy_version`, `artifact_id`, and `validation{}` authoritatively, writes it
+to `agent_outputs/<ticker>-<stamp>-thesis.json`, registers it as
+`investment_thesis` evidence, and appends `analyst_drafted` + `validated`
+audit events. On failure, nothing is written and only a `validated` (failure)
+event is recorded. Prints the same shape as `check-thesis` plus
+`artifact_path`/`evidence_id`/`artifact_id` on success; exits 1 on failure.
+
+- `--run-id ID` (required), `--path PATH` (required), `--ticker TICKER` (required)
+
+### `run build-policy-context`
+
+Builds this run's `portfolio-policy-worksheet.v1` JSON for one ticker — the
+Portfolio Manager's deterministic "Python calculates" layer, mirroring
+`build-worksheet`'s role for the Investment Analyst. Reads the live pipeline
+database fresh (portfolio state is not run-scoped) and evaluates the two
+checks `Knowledge-Base/ref/policy_v1_1.yaml` actually defines: the
+single-name cap (`constraints.single_name_max_percent`, with the same
+Core-classified-broad-market-ETF exemption `analytics.portfolio_report`'s
+concentration check applies) and the security's classifier group's
+allocation-target band (`allocation_targets.<group>.max_percent`). Sector,
+look-through-sector, and currency exposure
+(`get_sector_allocation`/`get_look_through_sector_exposure`/`get_currency_exposure`)
+are included as informational `portfolio_context` only — `policy_v1_1.yaml`
+defines no cap for either, so none is invented. Prints the worksheet path and
+sha256 hash, `policy_checks` (`{name, result: pass|fail|unavailable, detail}`),
+`current_weight_pct`, and `subject` (resolved ticker_id/group/held status).
+
+- `--run-id ID` (required), `--ticker TICKER` (required)
+- `--db-path PATH` — override the configured pipeline database (test/debug only)
+
+### `run check-decision`
+
+Dry-run validates a draft `DecisionProposal` file against schema (the locked
+`Buy|Hold|Trim|Sell|Add` action enum — `Watchlist`/`Avoid` are rejected, that
+vocabulary belongs to the not-held research path), the `thesis_ref` and
+`policy_worksheet_ref` hashes, and the policy-consistency gate: if the cited
+policy worksheet recorded any `fail` check for this security, `proposed_action`
+must be `Hold`/`Trim`/`Sell` — `Buy`/`Add` against a failing check is a
+validation error, not left to judgment. **Writes nothing**. Prints
+`{ok, status, errors, warnings}` and exits 1 when not ok.
+
+- `--run-id ID` (required)
+- `--path PATH` (required) — run-relative path to the draft JSON, e.g.
+  `tmp/PLTR-decision-draft.json`.
+
+### `run save-decision`
+
+Re-validates the draft independently. Only if valid or valid-with-warnings:
+overwrites `policy_version` authoritatively, writes it to
+`final/<ticker>-<stamp>-decision.json` (a proposal, never an order —
+`trade_executed`/`human_approval_required` are pinned by the schema), registers
+it as `decision_proposal` evidence, and appends `pm_drafted` + `validated`
+audit events. On failure, nothing is written and only a `validated` (failure)
+event is recorded. Prints the same shape as `check-decision` plus
+`artifact_path`/`evidence_id`/`proposal_id` on success; exits 1 on failure.
+
+- `--run-id ID` (required), `--path PATH` (required), `--ticker TICKER` (required)
+
 ### `run validate`
 
 Checks files, schemas, and cross-references: evidence citations resolve to
 registered IDs, referenced paths stay inside the run, artifact hashes still
-match, no trade-execution fields appear anywhere, and neither append-only log
-has malformed lines. Prints `{ok, errors, warnings, counts}` and **exits 1**
-when not ok, so it works as a gate.
+match, no trade-execution fields appear anywhere, neither append-only log has
+malformed lines, any `investment-thesis.v1` artifact under `agent_outputs/`
+independently re-passes `thesis_validation.validate_thesis` (schema, citations,
+`worksheet_ref` hash, section/scope, confidence cap), and any `DecisionProposal`
+under `final/` independently re-passes `decision_validation.validate_decision`
+(schema, `thesis_ref`/`policy_worksheet_ref` hashes, the policy-consistency
+gate). Prints `{ok, errors, warnings, counts}` and **exits 1** when not ok, so
+it works as a gate.
 
 ### `run set-status`
 
 Moves a run through `created → in_progress → awaiting_input |
-awaiting_human_review → completed | failed → archived`. Transitions outside
-that model are refused with an error naming the legal alternatives.
+awaiting_human_review → completed | failed | insufficient_evidence →
+archived`. `insufficient_evidence` is the outcome of a `build-worksheet` call
+whose `evidence_health.blocking` came back `true` (a `stop`-policy run with a
+required evidence domain that failed TRACE) — distinct from `failed` (a bug),
+it means the pipeline worked correctly and found a real gap a human must fill
+before the run can continue. Transitions outside this model are refused with
+an error naming the legal alternatives.
 
 - `--status STATUS` (required), `--note TEXT` — recorded as a warning, or as
-  an error when failing the run.
+  an error when failing the run or marking it `insufficient_evidence`.
+
+Entering `completed`, `failed`, or `insufficient_evidence` also purges the
+run's `cache/` directory (bulk payloads a data-pull skill fetched for this
+run's lifetime — see `docs/architecture/run_workspace.md`), recording each
+deleted file's provenance in `cache/cache_manifest.json`.
+`awaiting_human_review` is deliberately **not** covered: the investment
+analyst's cache must survive for the portfolio-manager stage that follows in
+the same run. A run shared by a ticker fan-out has one status for the whole
+run — do not set a terminal status until every ticker has finished, or the
+first to finish purges cache the others still need.
 
 ### `run archive`
 
 Moves the run into `workspace/archive/<YYYY-MM>/<run-id>/`, structure intact.
-**Runs are never deleted**; only `tmp/` contents are discarded, and an
-occupied archive slot is refused. Validates first by default.
+**Runs are never deleted**; only `tmp/` and `cache/` contents are discarded
+(the latter into a retained manifest, same as `set-status`), and an occupied
+archive slot is refused. Validates first by default.
 
 - `--no-validate` — archive without validating, for retaining an abandoned or
   failed run.
+
+### `run gc`
+
+Sweeps every run under `workspace/runs/` and purges `cache/` for any run
+whose metadata is older than `--older-than-days` and still has un-purged
+payloads — reclaiming a run that crashed before ever reaching a terminal
+`set-status` call (the only other place a purge happens). Idempotent: a run
+already purged, or one whose skills never wrote to `cache/`, is skipped from
+the report entirely.
+
+- `--older-than-days INT` (default `7`)
+- `--dry-run` — report what would be purged without deleting anything; safe
+  to run against the real `workspace/runs/` first.
+
+## Database
+
+```powershell
+uv run python src/app.py database status --ticker OUST --set wishlist --rationale "LIDAR play, watching for entry"
+uv run python src/app.py database status --ticker OUST --set clear
+```
+
+Manages database-level declarations that fall outside pipeline ingestion.
+Currently one subcommand, `status`, which declares or clears a ticker's
+non-ownership status in the `security_status` table (schema v15) — a
+wishlist candidate, a name to avoid, or a retired idea. **CLI/human-only by
+design:** no agent has write access to this table (see the read-only
+`.claude/skills/security-status/` skill, shared by the `investment-analyst`
+and `investment-portfolio-manager` agents).
+
+Ownership itself is never declared here — it stays derived from
+`position_snapshots.quantity > 0` and always overrides any declaration, so a
+wishlist ticker that gets bought becomes `owned` automatically with no write
+to this table. See `src/database.py`'s `_create_security_status_table`
+docstring and `src/analytics.py`'s `resolve_security_status`.
+
+### `database status`
+
+- `--ticker SYMBOL` (required)
+- `--set {wishlist,avoid,retired,clear}` (required) — `clear` removes any
+  existing declaration.
+- `--rationale TEXT` — optional free-text reason, stored alongside the
+  declaration.
+- `--database PATH` — override the configured pipeline database.
+
+A symbol with no existing `tickers` row is resolved and created the same way
+every other ingestion path does (via `ensure_tickers`, yfinance-enriched),
+so a never-traded wishlist name still gets a `ticker_id` and a clean foreign
+key like every other row in the schema. A symbol matching more than one
+exchange must already be uniquely identified elsewhere in the database —
+this command does not disambiguate by exchange.
+
+**This is the registration door for a research ticker.** A `wishlist`
+declaration is the prerequisite for the `investment-analyst`/
+`investment-portfolio-manager` track on a name you do not own: once
+declared, `market_data.get_market_targets`'s `include_research` widening
+admits it, and `investment-analyst-resources` (see
+`.claude/skills/investment-analyst-resources/`) persists real prices,
+earnings, dividends, financials, and stock/ETF details for it — the same
+DB-backed depth an owned ticker gets, on demand, without touching the
+routine `pipeline` run. That skill's `--register-wishlist` flag runs this
+exact declaration for you, agent-side, when the caller opts in.
 
 ## Compatibility Commands
 

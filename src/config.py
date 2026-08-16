@@ -38,7 +38,7 @@ WORKSPACE_ARCHIVE_FOLDER = WORKSPACE_FOLDER / "archive"
 DATABASE_PATH = Path(
     os.getenv("DB_PATH", str(DATA_FOLDER / "PRD_WealthSimple.duckdb"))
 ).expanduser()
-DATABASE_SCHEMA_VERSION = 13
+DATABASE_SCHEMA_VERSION = 15
 
 """
 Financial analytics assumptions. Keep business constants here so calculations

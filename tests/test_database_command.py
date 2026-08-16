@@ -635,10 +635,10 @@ class DatabaseCommandTest(unittest.TestCase):
             "enrichment": {"mode": "identity", "attempted_fields": [], "populated_fields": [], "errors": []},
         }
 
-    def _write_classification_json(self, holdings):
+    def _write_classification_json(self, holdings, generated_at="2026-01-01T00:00:00+00:00"):
         path = Path(self.temp_dir.name) / "portfolio-classification.json"
         path.write_text(json.dumps({
-            "schema_version": "1.0", "generated_at": "2026-01-01T00:00:00+00:00",
+            "schema_version": "1.0", "generated_at": generated_at,
             "workflow": "classify-my-portfolio", "database_mode": "read_only",
             "summary": {}, "holdings": holdings,
         }))
@@ -686,16 +686,146 @@ class DatabaseCommandTest(unittest.TestCase):
         self.assertEqual(written, 1)
         self.assertEqual(remaining, [(ticker_ids["AAPL"],)])
 
-    def test_classification_sync_skips_unresolved_ticker(self):
+    def test_classification_sync_raises_for_unresolved_ticker(self):
         path = self._write_classification_json([self._holding("UNKNOWN")])
 
-        with self.assertLogs("database_command", level="WARNING") as captured:
-            written = upload_portfolio_classifications(path, self.db_path)
+        with self.assertRaises(ValueError) as raised:
+            upload_portfolio_classifications(path, self.db_path)
 
-        self.assertEqual(written, 0)
-        self.assertTrue(
-            any("Skipping classification upload for unresolved ticker" in line for line in captured.output)
+        self.assertIn("UNKNOWN", str(raised.exception))
+
+    def test_classification_sync_raises_for_ambiguous_ticker_symbol(self):
+        """Two tickers rows sharing a symbol (e.g. dual-listed) must not let
+        the sync silently pick one -- match-by-symbol-alone (see
+        upload_portfolio_classifications' docstring) requires exactly one row."""
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('DUPE', 'NYSE', 'USD', 'Dupe Co', 'stock')"""
         )
+        connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('DUPE', 'TSX', 'CAD', 'Dupe Co CA', 'stock')"""
+        )
+        path = self._write_classification_json([self._holding("DUPE")])
+
+        with self.assertRaises(ValueError) as raised:
+            upload_portfolio_classifications(path, self.db_path)
+
+        self.assertIn("DUPE", str(raised.exception))
+
+    def test_classification_sync_rolls_back_fully_on_an_unresolved_ticker(self):
+        """A holding the sync cannot resolve must not leave the table
+        partially cleared -- the whole sync rolls back together rather than
+        committing a table missing every classification after the DELETE."""
+        connection = database.get_shared_connection(self.db_path)
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock') RETURNING ticker_id"""
+        ).fetchone()[0]
+        upload_portfolio_classifications(
+            self._write_classification_json([self._holding("AAPL")]), self.db_path
+        )
+
+        bad_path = self._write_classification_json([self._holding("AAPL"), self._holding("UNKNOWN")])
+        with self.assertRaises(ValueError):
+            upload_portfolio_classifications(bad_path, self.db_path)
+
+        remaining = connection.execute("SELECT ticker_id FROM portfolio_classifications").fetchall()
+        self.assertEqual(remaining, [(ticker_id,)])
+
+    def _declare(self, connection, ticker_id, declared_at, status="wishlist"):
+        connection.execute(
+            "INSERT INTO security_status (ticker_id, declared_status, rationale, declared_at, declared_by) "
+            "VALUES (?, ?, 'test', ?, 'test')",
+            [ticker_id, status, declared_at],
+        )
+
+    def test_stale_subset_export_older_than_a_declaration_is_refused(self):
+        connection = database.get_shared_connection(self.db_path)
+        ticker_ids = {}
+        for symbol in ("AAPL", "MP"):
+            ticker_ids[symbol] = connection.execute(
+                """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+                   VALUES (?, 'NASDAQ', 'USD', ?, 'stock') RETURNING ticker_id""",
+                [symbol, symbol],
+            ).fetchone()[0]
+        upload_portfolio_classifications(
+            self._write_classification_json(
+                [self._holding("AAPL"), self._holding("MP")],
+                generated_at="2026-01-01T00:00:00+00:00",
+            ),
+            self.db_path,
+        )
+        self._declare(connection, ticker_ids["MP"], datetime(2026, 1, 5))
+
+        stale_path = self._write_classification_json(
+            [self._holding("AAPL")], generated_at="2026-01-02T00:00:00+00:00"
+        )
+        with self.assertRaisesRegex(ValueError, "stale"):
+            upload_portfolio_classifications(stale_path, self.db_path)
+
+        # Refused sync must not have touched the table.
+        remaining = {row[0] for row in connection.execute(
+            "SELECT ticker_id FROM portfolio_classifications"
+        ).fetchall()}
+        self.assertEqual(remaining, set(ticker_ids.values()))
+
+    def test_subset_export_newer_than_the_declaration_is_accepted(self):
+        """A wishlist declaration can legitimately be removed -- a subset
+        export generated *after* that removal must stay syncable."""
+        connection = database.get_shared_connection(self.db_path)
+        ticker_ids = {}
+        for symbol in ("AAPL", "MP"):
+            ticker_ids[symbol] = connection.execute(
+                """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+                   VALUES (?, 'NASDAQ', 'USD', ?, 'stock') RETURNING ticker_id""",
+                [symbol, symbol],
+            ).fetchone()[0]
+        upload_portfolio_classifications(
+            self._write_classification_json(
+                [self._holding("AAPL"), self._holding("MP")],
+                generated_at="2026-01-01T00:00:00+00:00",
+            ),
+            self.db_path,
+        )
+        self._declare(connection, ticker_ids["MP"], datetime(2026, 1, 5))
+
+        newer_path = self._write_classification_json(
+            [self._holding("AAPL")], generated_at="2026-01-06T00:00:00+00:00"
+        )
+        written = upload_portfolio_classifications(newer_path, self.db_path)
+
+        self.assertEqual(written, 1)
+        remaining = connection.execute("SELECT ticker_id FROM portfolio_classifications").fetchall()
+        self.assertEqual(remaining, [(ticker_ids["AAPL"],)])
+
+    def test_full_export_is_accepted_even_if_older_than_a_declaration(self):
+        """Not a strict subset -- nothing is at risk of being dropped, so the
+        staleness guard must not fire regardless of timestamps."""
+        connection = database.get_shared_connection(self.db_path)
+        ticker_ids = {}
+        for symbol in ("AAPL", "MP"):
+            ticker_ids[symbol] = connection.execute(
+                """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+                   VALUES (?, 'NASDAQ', 'USD', ?, 'stock') RETURNING ticker_id""",
+                [symbol, symbol],
+            ).fetchone()[0]
+        upload_portfolio_classifications(
+            self._write_classification_json(
+                [self._holding("AAPL"), self._holding("MP")],
+                generated_at="2026-01-01T00:00:00+00:00",
+            ),
+            self.db_path,
+        )
+        self._declare(connection, ticker_ids["MP"], datetime(2026, 1, 5))
+
+        full_path = self._write_classification_json(
+            [self._holding("AAPL"), self._holding("MP")],
+            generated_at="2026-01-02T00:00:00+00:00",
+        )
+        written = upload_portfolio_classifications(full_path, self.db_path)
+        self.assertEqual(written, 2)
 
 
 class FinancialSnapshotsUploadTest(unittest.TestCase):

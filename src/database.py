@@ -43,6 +43,7 @@ REQUIRED_TABLES = frozenset(
         "earnings_events",
         "dividend_events",
         "financial_snapshots",
+        "security_status",
     }
 )
 TRADE_EVENTS_VIEW = "v_trade_events"
@@ -200,6 +201,21 @@ def _apply_v10_position_engine_schema(connection: duckdb.DuckDBPyConnection) -> 
     _create_position_engine_tables(connection)
 
 
+def _apply_v14_email_amount_quality_schema(connection: duckdb.DuckDBPyConnection) -> None:
+    """Migrate an existing v13 database up to the v14 email-amount-quality schema.
+
+    Adds the column `parse_wealthsimple_email` now populates (see
+    `email_extractor.py`) recording whether a trade's CAD/USD amount was
+    stated by the confirmation email, derived from quantity x fill price, or
+    left missing -- so `v_trade_events`/the position engine/analytics can
+    flag a sale's proceeds and realized gain as an estimate instead of
+    silently treating a derived figure as a confirmed brokerage amount.
+    """
+    connection.execute(
+        "ALTER TABLE email_transactions ADD COLUMN IF NOT EXISTS amount_quality VARCHAR"
+    )
+
+
 def _create_statement_balances_table(connection: duckdb.DuckDBPyConnection) -> None:
     """Create the table tracking every statement line's trailing balance.
 
@@ -311,6 +327,38 @@ def _create_financial_snapshots_table(connection: duckdb.DuckDBPyConnection) -> 
             extra JSON,
             fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (ticker_id, period_end_date),
+            FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
+        )
+        """
+    )
+
+
+def _create_security_status_table(connection: duckdb.DuckDBPyConnection) -> None:
+    """Create the security_status table (declared, non-ownership intent).
+
+    Shared between `_deploy_schema` (fresh installs) and the v14->v15
+    migration so both paths stay in lockstep, matching every other
+    table-creation helper in this module.
+
+    Deliberately does NOT store "owned" as a status: ownership is already
+    derivable and authoritative from `position_snapshots.quantity > 0` (see
+    `analytics.get_holdings`), so writing it here would create a second,
+    driftable truth the moment a position closes. This table only records
+    *declared* intent for a ticker the pipeline has not (or no longer)
+    transacted -- a wishlist candidate, a name to avoid, or a retired idea.
+    Callers resolve the effective status as owned > declared_status > unknown
+    (see `analytics.resolve_security_status`), so a wishlist ticker that gets
+    bought becomes "owned" automatically with no write to this table.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS security_status (
+            ticker_id BIGINT PRIMARY KEY,
+            declared_status VARCHAR NOT NULL,
+            rationale VARCHAR,
+            declared_at TIMESTAMP NOT NULL,
+            declared_by VARCHAR NOT NULL,
+            CHECK (declared_status IN ('wishlist', 'avoid', 'retired')),
             FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)
         )
         """
@@ -802,6 +850,7 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
         _create_statement_balances_table(connection)
         _create_earnings_dividends_tables(connection)
         _create_financial_snapshots_table(connection)
+        _create_security_status_table(connection)
         connection.execute(
             """
             INSERT INTO schema_metadata (component, schema_version)
@@ -1168,14 +1217,44 @@ def initialize_database(db_path: str | Path = DATABASE_PATH) -> bool:
                     _create_financial_snapshots_table(connection)
                     connection.execute(
                         "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
-                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                        [13, SCHEMA_COMPONENT],
                     )
                     connection.execute("COMMIT")
                 except Exception:
                     connection.execute("ROLLBACK")
                     logger.exception("Database migration from version 12 failed")
                     raise
-                logger.info("Database migrated from schema version 12 to %d", DATABASE_SCHEMA_VERSION)
+                logger.info("Database migrated from schema version 12 to 13")
+                row = (13,)
+            if row and row[0] == 13:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    _apply_v14_email_amount_quality_schema(connection)
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [14, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 13 failed")
+                    raise
+                logger.info("Database migrated from schema version 13 to 14")
+                row = (14,)
+            if row and row[0] == 14:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    _create_security_status_table(connection)
+                    connection.execute(
+                        "UPDATE schema_metadata SET schema_version = ? WHERE component = ?",
+                        [DATABASE_SCHEMA_VERSION, SCHEMA_COMPONENT],
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    logger.exception("Database migration from version 14 failed")
+                    raise
+                logger.info("Database migrated from schema version 14 to %d", DATABASE_SCHEMA_VERSION)
                 _create_trade_events_view(connection)
                 return False
         if existing_tables:

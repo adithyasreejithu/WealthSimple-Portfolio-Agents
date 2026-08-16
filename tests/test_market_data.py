@@ -1,9 +1,12 @@
+import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 from unittest.mock import ANY, Mock, patch
 
 import pandas as pd
 
+import database
 import market_data
 
 
@@ -714,6 +717,153 @@ class FinancialSnapshotsSyncTest(unittest.TestCase):
 
         self.assertFalse(result.succeeded)
         self.assertEqual(connection.execute.call_args_list[-1].args[0], "ROLLBACK")
+
+
+class GetMarketTargetsScopeTest(unittest.TestCase):
+    """Real fixture DB (not mocked) -- exercises the actual `owned_dates` /
+    `security_status` LEFT JOIN in `get_market_targets`, not just callers
+    that mock the function out entirely."""
+
+    def setUp(self):
+        database.close_connection()
+        self.temp_dir = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
+        self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
+        database.initialize_database(self.db_path)
+        self.connection = database.get_shared_connection(self.db_path)
+
+    def _seed_ticker(self, symbol, *, owned=False, declared_status=None):
+        ticker_id = self.connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES (?, 'NASDAQ', 'USD', ?, 'stock') RETURNING ticker_id""",
+            [symbol, f"{symbol} Inc."],
+        ).fetchone()[0]
+        self.connection.execute(
+            """INSERT INTO ticker_provider_mappings (ticker_id, provider, provider_symbol, verification_status)
+               VALUES (?, 'yahoo', ?, 'verified')""",
+            [ticker_id, symbol],
+        )
+        if owned:
+            self.connection.execute(
+                "INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, debit) "
+                "VALUES (?, 'BUY', ?, 10, 1000)",
+                [date(2025, 1, 2), ticker_id],
+            )
+        if declared_status:
+            self.connection.execute(
+                """INSERT INTO security_status (ticker_id, declared_status, rationale, declared_at, declared_by)
+                   VALUES (?, ?, NULL, CURRENT_TIMESTAMP, 'test')""",
+                [ticker_id, declared_status],
+            )
+        return ticker_id
+
+    def test_owned_only_by_default(self):
+        self._seed_ticker("OWNED", owned=True)
+        self._seed_ticker("WISH", declared_status="wishlist")
+        targets = market_data.get_market_targets(self.db_path)
+        symbols = {t.symbol for t in targets}
+        self.assertEqual(symbols, {"OWNED"})
+        self.assertEqual(targets[0].scope, "portfolio")
+
+    def test_include_research_admits_declared_wishlist(self):
+        self._seed_ticker("OWNED", owned=True)
+        self._seed_ticker("WISH", declared_status="wishlist")
+        targets = market_data.get_market_targets(self.db_path, include_research=True)
+        by_symbol = {t.symbol: t for t in targets}
+        self.assertEqual(set(by_symbol), {"OWNED", "WISH"})
+        self.assertEqual(by_symbol["OWNED"].scope, "portfolio")
+        self.assertEqual(by_symbol["WISH"].scope, "research")
+        self.assertIsNone(by_symbol["WISH"].first_owned_date)
+
+    def test_avoid_and_retired_excluded_even_with_include_research(self):
+        self._seed_ticker("AVOID", declared_status="avoid")
+        self._seed_ticker("RETIRED", declared_status="retired")
+        targets = market_data.get_market_targets(self.db_path, include_research=True)
+        self.assertEqual(targets, [])
+
+    def test_undeclared_unowned_ticker_excluded_even_with_include_research(self):
+        self._seed_ticker("NOSTATUS")
+        targets = market_data.get_market_targets(self.db_path, include_research=True)
+        self.assertEqual(targets, [])
+
+    def test_symbols_filter_still_applies_under_include_research(self):
+        self._seed_ticker("OWNED", owned=True)
+        self._seed_ticker("WISH", declared_status="wishlist")
+        targets = market_data.get_market_targets(
+            self.db_path, symbols=["WISH"], include_research=True
+        )
+        self.assertEqual([t.symbol for t in targets], ["WISH"])
+
+
+class MarketTargetHistoryFloorNoOwnershipTest(unittest.TestCase):
+    def test_history_floor_falls_back_to_minimum_history_when_never_owned(self):
+        target = market_data.MarketTarget(
+            ticker_id=1, symbol="WISH", provider_symbol="WISH", currency="USD",
+            security_name="Wish Co", first_owned_date=None,
+            earliest_market_date=None, latest_market_date=None, scope="research",
+        )
+        with patch.object(market_data, "MINIMUM_PRICE_HISTORY_DAYS", 30):
+            floor = target.history_floor(date(2026, 8, 14))
+        self.assertEqual(floor, date(2026, 7, 15))
+
+
+class SyncFunctionsIncludeResearchForwardingTest(unittest.TestCase):
+    """Every sync function defaults to owned-only and forwards `include_research`
+    verbatim to `get_market_targets` -- `pipeline` never passes it, so this is
+    what keeps routine syncs byte-for-byte unaffected by the research widening."""
+
+    def test_sync_market_data_defaults_to_owned_only(self):
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "ensure_fx_history", return_value=0),
+            patch.object(market_data, "ensure_benchmark_history", return_value=0),
+            patch.object(market_data, "get_market_targets", return_value=[]) as get_targets,
+        ):
+            market_data.sync_market_data("portfolio.duckdb")
+        get_targets.assert_called_once_with("portfolio.duckdb", None, include_research=False)
+
+    def test_sync_market_data_widens_with_include_research(self):
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "ensure_fx_history", return_value=0),
+            patch.object(market_data, "ensure_benchmark_history", return_value=0),
+            patch.object(market_data, "get_market_targets", return_value=[]) as get_targets,
+        ):
+            market_data.sync_market_data("portfolio.duckdb", include_research=True)
+        get_targets.assert_called_once_with("portfolio.duckdb", None, include_research=True)
+
+    def test_sync_earnings_dividends_defaults_to_owned_only(self):
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[]) as get_targets,
+        ):
+            market_data.sync_earnings_dividends("portfolio.duckdb")
+        get_targets.assert_called_once_with("portfolio.duckdb", None, include_research=False)
+
+    def test_sync_earnings_dividends_widens_with_include_research(self):
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[]) as get_targets,
+        ):
+            market_data.sync_earnings_dividends("portfolio.duckdb", include_research=True)
+        get_targets.assert_called_once_with("portfolio.duckdb", None, include_research=True)
+
+    def test_sync_financial_snapshots_defaults_to_owned_only(self):
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[]) as get_targets,
+        ):
+            market_data.sync_financial_snapshots("portfolio.duckdb")
+        get_targets.assert_called_once_with("portfolio.duckdb", None, include_research=False)
+
+    def test_sync_financial_snapshots_widens_with_include_research(self):
+        with (
+            patch.object(market_data, "initialize_database"),
+            patch.object(market_data, "get_market_targets", return_value=[]) as get_targets,
+        ):
+            market_data.sync_financial_snapshots("portfolio.duckdb", include_research=True)
+        get_targets.assert_called_once_with("portfolio.duckdb", None, include_research=True)
 
 
 if __name__ == "__main__":

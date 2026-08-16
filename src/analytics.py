@@ -208,6 +208,69 @@ def get_excluded_positions(db_path: str = DATABASE_PATH) -> list[Holding]:
     ]
 
 
+def resolve_security_status(ticker: str, db_path: str = DATABASE_PATH) -> dict[str, Any]:
+    """Resolve one ticker's effective status: owned > declared > unknown.
+
+    Ownership is derived fresh from `position_snapshots.quantity > 0` and
+    always wins over any row in `security_status` -- a wishlist ticker that
+    gets bought becomes "owned" with no write required (see
+    `database._create_security_status_table`'s docstring). A symbol absent
+    from `tickers` entirely resolves to `resolved: False` rather than
+    raising, so callers (the `security-status` skill) have a clean
+    not-applicable case for an unresolvable ticker, matching
+    `security_technicals_cli.build_result`'s same convention.
+    """
+    connection = get_shared_connection(db_path)
+    symbol = ticker.upper().strip()
+
+    ticker_row = connection.execute(
+        "SELECT ticker_id FROM tickers WHERE ticker_symbol = ?",
+        [symbol],
+    ).fetchone()
+    if ticker_row is None:
+        return {"ticker": symbol, "resolved": False, "status": "unknown", "declaration": None}
+
+    ticker_id = int(ticker_row[0])
+    ensure_positions_fresh(connection)
+    position_row = connection.execute(
+        "SELECT quantity FROM position_snapshots WHERE ticker_id = ?",
+        [ticker_id],
+    ).fetchone()
+    quantity = _decimal(position_row[0]) if position_row is not None else Decimal("0")
+
+    declared_row = connection.execute(
+        """
+        SELECT declared_status, rationale, declared_at, declared_by
+        FROM security_status WHERE ticker_id = ?
+        """,
+        [ticker_id],
+    ).fetchone()
+    declaration: dict[str, Any] | None = None
+    if declared_row is not None:
+        declared_at = declared_row[2]
+        declaration = {
+            "declared_status": declared_row[0],
+            "rationale": declared_row[1],
+            "declared_at": declared_at.isoformat() if declared_at is not None else None,
+            "declared_by": declared_row[3],
+        }
+
+    if quantity > 0:
+        status = "owned"
+    elif declaration is not None:
+        status = declaration["declared_status"]
+    else:
+        status = "unknown"
+
+    return {
+        "ticker": symbol,
+        "ticker_id": ticker_id,
+        "resolved": True,
+        "status": status,
+        "declaration": declaration,
+    }
+
+
 def get_cash_summary(db_path: str = DATABASE_PATH) -> CashSummary:
     """Return the current cash balance, anchored to the latest statement and
     rolled forward with any CSV-sourced activity since then.
@@ -281,6 +344,20 @@ def get_position(ticker_id: int, db_path: str = DATABASE_PATH) -> Holding:
         last_price=None,
         last_price_date=None,
     )
+
+
+def get_ticker_id(symbol: str, db_path: str = DATABASE_PATH) -> int | None:
+    """Resolve a pipeline ticker symbol to its `ticker_id`, case-insensitive.
+
+    `None` for an unknown symbol -- a caller (e.g. `workspace.policy_worksheet`
+    sizing a not-yet-held candidate) needs to distinguish "not on file" from
+    "on file with id 0" rather than getting a placeholder `Holding`."""
+    connection = get_shared_connection(db_path)
+    row = connection.execute(
+        "SELECT ticker_id FROM tickers WHERE UPPER(ticker_symbol) = UPPER(?) ORDER BY ticker_id LIMIT 1",
+        [symbol],
+    ).fetchone()
+    return int(row[0]) if row else None
 
 
 def _load_json_column(value: Any, default: Any) -> Any:
@@ -1117,6 +1194,14 @@ def _get_classifications(db_path: str, ticker_ids: list[int]) -> dict[int, dict[
             "review_needed": bool(review_needed),
         }
     return classifications
+
+
+def get_classification(ticker_id: int, db_path: str = DATABASE_PATH) -> dict[str, Any] | None:
+    """A single ticker's `portfolio_classifications` row, or `None` if it has
+    none yet. Public single-ticker wrapper around `_get_classifications` for
+    callers (e.g. `workspace.policy_worksheet`) that need one security's
+    group rather than a batch keyed by every held ticker_id."""
+    return _get_classifications(db_path, [ticker_id]).get(ticker_id)
 
 
 def get_group_allocation(db_path: str, holdings: list[Holding]) -> dict[str, Any]:

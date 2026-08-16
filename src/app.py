@@ -26,9 +26,11 @@ from config import (
 from data_sorter import move_to_processed_folder, sort_data
 from database import close_connection, get_shared_connection, initialize_database
 from database_command import (
+    SECURITY_STATUS_VALUES,
     get_email_checkpoint,
     reconcile_email_transactions,
     reconcile_statement_activities,
+    set_security_status,
     update_email_checkpoint,
     upload_email_transactions,
     upload_portfolio_classifications,
@@ -712,6 +714,10 @@ def _print_root_help() -> None:
     )
     commands = parser.add_subparsers(dest="command", title="commands")
     commands.add_parser("pipeline", help="Run the staged data pipeline.")
+    commands.add_parser(
+        "classify",
+        help="Classify current holdings and sync the result into DuckDB in one step.",
+    )
     commands.add_parser("analytics", help="Show a portfolio analytics report.")
     commands.add_parser("statements", help="Extract PDF statement activity.")
     commands.add_parser("email", help="Extract email transactions.")
@@ -763,8 +769,13 @@ def _print_root_help() -> None:
     commands.add_parser(
         "run",
         help="Create and manage investment-research run workspaces "
-             "(create, show, list, register-evidence, build-manifest, validate, "
-             "set-status, archive).",
+             "(create, show, list, register-evidence, build-manifest, build-worksheet, "
+             "check-thesis, save-thesis, build-policy-context, check-decision, save-decision, "
+             "validate, set-status, archive, gc).",
+    )
+    commands.add_parser(
+        "database",
+        help="Manage database-level declarations outside pipeline ingestion (status).",
     )
     parser.print_help()
 
@@ -1195,6 +1206,27 @@ def _run_classification_sync_command(argv: list[str]) -> int:
     return 0
 
 
+def _run_classify_command(argv: list[str]) -> int:
+    """Classify current holdings and sync the result into DuckDB in one step.
+
+    Equivalent to `portfolio-classify` followed by `classification-sync`, as
+    its own command -- classification is not part of `pipeline` (see
+    `run_pipeline`'s docstring), so this is how the dashboard's "Run
+    Classification" action and any other caller triggers it directly.
+    """
+    parser = argparse.ArgumentParser(
+        description="Classify current holdings and persist the result into DuckDB."
+    )
+    parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    args = parser.parse_args(argv)
+    result = _run_portfolio_classification(args.database)
+    if result.status == "failed":
+        print(f"classify failed: {result.error}", file=sys.stderr)
+        return 1
+    print(f"classify: succeeded ({result.rows} row(s)) -> {result.source_file}")
+    return 0
+
+
 def _run_recompute_positions_command(argv: list[str]) -> int:
     """Force a full rebuild of position_ledger/position_snapshots.
 
@@ -1226,6 +1258,53 @@ def _run_reconcile_holdings_command(argv: list[str]) -> int:
     return 0 if result.ok else 1
 
 
+def _run_database_command(argv: list[str]) -> int:
+    """Manage database-level declarations that are not part of pipeline ingestion.
+
+    Currently one subcommand: `status`, which declares or clears a ticker's
+    non-ownership status (wishlist/avoid/retired) in `security_status`.
+    CLI/human-only by design -- no agent gets write access to this table
+    (see `.claude/skills/security-status/`, which is read-only).
+    """
+    parser = argparse.ArgumentParser(
+        prog="python src/app.py database",
+        description="Manage database-level declarations outside pipeline ingestion.",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Declare or clear a ticker's non-ownership status (wishlist/avoid/retired).",
+    )
+    status_parser.add_argument("--ticker", required=True, help="Ticker symbol.")
+    status_parser.add_argument(
+        "--set",
+        dest="status",
+        required=True,
+        choices=sorted(SECURITY_STATUS_VALUES) + ["clear"],
+        help="Status to declare, or 'clear' to remove any existing declaration.",
+    )
+    status_parser.add_argument("--rationale", default=None, help="Optional free-text reason.")
+    status_parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+
+    args = parser.parse_args(argv)
+    if args.subcommand == "status":
+        try:
+            result = set_security_status(
+                args.ticker,
+                args.status,
+                db_path=args.database,
+                rationale=args.rationale,
+                declared_by="cli",
+            )
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        print(json.dumps(result, default=str, indent=2))
+        return 0
+    return 1
+
+
 def _run_workspace_command(argv: list[str]) -> int:
     """Create and manage run workspaces (`docs/architecture/run_workspace.md`).
 
@@ -1245,6 +1324,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if raw_args and raw_args[0] == "pipeline":
         return _run_pipeline_command(raw_args[1:])
+    if raw_args and raw_args[0] == "classify":
+        return _run_classify_command(raw_args[1:])
     if raw_args and raw_args[0] == "analytics":
         return _run_analytics_command(raw_args[1:])
     if raw_args and raw_args[0] == "yfinance-sync":
@@ -1263,6 +1344,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_reconcile_holdings_command(raw_args[1:])
     if raw_args and raw_args[0] == "run":
         return _run_workspace_command(raw_args[1:])
+    if raw_args and raw_args[0] == "database":
+        return _run_database_command(raw_args[1:])
 
     # Delegate to module entry points so each command keeps one argument contract.
     delegated_commands = {

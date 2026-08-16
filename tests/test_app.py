@@ -221,6 +221,25 @@ class AppPipelineTest(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertIn("yfinance unavailable", result.error)
 
+    def test_classify_command_succeeds(self):
+        with patch.object(
+            app, "_run_portfolio_classification",
+            return_value=app.SourceResult("classification", Path("out.json"), "succeeded", 28),
+        ) as classify:
+            output = app.main(["classify", "--database", str(self.data_dir / "db.duckdb")])
+
+        self.assertEqual(output, 0)
+        classify.assert_called_once_with(self.data_dir / "db.duckdb")
+
+    def test_classify_command_failure_returns_nonzero(self):
+        with patch.object(
+            app, "_run_portfolio_classification",
+            return_value=app.SourceResult("classification", None, "failed", error="boom"),
+        ):
+            output = app.main(["classify"])
+
+        self.assertEqual(output, 1)
+
     def test_analytics_command_prints_report(self):
         report = {
             "generated_at": "2025-01-01T00:00:00",

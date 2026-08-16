@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
@@ -70,9 +70,11 @@ class MarketTarget:
     provider_symbol: str
     currency: str
     security_name: str
-    first_owned_date: date
+    first_owned_date: date | None
     earliest_market_date: date | None
     latest_market_date: date | None
+    asset_class: str = "stock"
+    scope: str = "portfolio"
 
     def history_floor(self, today: date) -> date:
         """How far back stored history should reach.
@@ -80,9 +82,15 @@ class MarketTarget:
         Ownership alone is not deep enough: a name bought last month can never
         accumulate the ~275 bars an SMA-200 or a 365-day relative-strength
         window needs. The floor is therefore the earlier of first ownership and
-        `MINIMUM_PRICE_HISTORY_DAYS` ago.
+        `MINIMUM_PRICE_HISTORY_DAYS` ago. A research-scoped target has no
+        ownership date at all (`first_owned_date is None`), so the floor is
+        just `MINIMUM_PRICE_HISTORY_DAYS` ago -- still enough bars for the
+        same technicals.
         """
-        return min(self.first_owned_date, today - timedelta(days=MINIMUM_PRICE_HISTORY_DAYS))
+        floor = today - timedelta(days=MINIMUM_PRICE_HISTORY_DAYS)
+        if self.first_owned_date is None:
+            return floor
+        return min(self.first_owned_date, floor)
 
     def fetch_ranges(self, today: date, *, full: bool = False) -> list[tuple[date, date]]:
         """The `[start, end)` ranges to request, head gap first.
@@ -146,14 +154,36 @@ class FinancialSnapshotsSyncResult:
         return self.error is None
 
 
+RESEARCH_STATUSES = frozenset({"wishlist"})
+
+
 def get_market_targets(
     db_path: Path | str = DATABASE_PATH,
     symbols: Iterable[str] | None = None,
+    *,
+    include_research: bool = False,
 ) -> list[MarketTarget]:
-    """Return portfolio tickers with ownership and synchronization boundaries."""
+    """Return synchronization targets with ownership/research scope and boundaries.
+
+    `include_research=False` (the default) reproduces the original
+    owned-only behavior byte-for-byte -- `pipeline`, `yfinance-sync`,
+    `earnings-dividends-sync`, and `financial-snapshots-sync` never pass this,
+    so routine syncs stay scoped to what's actually held. `include_research=True`
+    additionally admits tickers with a `security_status.declared_status` in
+    `RESEARCH_STATUSES` (currently just `wishlist`) even though they have zero
+    transactions -- the on-demand path `investment-analyst-resources` uses to
+    persist real price/earnings/dividend/financials history for a research
+    candidate. `avoid` and `retired` are deliberately excluded from both scopes.
+    """
     requested = {str(symbol).strip().upper() for symbol in symbols or [] if str(symbol).strip()}
+    research_clause = (
+        "OR (s.declared_status IN (" + ", ".join("?" for _ in RESEARCH_STATUSES) + "))"
+        if include_research
+        else ""
+    )
+    params: list[Any] = list(RESEARCH_STATUSES) if include_research else []
     rows = get_shared_connection(db_path).execute(
-        """
+        f"""
         WITH owned_dates AS (
             SELECT ticker_id, MIN(transaction_date) AS first_owned_date
             FROM (
@@ -183,21 +213,26 @@ def get_market_targets(
             t.security_name,
             o.first_owned_date,
             h.earliest_market_date,
-            h.latest_market_date
-        FROM owned_dates o
-        JOIN tickers t USING (ticker_id)
+            h.latest_market_date,
+            t.security_type,
+            CASE WHEN o.first_owned_date IS NOT NULL THEN 'portfolio' ELSE 'research' END AS scope
+        FROM tickers t
         JOIN ticker_provider_mappings m
           ON m.ticker_id = t.ticker_id
          AND m.provider = 'yahoo'
          AND m.verification_status = 'verified'
-        LEFT JOIN history_bounds h USING (ticker_id)
+        LEFT JOIN owned_dates o ON o.ticker_id = t.ticker_id
+        LEFT JOIN history_bounds h ON h.ticker_id = t.ticker_id
+        LEFT JOIN security_status s ON s.ticker_id = t.ticker_id
+        WHERE o.first_owned_date IS NOT NULL {research_clause}
         ORDER BY t.ticker_symbol, t.exchange
-        """
+        """,
+        params,
     ).fetchall()
     targets = [
         MarketTarget(
             int(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4]),
-            row[5], row[6], row[7],
+            row[5], row[6], row[7], str(row[8] or "stock"), str(row[9]),
         )
         for row in rows
     ]
@@ -397,10 +432,16 @@ def sync_market_data(
     *,
     as_of: date | None = None,
     full: bool = False,
+    include_research: bool = False,
     metadata_fetcher: MetadataFetcher = fetch_security_info,
     history_fetcher: HistoryFetcher = _fetch_security_history_strict,
 ) -> MarketSyncResult:
-    """Fetch and atomically persist metadata and incremental price history."""
+    """Fetch and atomically persist metadata and incremental price history.
+
+    Scoped to owned tickers by default; pass `include_research=True` to also
+    sync declared-wishlist tickers (see `get_market_targets`). `pipeline`
+    never sets this, so routine syncs are unaffected.
+    """
     initialize_database(db_path)
     today = as_of or date.today()
     try:
@@ -416,7 +457,7 @@ def sync_market_data(
         # Benchmarks only feed the dashboard's trend overlays; same failure
         # isolation as the FX pair.
         logger.exception("Benchmark history synchronization failed; continuing with ticker sync")
-    targets = get_market_targets(db_path, symbols)
+    targets = get_market_targets(db_path, symbols, include_research=include_research)
     if not targets:
         return MarketSyncResult(0, 0, 0)
 
@@ -479,6 +520,7 @@ def sync_earnings_dividends(
     db_path: Path | str = DATABASE_PATH,
     symbols: Iterable[str] | None = None,
     *,
+    include_research: bool = False,
     earnings_fetcher: Callable[[Iterable[str]], pd.DataFrame] = fetch_earnings_events,
     dividends_fetcher: Callable[[Iterable[str]], pd.DataFrame] = fetch_dividend_events,
     skip_earnings: bool = False,
@@ -486,15 +528,16 @@ def sync_earnings_dividends(
 ) -> EarningsDividendsSyncResult:
     """Fetch and atomically persist company-declared earnings/dividend calendars.
 
-    Scoped to owned tickers with a verified Yahoo mapping (reuses
-    `get_market_targets`, the same scope as `sync_market_data`). This is
+    Scoped to owned tickers with a verified Yahoo mapping by default (reuses
+    `get_market_targets`, the same scope as `sync_market_data`); pass
+    `include_research=True` to also cover declared-wishlist tickers. This is
     company-declared market data, distinct from the user's own received
     dividend cash in `cash_transactions`/`transactions` -- the two are never
     joined or conflated. Runs on demand only; unlike OHLCV it is not part of
     the automatic post-email sync.
     """
     initialize_database(db_path)
-    targets = get_market_targets(db_path, symbols)
+    targets = get_market_targets(db_path, symbols, include_research=include_research)
     if not targets:
         return EarningsDividendsSyncResult(0, 0, 0)
 
@@ -544,13 +587,15 @@ def sync_financial_snapshots(
     db_path: Path | str = DATABASE_PATH,
     symbols: Iterable[str] | None = None,
     *,
+    include_research: bool = False,
     snapshots_fetcher: Callable[[Iterable[str]], pd.DataFrame] = fetch_financial_snapshots,
 ) -> FinancialSnapshotsSyncResult:
     """Fetch and atomically persist per-quarter company financial statement data.
 
-    Scoped to owned tickers with a verified Yahoo mapping (reuses
+    Scoped to owned tickers with a verified Yahoo mapping by default (reuses
     `get_market_targets`, the same scope as `sync_market_data`/
-    `sync_earnings_dividends`). Not date-windowed: every run re-fetches each
+    `sync_earnings_dividends`); pass `include_research=True` to also cover
+    declared-wishlist tickers. Not date-windowed: every run re-fetches each
     ticker's currently-available quarterly window and upserts it against
     what's already stored -- yfinance's own quarterly statement endpoints
     only ever return a shallow trailing window, so accumulated depth comes
@@ -558,7 +603,7 @@ def sync_financial_snapshots(
     only; unlike OHLCV it is not part of the automatic post-email sync.
     """
     initialize_database(db_path)
-    targets = get_market_targets(db_path, symbols)
+    targets = get_market_targets(db_path, symbols, include_research=include_research)
     if not targets:
         return FinancialSnapshotsSyncResult(0, 0)
 

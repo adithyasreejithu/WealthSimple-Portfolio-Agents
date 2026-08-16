@@ -512,32 +512,103 @@ def upload_financial_snapshots(
     return written
 
 
+def _check_export_not_stale(
+    connection: Any, *, generated_at: str, holdings: list[dict[str, Any]]
+) -> None:
+    """Refuse a classification sync that would silently erase currently-
+    classified tickers.
+
+    Triggers only when both are true: (1) the export's ticker set is a
+    strict subset of what `portfolio_classifications` already holds, and (2)
+    the export predates the most recent `security_status` declaration --
+    i.e. this looks exactly like a pre-Feature-A export, or one generated
+    before a wishlist ticker was declared, being synced over good rows. A
+    subset export that is *newer* than the last declaration is left alone:
+    that is a legitimate case (a wishlist declaration was removed since the
+    export was built) and must remain syncable.
+    """
+    current_ticker_ids = {
+        row[0] for row in connection.execute("SELECT ticker_id FROM portfolio_classifications").fetchall()
+    }
+    if not current_ticker_ids:
+        return  # nothing to lose
+    export_ticker_ids: set[int] = set()
+    for holding in holdings:
+        rows = connection.execute(
+            "SELECT ticker_id FROM tickers WHERE ticker_symbol = ?", [holding["ticker"]]
+        ).fetchall()
+        if len(rows) == 1:
+            export_ticker_ids.add(rows[0][0])
+    if not (export_ticker_ids < current_ticker_ids):
+        return  # not a strict subset -- nothing at risk of being dropped
+    newest_declared_at = connection.execute("SELECT MAX(declared_at) FROM security_status").fetchone()[0]
+    if newest_declared_at is None:
+        return  # no declarations exist to have gone stale against
+    # `generated_at` is timezone-aware UTC (see `classify_portfolio`); DuckDB
+    # TIMESTAMP columns come back naive. Both are UTC wall-clock values, so
+    # strip the offset rather than attach one, to compare like with like.
+    generated_at_dt = datetime.fromisoformat(generated_at).replace(tzinfo=None)
+    if generated_at_dt >= newest_declared_at:
+        return  # export is current enough
+    missing = sorted(current_ticker_ids - export_ticker_ids)
+    raise ValueError(
+        f"Refusing to sync a stale classification export: it covers {len(export_ticker_ids)} "
+        f"of {len(current_ticker_ids)} currently-classified ticker(s), missing ticker_id(s) "
+        f"{missing}, and was generated at {generated_at!r} -- before the most recent "
+        f"security_status declaration at {newest_declared_at.isoformat()!r}. Run "
+        "`python src/app.py classify` to regenerate a current export before syncing."
+    )
+
+
 def upload_portfolio_classifications(
     json_path: Path | str | None = None,
     db_path: Path | str = DATABASE_PATH,
 ) -> int:
-    """Fully replace portfolio_classifications from the classify-portfolio JSON output."""
+    """Fully replace portfolio_classifications from the classify-portfolio JSON output.
+
+    Matches each holding by `ticker_symbol` alone (not `ticker_symbol AND
+    exchange`) -- the exchange string on a `tickers` row can be rewritten by a
+    yfinance metadata refresh between when classify-portfolio read it and when
+    this sync runs, and matching on both meant that mismatch silently dropped
+    the holding's classification (only a log warning) after the table had
+    already been cleared by the DELETE below, leaving a currently-owned
+    holding with no row at all. A missing or ambiguous match now raises,
+    rolling back the whole sync instead of committing a partial table.
+
+    A full DELETE+reinsert is safe once `classify_portfolio()` covers owned
+    holdings *and* declared wishlist tickers in one pass (see
+    `classification_workflow.classify_portfolio`) -- nothing legitimately
+    classified is ever missing from a current export. What is not safe is
+    syncing a *stale* export generated before wishlist classification existed,
+    or before a wishlist declaration changed: that export would be missing
+    tickers this table currently has rows for, and the DELETE would erase
+    them with nothing to replace them. `_check_export_not_stale` below is the
+    guard against exactly that -- it refuses the sync rather than silently
+    reverting a currently-classified ticker to unclassified.
+    """
     path = Path(json_path) if json_path is not None else DEFAULT_CLASSIFICATION_JSON_PATH
     payload = json.loads(path.read_text(encoding="utf-8"))
     generated_at = payload["generated_at"]
     holdings = payload["holdings"]
     connection = get_shared_connection(db_path)
+    _check_export_not_stale(connection, generated_at=generated_at, holdings=holdings)
     written = 0
     connection.execute("BEGIN TRANSACTION")
     try:
         connection.execute("DELETE FROM portfolio_classifications")
         for holding in holdings:
             fields = holding.get("fields") or {}
-            row = connection.execute(
-                "SELECT ticker_id FROM tickers WHERE ticker_symbol = ? AND exchange = ?",
-                [holding["ticker"], fields.get("exchange")],
-            ).fetchone()
-            if row is None:
-                logger.warning(
-                    "Skipping classification upload for unresolved ticker | ticker=%s",
-                    holding["ticker"],
+            rows = connection.execute(
+                "SELECT ticker_id FROM tickers WHERE ticker_symbol = ?",
+                [holding["ticker"]],
+            ).fetchall()
+            if len(rows) != 1:
+                raise ValueError(
+                    f"Cannot sync classification for ticker={holding['ticker']!r}: "
+                    f"expected exactly one tickers row, found {len(rows)} "
+                    f"(exchange in classification JSON was {fields.get('exchange')!r})"
                 )
-                continue
+            row = rows[0]
             connection.execute(
                 """
                 INSERT INTO portfolio_classifications (
@@ -644,6 +715,77 @@ def ensure_tickers(
         len(hints), reused_count, fully_enriched, partially_enriched, len(unresolved),
     )
     return candidates
+
+
+SECURITY_STATUS_VALUES = frozenset({"wishlist", "avoid", "retired"})
+
+
+def set_security_status(
+    ticker: str,
+    status: str,
+    db_path: Path | str = DATABASE_PATH,
+    rationale: str | None = None,
+    declared_by: str = "cli",
+) -> dict[str, Any]:
+    """Declare or clear a ticker's non-ownership status (wishlist/avoid/retired).
+
+    Write path only -- never invoked by an agent (see the read-only
+    `security-status` skill). `status="clear"` deletes any declaration.
+    Ownership itself is never stored here -- it stays derived from
+    `position_snapshots.quantity > 0` (see `security_status` table's
+    docstring in `database.py`), so a wishlist ticker that gets bought
+    becomes "owned" automatically with no write to this table.
+
+    A wishlist symbol may not have been transacted yet, so it may have no
+    `tickers` row at all; `ensure_tickers` resolves or creates one via
+    yfinance the same way every other ingestion path does, giving the
+    declaration a clean FK like every other table in the schema.
+    """
+    symbol = _text(ticker).upper()
+    if not symbol:
+        raise ValueError("ticker is required")
+    status = _text(status).lower()
+    if status != "clear" and status not in SECURITY_STATUS_VALUES:
+        raise ValueError(
+            f"Invalid status {status!r}; expected one of "
+            f"{', '.join(sorted(SECURITY_STATUS_VALUES))} or 'clear'"
+        )
+
+    candidates = ensure_tickers([symbol], db_path=db_path, require_all=True)
+    matches = candidates.get(symbol, [])
+    if len(matches) != 1:
+        raise ValueError(
+            f"{symbol} matches {len(matches)} ticker(s) across exchanges; "
+            "this symbol is already tracked and cannot be auto-resolved."
+        )
+    ticker_id = int(matches[0]["ticker_id"])
+    connection = get_shared_connection(db_path)
+
+    if status == "clear":
+        connection.execute("DELETE FROM security_status WHERE ticker_id = ?", [ticker_id])
+        logger.info("Cleared declared security status | ticker=%s", symbol)
+        return {"ticker": symbol, "ticker_id": ticker_id, "declared_status": None}
+
+    connection.execute(
+        """
+        INSERT INTO security_status (ticker_id, declared_status, rationale, declared_at, declared_by)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+        ON CONFLICT (ticker_id) DO UPDATE SET
+            declared_status = excluded.declared_status,
+            rationale = excluded.rationale,
+            declared_at = excluded.declared_at,
+            declared_by = excluded.declared_by
+        """,
+        [ticker_id, status, rationale, declared_by],
+    )
+    logger.info("Declared security status | ticker=%s | status=%s", symbol, status)
+    return {
+        "ticker": symbol,
+        "ticker_id": ticker_id,
+        "declared_status": status,
+        "rationale": rationale,
+        "declared_by": declared_by,
+    }
 
 
 def normalize_ticker_dataframe(
