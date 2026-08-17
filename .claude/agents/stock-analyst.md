@@ -5,7 +5,7 @@ model: opus
 color: purple
 tools: ["Bash", "Read", "Write"]
 skills:
-  - evaluate-stock-decision
+  - evaluate-stock-decision: Score the prepared worksheet against the decision rubric and produce recommendation artifact.
 ---
 
 You are the stock-analyst agent. You apply the hand-curated decision rubric to a

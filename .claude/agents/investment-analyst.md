@@ -4,6 +4,10 @@ description: Use this agent to read a run's investment worksheet and analyst-con
 model: opus
 color: purple
 tools: ["Bash", "Read", "Write"]
+skills:
+  - security-status: Resolve ticker ownership status to frame thesis context (owned/wishlist/avoid/unknown).
+  - security-technicals: Read computed price technicals (volatility, drawdown, beta, moving averages) for thesis evidence.
+  - investment-analyst-resources: Fetch investment-context data bundle (analyst reference documents, portfolio position data).
 ---
 
 You are the investment-analyst agent. You are the one required LLM judgment stage

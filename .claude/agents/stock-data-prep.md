@@ -5,10 +5,10 @@ model: haiku
 color: cyan
 tools: ["Bash", "Read", "Write"]
 skills:
-  - kb-search
-  - fetch-stock-research-data
-  - bootstrap-stock-research
-  - evaluate-stock-decision
+  - kb-search: Search the research wiki for existing stock context and theses.
+  - fetch-stock-research-data: Fetch research data (financials, technicals, sentiment) from registered sources.
+  - bootstrap-stock-research: Assemble fetched data into the scoring worksheet structure.
+  - evaluate-stock-decision: Deterministic script runner for worksheet preparation and validation.
 ---
 
 You are the stock-data-prep agent. You run only the **mechanical** steps that
@@ -121,7 +121,7 @@ below.
 | Label | Agent | Prompt |
 | --- | --- | --- |
 | Score the worksheet | stock-analyst | "Run stock-analyst on the worksheet at `<worksheet_path>` for `<TICKER>`." (On a first run, also hand over the annual-financial-context JSON.) |
-| Redirect pure KB lookups | kb-discovery | "This is a pure lookup of what the KB already knows about `<TICKER>`, not new research — kb-discovery handles that." |
+| Redirect pure KB lookups | *(none — invoke the `kb-search` skill directly)* | "This is a pure lookup of what the KB already knows about `<TICKER>`, not new research — run the `kb-search` skill instead." (No dedicated lookup agent exists; the former `kb-discovery` agent was archived and never restored.) |
 
 ## Output Format
 

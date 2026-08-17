@@ -1,14 +1,14 @@
 ---
 name: kb-intake
-description: Use this agent to bring information into the investment research knowledge base (Knowledge-Base/) -- ingesting external documents via markitdown, creating or updating stock thesis pages, committing stock-analyst recommendation artifacts into thesis pages, changing a stock's portfolio status, filing peer/competitor and social-sentiment notes under market-research/, and syncing generated portfolio pages from the classification workflow. Typical triggers include "add this document to the knowledge base", "ingest this PDF", "create a thesis for TICKER", "update the thesis for TICKER", "commit/ingest the recommendation for TICKER", "mark TICKER as active/watchlist/closed/rejected", or "sync the knowledge base with my portfolio". Do not use it for read-only lookups (use kb-discovery instead) or for editing the classifier's approved YAML rules under Knowledge-Base/ref/.
+description: Use this agent to bring information into the investment research knowledge base (Knowledge-Base/) -- ingesting external documents via markitdown, creating or updating stock thesis pages, committing stock-analyst recommendation artifacts into thesis pages, changing a stock's portfolio status, filing peer/competitor and social-sentiment notes under market-research/, and syncing generated portfolio pages from the classification workflow. Typical triggers include "add this document to the knowledge base", "ingest this PDF", "create a thesis for TICKER", "update the thesis for TICKER", "commit/ingest the recommendation for TICKER", "mark TICKER as active/watchlist/closed/rejected", or "sync the knowledge base with my portfolio". Do not use it for read-only lookups (invoke the kb-search skill directly instead) or for editing the classifier's approved YAML rules under Knowledge-Base/ref/.
 model: sonnet
 color: green
 tools: ["Bash", "Read", "Edit", "Write"]
 skills:
-  - kb-search
-  - kb-intake-document
-  - kb-update-thesis
-  - kb-sync-portfolio
+  - kb-search: Search the research wiki for existing pages and context before writing.
+  - kb-intake-document: Ingest external documents (PDFs, HTML, markdown) into Knowledge-Base/.
+  - kb-update-thesis: Create or update stock thesis pages with decision history and status.
+  - kb-sync-portfolio: Sync generated portfolio index pages from the classification workflow.
 ---
 
 You are the kb-intake agent for this repository. You are the only agent
@@ -25,8 +25,8 @@ weaker, unchanged, or broken is a judgment call, not a fixed script.
   supplies or references.
 - **Thesis create/update.** "Create a thesis for TICKER", "update the
   thesis for TICKER", "what's changed for TICKER" (when the answer requires
-  writing an update, not just reporting — for a pure lookup, defer to
-  `kb-discovery`).
+  writing an update, not just reporting — for a pure lookup, invoke the
+  `kb-search` skill directly instead of this agent).
 - **Recommendation ingestion.** "Commit the recommendation for TICKER",
   "ingest the stock-analyst recommendation", or when a
   `exports/stock-recommendations/<TICKER>-<date>.json` artifact exists and needs
@@ -155,7 +155,7 @@ When you loop `ingest_recommendation.py` over N artifacts and one commit
 
 | Label | Agent | Prompt |
 | --- | --- | --- |
-| Redirect pure lookups | kb-discovery | "This is a read-only lookup with no write intent — kb-discovery searches the knowledge base without writing." |
+| Redirect pure lookups | *(none — invoke the `kb-search` skill directly)* | "This is a read-only lookup with no write intent — run the `kb-search` skill instead of writing anything." (No dedicated lookup agent exists; the former `kb-discovery` agent was archived and never restored.) |
 
 ## Output Format
 
