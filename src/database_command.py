@@ -380,6 +380,75 @@ def upload_dividend_events(
     return written
 
 
+def upload_upcoming_dividends(
+    data: pd.DataFrame,
+    ticker_ids: dict[str, int],
+    db_path: Path | str = DATABASE_PATH,
+) -> int:
+    """Upsert forward-looking dividend rows, retiring superseded forecasts.
+
+    Same table and primary key as `upload_dividend_events` -- `dividend_events`
+    holds both the historical schedule and the one-or-few forward-looking rows
+    a ticker currently has, distinguished only by `ex_dividend_date` being in
+    the past or future. Mirrors `upload_earnings_events`'s retire-then-upsert
+    shape: for each ticker present in the fetched batch, first delete any
+    existing still-future row (`ex_dividend_date >= CURRENT_DATE`) so a
+    forecast that has since moved or been withdrawn does not linger, then
+    upsert every freshly fetched row with `pay_date` and `frequency`
+    populated. `upload_dividend_events`'s own `ON CONFLICT` clause never
+    touches those two columns, so a later historical re-sync of the same
+    ex-date cannot clobber them.
+    """
+    connection = get_shared_connection(db_path)
+    prepared: list[tuple[int, str, str | None, Decimal, str]] = []
+    batch_ticker_ids: set[int] = set()
+    for row in data.to_dict(orient="records"):
+        provider_symbol = _text(row.get("ProviderSymbol") or row.get("Ticker")).upper()
+        ticker_id = ticker_ids.get(provider_symbol)
+        ex_dividend_date = _optional_date(row.get("ExDividendDate"))
+        declared_amount = _optional_decimal(row.get("DeclaredAmount"))
+        if ticker_id is None:
+            raise ValueError(f"No ticker_id mapping for yfinance symbol {provider_symbol}")
+        if not ex_dividend_date or declared_amount is None:
+            raise ValueError(
+                f"Incomplete upcoming dividend row for {provider_symbol or 'unknown'}"
+            )
+        prepared.append(
+            (
+                ticker_id,
+                ex_dividend_date,
+                _optional_date(row.get("PayDate")),
+                declared_amount,
+                _text(row.get("Frequency")) or None,
+            )
+        )
+        batch_ticker_ids.add(ticker_id)
+
+    for ticker_id in batch_ticker_ids:
+        connection.execute(
+            "DELETE FROM dividend_events WHERE ticker_id = ? AND ex_dividend_date >= CURRENT_DATE",
+            [ticker_id],
+        )
+
+    written = 0
+    for ticker_id, ex_dividend_date, pay_date, declared_amount, frequency in prepared:
+        connection.execute(
+            """
+            INSERT INTO dividend_events (
+                ticker_id, ex_dividend_date, pay_date, declared_amount, frequency
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (ticker_id, ex_dividend_date) DO UPDATE SET
+                pay_date = excluded.pay_date,
+                declared_amount = excluded.declared_amount,
+                frequency = excluded.frequency,
+                fetched_at = now()
+            """,
+            [ticker_id, ex_dividend_date, pay_date, declared_amount, frequency],
+        )
+        written += 1
+    return written
+
+
 def upload_earnings_events(
     data: pd.DataFrame,
     ticker_ids: dict[str, int],
@@ -977,6 +1046,92 @@ def upload_statement_transactions(
     return written
 
 
+_EMAIL_ENRICHABLE_FIELDS = (
+    "account", "transaction_type", "quantity", "average_price",
+    "total_cost", "debit", "transaction_date", "price_currency", "amount_quality",
+)
+
+
+def _enrich_or_skip_email_transaction(
+    connection: Any, email_message_id: int, candidate: dict[str, Any], source_message_id: str
+) -> None:
+    """Refresh an existing email_transaction's parser-owned fields in place.
+
+    Only touches rows the position engine still treats as provisional and
+    unlinked (`reconciliation_status = 'provisional'` and no
+    `matched_activity_id`/`matched_transaction_id`) -- a row a reconciliation
+    pass has already linked to an activities/statement row is authoritative
+    and must never be silently rewritten by a later replay with an improved
+    parser. A replay whose values disagree with an already-linked row is
+    logged for manual review instead.
+    """
+    existing = connection.execute(
+        """
+        SELECT email_transaction_id, account, transaction_type, quantity, average_price,
+               total_cost, debit, transaction_date, price_currency, amount_quality,
+               reconciliation_status, matched_activity_id, matched_transaction_id
+        FROM email_transactions
+        WHERE email_message_id = ?
+        """,
+        [email_message_id],
+    ).fetchone()
+    if existing is None:
+        return
+    (
+        email_transaction_id, account, transaction_type, quantity, average_price,
+        total_cost, debit, transaction_date, price_currency, amount_quality,
+        reconciliation_status, matched_activity_id, matched_transaction_id,
+    ) = existing
+    stored = {
+        "account": account, "transaction_type": transaction_type, "quantity": quantity,
+        "average_price": average_price, "total_cost": total_cost, "debit": debit,
+        "transaction_date": transaction_date, "price_currency": price_currency,
+        "amount_quality": amount_quality,
+    }
+    diffs = [
+        (field, stored[field], candidate[field])
+        for field in _EMAIL_ENRICHABLE_FIELDS
+        if stored[field] != candidate[field]
+    ]
+    if not diffs:
+        return
+
+    is_linked = (
+        reconciliation_status != "provisional"
+        or matched_activity_id is not None
+        or matched_transaction_id is not None
+    )
+    if is_linked:
+        logger.warning(
+            "Replay found richer data for an already-linked email transaction; keeping the "
+            "linked (authoritative) values | source_message_id=%s | email_transaction_id=%s | "
+            "diffs=%s",
+            source_message_id, email_transaction_id, diffs,
+        )
+        return
+
+    connection.execute(
+        """
+        UPDATE email_transactions
+        SET account = ?, transaction_type = ?, quantity = ?, average_price = ?,
+            total_cost = ?, debit = ?, transaction_date = ?, price_currency = ?,
+            amount_quality = ?
+        WHERE email_transaction_id = ?
+        """,
+        [
+            candidate["account"], candidate["transaction_type"], candidate["quantity"],
+            candidate["average_price"], candidate["total_cost"], candidate["debit"],
+            candidate["transaction_date"], candidate["price_currency"],
+            candidate["amount_quality"], email_transaction_id,
+        ],
+    )
+    logger.info(
+        "Enriched provisional email transaction on replay | source_message_id=%s | "
+        "email_transaction_id=%s | diffs=%s",
+        source_message_id, email_transaction_id, diffs,
+    )
+
+
 def upload_email_transactions(
     data: pd.DataFrame,
     db_path: Path | str = DATABASE_PATH,
@@ -995,6 +1150,20 @@ def upload_email_transactions(
             [source, source_message_id],
         ).fetchone()
         if existing_message:
+            candidate = {
+                "account": _text(row.get("account")) or None,
+                "transaction_type": _text(row.get("transaction")) or "UNKNOWN",
+                "quantity": _decimal(row.get("quantity")),
+                "average_price": _decimal(row.get("avg_price")),
+                "total_cost": _decimal(row.get("total_cost")),
+                "debit": _decimal(row.get("debit")),
+                "transaction_date": _optional_date(row.get("date")),
+                "price_currency": _text(row.get("price_currency")) or None,
+                "amount_quality": _text(row.get("amount_quality")) or None,
+            }
+            _enrich_or_skip_email_transaction(
+                connection, int(existing_message[0]), candidate, source_message_id
+            )
             continue
         content_hash = hashlib.sha256(
             json.dumps(row, default=str, sort_keys=True).encode("utf-8")
@@ -1046,14 +1215,15 @@ def upload_email_transactions(
             INSERT OR IGNORE INTO email_transactions (
                 account, transaction_type, ticker_id, quantity, average_price,
                 total_cost, debit, transaction_date, email_message_id,
-                source_symbol, price_currency, ticker_resolution_status,
+                source_symbol, price_currency, amount_quality, ticker_resolution_status,
                 reconciliation_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values + [
                 email_message_id,
                 _text(row.get("ticker")) or None,
                 _text(row.get("price_currency")) or None,
+                _text(row.get("amount_quality")) or None,
                 ticker_resolution_status,
                 "not_applicable" if source == "interac" else "provisional",
             ],
@@ -1378,8 +1548,16 @@ def update_email_checkpoint(
             source, checked_through_date, checked_through_at, email_count
         ) VALUES (?, ?, ?, ?)
         ON CONFLICT (source) DO UPDATE SET
-            checked_through_date = excluded.checked_through_date,
-            checked_through_at = excluded.checked_through_at,
+            -- A --email-date-from replay re-fetches a past range, whose
+            -- latest received date can be earlier than the checkpoint a
+            -- normal run already advanced to; never let that regress the
+            -- checkpoint backward.
+            checked_through_date = GREATEST(
+                email_checkpoints.checked_through_date, excluded.checked_through_date
+            ),
+            checked_through_at = GREATEST(
+                email_checkpoints.checked_through_at, excluded.checked_through_at
+            ),
             email_count = email_checkpoints.email_count + excluded.email_count,
             updated_at = now()
         """,

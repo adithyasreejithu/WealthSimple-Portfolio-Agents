@@ -404,6 +404,23 @@ promotion; migrating the `stock-data-prep → stock-analyst → kb-intake` chain
 `run_metadata.available_components` records which of these were reachable for
 each run, so a reader can always tell "not run" from "ran and found nothing".
 
+`run log-event` (`docs/reference/cli.md`) lets an orchestrating agent
+(`investment-orchestrator`, `kb-orchestrator`) append its own steps into the
+run it is coordinating — a preflight check result, which stage it dispatched,
+its final report — the same `audit_log.jsonl` the specialist stages already
+write to via `save-thesis`/`save-decision`. Since each ticker gets its own
+run (see "One run per subject" in `investment-orchestrator`'s guardrails),
+this history is inherently split by stock: a run's audit log holds only the
+orchestration story for that one ticker, from the preflight that let its run
+get created through to the final decision. Event names follow this
+package's existing `<noun>_<past-tense-verb>` convention (`run_created`,
+`manifest_built`, `cache_purged`, `pm_drafted`) — `investment-orchestrator`
+uses a fixed six: `preflight_passed`, `analyst_dispatched`,
+`analyst_completed`, `pm_dispatched`, `pm_completed`,
+`orchestration_completed` (`docs/agents/investment-orchestrator/architecture.md`),
+so the same stage reads the same way across every run, not a differently
+phrased ad hoc string each time.
+
 ## Worked example (synthetic)
 
 > The values below are a fixture — ticker `SYNTH` is not a real security and

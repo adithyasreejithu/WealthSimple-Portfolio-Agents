@@ -6,7 +6,7 @@ This file is the canonical repo-wide context for implementation work in this rep
 
 This repository is a Python data pipeline for Wealthsimple exports, statements, and email extraction.
 
-- `src/` contains the application code, including pipeline orchestration (`app.py`), extraction logic (`email_extractor.py`, `statement_extractor.py`, `yfinance_extractor.py`), storage (`database.py`, `database_command.py`), and utilities (`data_sorter.py`, `staging.py`, `system_logger.py`).
+- `src/` contains the application code, including pipeline orchestration (`app.py`), extraction logic (`email_extractor.py`, `statement_extractor.py`, `yfinance_extractor.py`, `earnings_dividends_extractor.py`, `financial_snapshots_extractor.py`), storage (`database.py`, `database_command.py`), read-only analytics (`analytics.py`, `portfolio_metrics.py`, `position_engine.py`, `market_data.py`, `security_technicals.py`, `holdings_reconciler.py`), Knowledge-Base wiki helpers (`kb_pages.py`), ticker identity/enrichment (`ticker_mapping.py`, `ticker_pipeline.py`, `manual_overrides.py`), and utilities (`config.py`, `data_sorter.py`, `staging.py`, `system_logger.py`, `skill_trace.py`).
 - `tests/` contains `unittest` test cases that mirror the main modules.
 - `docs/` contains design notes, handover material, and success criteria.
 - `src/workspace/` is the run-workspace package: one directory per investment-research request (`workspace/runs/<run_id>/`) holding that request's inputs, evidence, calculations, agent outputs, and audit log. Exposed as `python src/app.py run <subcommand>`. See `docs/architecture/run_workspace.md`.
@@ -23,7 +23,7 @@ Claude Code agents live in `.claude/agents/*.md` and skills live in `.claude/ski
 - Put Python that is used only by one agent/skill beside that skill in its `scripts/` directory, not in `src/`. `src/` is for general pipeline code that is not owned by a single agent. For example, the classifier workflow modules live in `.claude/skills/classify-portfolio/scripts/`.
 - Document each agent's purpose, runtime settings, skill dependencies, workflow, and guardrails under `docs/agents/<agent>/`, and keep it aligned with the actual agent config and skills.
 - See `docs/architecture/claude_agent_skill_structure.md` for the full recommended layout.
-- Agent and skill invocations (with per-subagent token usage and session separators) are logged by the `.claude/hooks/usage_tracker.py` hook to `logs/AgentSkillUsage.txt`, separate from the pipeline log `logs/SystemLogs.txt`. Skills whose output quality depends on input coverage additionally emit a completeness trace to `logs/SkillTrace.txt`/`.jsonl` via the shared `src/skill_trace.py` writer — one format across skills, grading only what was *obtainable* for the subject so a not-applicable field is never reported as a gap. That includes data-collecting skills (`investment-analyst-resources`, `market-analyst-resources`) and calculation skills whose inputs may be thin (`security-technicals`, where a ticker with sixty days of history simply cannot have an SMA-200). See `docs/architecture/usage_tracking.md`.
+- Agent and skill invocations (with per-subagent token usage and session separators) are logged by the `.claude/hooks/usage_tracker.py` hook to `logs/AgentSkillUsage.txt`, separate from the pipeline log `logs/SystemLogs.txt`. Skills whose output quality depends on input coverage additionally emit a completeness trace to `logs/SkillTrace.txt`/`.jsonl` via the shared `src/skill_trace.py` writer — one format across skills, grading only what was *obtainable* for the subject so a not-applicable field is never reported as a gap. That includes data-collecting skills (`investment-analyst-resources`, `market-analyst-resources`) and calculation/lookup skills whose inputs may be thin (`security-technicals`, where a ticker with sixty days of history simply cannot have an SMA-200; `security-status`, shared read-only status resolution for the investment-analyst track below). See `docs/architecture/usage_tracking.md`.
 
 **Skills import `src/`; `src/` never imports `.claude/`.** Python owned by exactly one skill lives in that skill's `scripts/`, but a skill may *wrap* `src/` code with multiple consumers rather than vendoring it — `security-technicals` supplies the CLI, run attachment, evidence/audit registration, and trace, while the math it computes stays in `src/security_technicals.py` because the worksheet builder and dashboard may also need it. Moving multi-consumer code into a skill would force a `src/` module to import from `.claude/`, which this rule exists to prevent. Skills come in two shapes: agent-invoked (Claude follows the `SKILL.md` workflow) and dependency-only (`read-portfolio-classification-data`, `fetch-yfinance-classification-data`, `read-security-price-history` — never invoked directly, imported by another skill's scripts). See `docs/architecture/claude_agent_skill_structure.md`.
 
@@ -37,8 +37,12 @@ matter per `Knowledge-Base/templates/front-matter-spec.md` — pages without
 it are invisible to `kb-search`. Generated pages (`portfolio/holdings.md`,
 `portfolio/portfolio-overview.md`, and every `index.md` except the
 hand-curated `theses/index.md`, `logs/index.md`, `taxonomy/index.md`) are
-rebuilt by their owning skill, never hand-edited. KB agents (`kb-discovery`,
-`kb-intake`) never edit `Knowledge-Base/ref/*.yaml` or `CHANGELOG.md`. See
+rebuilt by their owning skill, never hand-edited. `kb-intake`, the only
+KB-writing agent, never edits `Knowledge-Base/ref/*.yaml` or `CHANGELOG.md`.
+(A separate `kb-discovery` read-only lookup agent existed at one point but
+was archived and never restored -- `.claude/agents/_archive/kb-discovery.md`
+-- so a pure lookup with no write intent now goes straight to the `kb-search`
+skill rather than a dedicated subagent.) See
 `docs/architecture/knowledge_base.md` for the full layout.
 
 ### Decision-support scoring
@@ -77,6 +81,55 @@ the deterministic `ingest_recommendation.py` over all artifacts sequentially
 re-pay the agent context N times). Agents never Read the research/worksheet
 JSONs — the scripts print the summaries they need. See
 `docs/architecture/decision_support_flow.md`.
+
+### Investment Analyst track
+
+A second, separate decision-support path from the legacy `stock-analyst`
+benchmark above — its own vocabulary, its own storage, never mixed. Where
+the legacy path scores `decision-rubric.yml` and writes
+`Buy/Sell/Hold/Trim/Add/Watchlist/Avoid` into `Knowledge-Base/stocks/TICKER.md`,
+this track writes a `DecisionProposal` (`Buy/Hold/Trim/Sell/Add` for an owned
+security, `Buy/Watch/Wait/Pass` for a not-owned one — no `Watchlist`/`Avoid`)
+into a run-scoped `workspace/runs/<run_id>/final/*.json`, never into the
+knowledge base. Three agents, two of them doing real judgment:
+
+- **`investment-analyst`** (`opus`) reads a run's investment worksheet and
+  produces a validated `investment-thesis.v1` — fundamental rating,
+  valuation stance, thesis direction/confidence, key claims, conditions, all
+  cited to registered evidence. It never proposes a portfolio action.
+- **`investment-portfolio-manager`** (`sonnet`) turns that thesis plus a
+  deterministic policy worksheet (`src/workspace/policy_worksheet.py`
+  against `Knowledge-Base/ref/policy_v1_1.yaml`'s `single_name_cap`/
+  `group_allocation_target` limits and `src/analytics.py`'s exposure
+  functions) into the `DecisionProposal`, with weight-based sizing and,
+  for a live buy/sell action, advisory order-mechanics guidance (never an
+  instruction to trade). When a failing weight/allocation check — not the
+  thesis — is the only thing keeping an attractive thesis out of `Buy`/`Add`,
+  its rationale must say so explicitly rather than letting the action alone
+  imply the stock is unattractive; when the failing check is specifically
+  `group_allocation_target`, it also flags a possible classifier-group
+  mismatch (as an `uncertainties` entry, never a reclassification it performs
+  itself) when the thesis's own description of the business doesn't seem to
+  fit `primary_group`.
+- **`investment-orchestrator`** (`haiku`) coordinates the other two for
+  "analyze TICKER" requests: read-only preflight (ticker exists, price
+  history depth, classification presence, status blockers), then dispatches
+  `investment-analyst` and `investment-portfolio-manager` via `Task` in that
+  fixed order, one run per ticker. It is one of two agents in this repo
+  explicitly authorized to hold `Task` (with `kb-orchestrator`) — see
+  `docs/architecture/claude_agent_skill_structure.md`. It also logs its own
+  preflight/dispatch/report steps into the run's `audit_log.jsonl` via
+  `run log-event`, using six fixed event names
+  (`preflight_passed`/`analyst_dispatched`/`analyst_completed`/
+  `pm_dispatched`/`pm_completed`/`orchestration_completed`) so that history
+  reads the same way across every run.
+
+Both judgment agents share the read-only `security-status` skill to resolve
+a ticker's owned/wishlist/avoid/retired status before drafting. See
+`docs/architecture/run_workspace.md` for the run-workspace mechanics
+(evidence registry, audit log, lifecycle states) and
+`docs/agents/investment-analyst/`, `docs/agents/investment-orchestrator/`,
+`docs/agents/investment-portfolio-manager/` for full per-agent documentation.
 
 ## Build, Test, and Development Commands
 

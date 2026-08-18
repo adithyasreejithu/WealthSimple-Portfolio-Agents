@@ -62,6 +62,13 @@ BENCHMARK_TICKERS = {"XEQT": "XEQT.TO", "VFV": "VFV.TO"}
 # Overlay key served in the report's performance.trend_overlays -> db ticker symbol.
 TREND_BENCHMARKS = {"XEQT": "XEQT", "SP500": "VFV"}
 SINGLE_NAME_MAX_WEIGHT = Decimal("0.10")
+# Trading-day windows offered by analytics.get_return_correlation, keyed by the
+# label the dashboard's window selector sends. 63/252/756 approximate 3
+# months/1 year/3 years of trading days.
+CORRELATION_WINDOWS = {"3m": 63, "1y": 252, "3y": 756}
+# A pairwise correlation/covariance computed from fewer daily observations than
+# this is not reported -- too few points to be a meaningful estimate.
+MINIMUM_CORRELATION_OBSERVATIONS = 20
 ANALYTICS_EXPORT_FOLDER = EXPORT_FOLDER / "analytics"
 ANALYTICS_EXPORT_FILENAME = "portfolio-analytics.json"
 POLICY_FILE = PORTFOLIO_GROUPING_FOLDER / "policy_v1_1.yaml"
@@ -83,6 +90,16 @@ RECON_QTY_REL_TOL_EMAIL = Decimal("0.02")
 RECON_DATE_WINDOW_DAYS_STMT = 5
 RECON_DATE_WINDOW_DAYS_EMAIL = 4
 FX_PAIR_SYMBOL = "USDCAD=X"
+
+"""
+Staleness-gate intervals for `market_data.py`'s per-domain refresh helpers,
+used by `app.py run_pipeline`'s market-data refresh stage. Prices/FX/benchmark
+are not gated here -- `MarketTarget.fetch_ranges` is already incremental from
+the last stored date, so every run only fetches what is actually missing.
+"""
+EARNINGS_REFRESH_INTERVAL_DAYS = 1
+DIVIDENDS_REFRESH_INTERVAL_DAYS = 7
+FINANCIAL_SNAPSHOTS_REFRESH_INTERVAL_DAYS = 30
 
 """
 Logging config used by `system_logger.py`.
@@ -123,9 +140,17 @@ EMAIL_OUTPUT_COLUMNS = [
     "debit",
     "date",
     "price_currency",
+    "amount_quality",
     "source_message_id",
     "received_at",
 ]
+
+# v_trade_events/position_engine/analytics distinguish how a trade's CAD
+# amount was obtained, so a derived or missing figure can be flagged as an
+# estimate instead of silently presented as a confirmed brokerage amount.
+AMOUNT_QUALITY_REPORTED = "reported"
+AMOUNT_QUALITY_DERIVED = "derived_from_quantity_and_price"
+AMOUNT_QUALITY_MISSING = "missing"
 
 WEALTHSIMPLE_SENDERS = (
     "support@wealthsimple.com",

@@ -260,6 +260,121 @@ class MarketDataSyncTest(unittest.TestCase):
         self.assertEqual(connection.execute.call_args_list[-1].args[0], "ROLLBACK")
 
 
+class StaleSymbolsTest(unittest.TestCase):
+    """The staleness-gate helpers app.py's market-data refresh stage uses to
+    decide which owned symbols are due for an earnings/dividends/financial-
+    snapshots refresh (see config.py's *_REFRESH_INTERVAL_DAYS constants)."""
+
+    def setUp(self):
+        self.today = date(2026, 8, 13)
+        self.targets = [
+            market_data.MarketTarget(
+                ticker_id=1, symbol="AAPL", provider_symbol="AAPL", currency="USD",
+                security_name="Apple Inc.", first_owned_date=date(2020, 1, 1),
+                earliest_market_date=None, latest_market_date=None,
+            ),
+            market_data.MarketTarget(
+                ticker_id=2, symbol="ENB", provider_symbol="ENB.TO", currency="CAD",
+                security_name="Enbridge Inc.", first_owned_date=date(2020, 1, 1),
+                earliest_market_date=None, latest_market_date=None,
+            ),
+            market_data.MarketTarget(
+                ticker_id=3, symbol="LYTE", provider_symbol="LYTE", currency="USD",
+                security_name="Roundhill Photonics & Optics ETF", first_owned_date=date(2026, 8, 10),
+                earliest_market_date=None, latest_market_date=None, asset_class="etf",
+            ),
+        ]
+
+    def _connection(self, rows):
+        connection = Mock()
+        connection.execute.return_value.fetchall.return_value = rows
+        return connection
+
+    def test_ticker_with_no_row_at_all_is_stale(self):
+        # AAPL/ENB fetched today; LYTE has never been fetched (no row).
+        connection = self._connection([(1, datetime(2026, 8, 13)), (2, datetime(2026, 8, 13))])
+        with patch.object(market_data, "get_shared_connection", return_value=connection):
+            stale = market_data._stale_symbols(
+                "db.duckdb", self.targets, "earnings_events", 1, as_of=self.today
+            )
+
+        self.assertEqual(stale, ["LYTE"])
+
+    def test_ticker_older_than_max_age_is_stale(self):
+        connection = self._connection([
+            (1, datetime(2026, 8, 13)),
+            (2, datetime(2026, 8, 1)),
+            (3, datetime(2026, 8, 13)),
+        ])
+        with patch.object(market_data, "get_shared_connection", return_value=connection):
+            stale = market_data._stale_symbols(
+                "db.duckdb", self.targets, "dividend_events", 7, as_of=self.today
+            )
+
+        self.assertEqual(stale, ["ENB"])
+
+    def test_all_fresh_returns_empty_list(self):
+        fetched_at = datetime.combine(self.today, datetime.min.time())
+        connection = self._connection([(1, fetched_at), (2, fetched_at), (3, fetched_at)])
+        with patch.object(market_data, "get_shared_connection", return_value=connection):
+            stale = market_data._stale_symbols(
+                "db.duckdb", self.targets, "financial_snapshots", 30, as_of=self.today
+            )
+
+        self.assertEqual(stale, [])
+
+    def test_empty_targets_short_circuits_without_querying(self):
+        with patch.object(market_data, "get_shared_connection") as get_connection:
+            stale = market_data._stale_symbols("db.duckdb", [], "earnings_events", 1)
+
+        self.assertEqual(stale, [])
+        get_connection.assert_not_called()
+
+    def test_wrapper_functions_use_the_correct_table_and_default_interval(self):
+        connection = self._connection([])
+        with patch.object(market_data, "get_shared_connection", return_value=connection):
+            market_data.stale_earnings_symbols("db.duckdb", self.targets, as_of=self.today)
+            market_data.stale_dividend_symbols("db.duckdb", self.targets, as_of=self.today)
+            market_data.stale_financial_snapshot_symbols("db.duckdb", self.targets, as_of=self.today)
+
+        queries = [call.args[0] for call in connection.execute.call_args_list]
+        self.assertTrue(any("FROM earnings_events" in q for q in queries))
+        self.assertTrue(any("FROM dividend_events" in q for q in queries))
+        self.assertTrue(any("FROM financial_snapshots" in q for q in queries))
+
+    def test_earnings_gate_excludes_etfs_even_when_never_fetched(self):
+        """An ETF never gets an earnings_events row (yfinance has no earnings
+        date for a fund) -- without this exclusion, `_stale_symbols`'s
+        no-row-means-stale rule would mark every ETF permanently stale and
+        re-fetch it on every single pipeline run."""
+        connection = self._connection([])  # nothing fetched for anyone, ever
+        with patch.object(market_data, "get_shared_connection", return_value=connection):
+            stale = market_data.stale_earnings_symbols("db.duckdb", self.targets, as_of=self.today)
+
+        self.assertEqual(set(stale), {"AAPL", "ENB"})
+        self.assertNotIn("LYTE", stale)
+
+    def test_financial_snapshots_gate_excludes_etfs_even_when_never_fetched(self):
+        connection = self._connection([])
+        with patch.object(market_data, "get_shared_connection", return_value=connection):
+            stale = market_data.stale_financial_snapshot_symbols(
+                "db.duckdb", self.targets, as_of=self.today
+            )
+
+        self.assertEqual(set(stale), {"AAPL", "ENB"})
+        self.assertNotIn("LYTE", stale)
+
+    def test_dividend_gate_does_not_exclude_etfs(self):
+        """Unlike earnings/financials, ETFs do pay dividends (DGRO, SCHD,
+        XEQT, ...), so the dividend gate must not exclude them the way the
+        other two do."""
+        connection = self._connection([])
+        with patch.object(market_data, "get_shared_connection", return_value=connection):
+            stale = market_data.stale_dividend_symbols("db.duckdb", self.targets, as_of=self.today)
+
+        self.assertIn("LYTE", stale)
+
+
 class MarketTargetRangeTest(unittest.TestCase):
     """Range planning against the real `MINIMUM_PRICE_HISTORY_DAYS`."""
 
@@ -537,30 +652,42 @@ class EarningsDividendsSyncTest(unittest.TestCase):
         return pd.DataFrame([{"Ticker": "AAPL", "ProviderSymbol": "AAPL",
                               "ExDividendDate": "2025-02-07", "DeclaredAmount": 0.24}])
 
+    def _upcoming_frame(self):
+        return pd.DataFrame([{"Ticker": "AAPL", "ProviderSymbol": "AAPL",
+                              "ExDividendDate": "2025-06-01", "PayDate": "2025-06-15",
+                              "DeclaredAmount": 0.26, "Frequency": "quarterly"}])
+
     def test_sync_fetches_owned_scope_and_writes_in_one_transaction(self):
         connection = Mock()
         earnings_fetcher = Mock(return_value=self._earnings_frame())
         dividends_fetcher = Mock(return_value=self._dividend_frame())
+        upcoming_fetcher = Mock(return_value=self._upcoming_frame())
         with (
             patch.object(market_data, "initialize_database"),
             patch.object(market_data, "get_market_targets", return_value=[self.target]),
             patch.object(market_data, "get_shared_connection", return_value=connection),
             patch.object(market_data, "upload_earnings_events", return_value=1) as upload_e,
             patch.object(market_data, "upload_dividend_events", return_value=1) as upload_d,
+            patch.object(market_data, "upload_upcoming_dividends", return_value=1) as upload_u,
         ):
             result = market_data.sync_earnings_dividends(
                 "portfolio.duckdb",
                 earnings_fetcher=earnings_fetcher,
                 dividends_fetcher=dividends_fetcher,
+                upcoming_dividends_fetcher=upcoming_fetcher,
             )
 
         earnings_fetcher.assert_called_once_with(["AAPL"])
         dividends_fetcher.assert_called_once_with(["AAPL"])
+        upcoming_fetcher.assert_called_once_with(["AAPL"])
         upload_e.assert_called_once()
         upload_d.assert_called_once()
+        upload_u.assert_called_once()
         self.assertEqual(connection.execute.call_args_list[0].args[0], "BEGIN TRANSACTION")
         self.assertEqual(connection.execute.call_args_list[-1].args[0], "COMMIT")
-        self.assertEqual((result.earnings_rows, result.dividend_rows), (1, 1))
+        self.assertEqual(
+            (result.earnings_rows, result.dividend_rows, result.upcoming_dividend_rows), (1, 1, 1)
+        )
         self.assertTrue(result.succeeded)
 
     def test_sync_with_no_targets_returns_empty_without_writing(self):
@@ -571,32 +698,43 @@ class EarningsDividendsSyncTest(unittest.TestCase):
             patch.object(market_data, "get_shared_connection", return_value=connection),
         ):
             result = market_data.sync_earnings_dividends(
-                earnings_fetcher=Mock(), dividends_fetcher=Mock()
+                earnings_fetcher=Mock(),
+                dividends_fetcher=Mock(),
+                upcoming_dividends_fetcher=Mock(),
             )
 
-        self.assertEqual((result.tickers, result.earnings_rows, result.dividend_rows), (0, 0, 0))
+        self.assertEqual(
+            (result.tickers, result.earnings_rows, result.dividend_rows, result.upcoming_dividend_rows),
+            (0, 0, 0, 0),
+        )
         connection.execute.assert_not_called()
 
     def test_sync_skip_flags_bypass_the_respective_fetcher(self):
         connection = Mock()
         earnings_fetcher = Mock(return_value=self._earnings_frame())
         dividends_fetcher = Mock(return_value=self._dividend_frame())
+        upcoming_fetcher = Mock(return_value=self._upcoming_frame())
         with (
             patch.object(market_data, "initialize_database"),
             patch.object(market_data, "get_market_targets", return_value=[self.target]),
             patch.object(market_data, "get_shared_connection", return_value=connection),
             patch.object(market_data, "upload_earnings_events", return_value=1),
             patch.object(market_data, "upload_dividend_events", return_value=1) as upload_d,
+            patch.object(market_data, "upload_upcoming_dividends", return_value=1) as upload_u,
         ):
             market_data.sync_earnings_dividends(
                 earnings_fetcher=earnings_fetcher,
                 dividends_fetcher=dividends_fetcher,
+                upcoming_dividends_fetcher=upcoming_fetcher,
                 skip_dividends=True,
+                skip_upcoming=True,
             )
 
         earnings_fetcher.assert_called_once_with(["AAPL"])
         dividends_fetcher.assert_not_called()
+        upcoming_fetcher.assert_not_called()
         upload_d.assert_not_called()
+        upload_u.assert_not_called()
 
     def test_sync_fetch_failure_reports_error(self):
         connection = Mock()
@@ -606,10 +744,12 @@ class EarningsDividendsSyncTest(unittest.TestCase):
             patch.object(market_data, "get_shared_connection", return_value=connection),
             patch.object(market_data, "upload_earnings_events"),
             patch.object(market_data, "upload_dividend_events"),
+            patch.object(market_data, "upload_upcoming_dividends"),
         ):
             result = market_data.sync_earnings_dividends(
                 earnings_fetcher=Mock(side_effect=RuntimeError("provider failed")),
                 dividends_fetcher=Mock(return_value=self._dividend_frame()),
+                upcoming_dividends_fetcher=Mock(return_value=self._upcoming_frame()),
             )
 
         self.assertFalse(result.succeeded)
@@ -624,10 +764,12 @@ class EarningsDividendsSyncTest(unittest.TestCase):
             patch.object(market_data, "get_shared_connection", return_value=connection),
             patch.object(market_data, "upload_earnings_events", side_effect=ValueError("bad row")),
             patch.object(market_data, "upload_dividend_events", return_value=1),
+            patch.object(market_data, "upload_upcoming_dividends", return_value=1),
         ):
             result = market_data.sync_earnings_dividends(
                 earnings_fetcher=Mock(return_value=self._earnings_frame()),
                 dividends_fetcher=Mock(return_value=self._dividend_frame()),
+                upcoming_dividends_fetcher=Mock(return_value=self._upcoming_frame()),
             )
 
         self.assertFalse(result.succeeded)

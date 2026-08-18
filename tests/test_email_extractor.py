@@ -1,5 +1,6 @@
 import unittest
 from datetime import date
+from decimal import Decimal
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -60,6 +61,90 @@ class EmailExtractorTest(unittest.TestCase):
         self.assertEqual(parsed.loc[0, "total_cost"], "94.80")
         self.assertEqual(parsed.loc[0, "debit"], "94.80")
         self.assertEqual(parsed.loc[0, "date"], date(2025, 4, 10))
+        self.assertEqual(parsed.loc[0, "amount_quality"], "reported")
+
+    def test_parse_wealthsimple_sell_email_reads_total_value_label(self):
+        """
+        Reproduces the PLTR production incident: Wealthsimple labels a filled
+        sell's total "Total value" (or "Total proceeds"), not "Total cost" --
+        the original parser only recognized "Total cost", so a sell
+        confirmation's amount was silently dropped, leaving cash and realized
+        gain both stuck at zero for a real, evidenced sale.
+        """
+        email = """
+        Account: TFSA
+        Type: Sell
+        Symbol: PLTR
+        Shares: 1.0000
+        Average price: US$45.00
+        Total value: US$45.00
+        Time: 2026-08-05 09:30:00
+        """
+
+        parsed = parse_wealthsimple_email(email, "Your order filled")
+
+        self.assertEqual(parsed.loc[0, "transaction"], "Sell")
+        self.assertEqual(parsed.loc[0, "total_cost"], "45.00")
+        self.assertEqual(parsed.loc[0, "price_currency"], "USD")
+        self.assertEqual(parsed.loc[0, "amount_quality"], "reported")
+
+    def test_parse_wealthsimple_sell_email_reads_total_proceeds_label(self):
+        email = """
+        Account: TFSA
+        Type: Sell
+        Symbol: PLTR
+        Shares: 2.0000
+        Average price: US$45.00
+        Total proceeds: US$90.00
+        Time: 2026-08-05 09:30:00
+        """
+
+        parsed = parse_wealthsimple_email(email, "Your order filled")
+
+        self.assertEqual(parsed.loc[0, "total_cost"], "90.00")
+        self.assertEqual(parsed.loc[0, "amount_quality"], "reported")
+
+    def test_parse_wealthsimple_sell_email_derives_amount_when_total_is_unrecognized(self):
+        """
+        No "Total value"/"Total proceeds"/"Total cost" label at all (e.g. an
+        unrecognized confirmation format) must not leave the trade amount
+        blank -- derive it from quantity x fill price instead, exactly the
+        PLTR-shaped gap that left cash at $0.31 and realized gain at $0.00.
+        """
+        email = """
+        Account: TFSA
+        Type: Sell
+        Symbol: PLTR
+        Shares: 1.0000
+        Average price: US$45.00
+        Time: 2026-08-05 09:30:00
+        """
+
+        parsed = parse_wealthsimple_email(email, "Your order filled")
+
+        self.assertEqual(Decimal(parsed.loc[0, "total_cost"]), Decimal("45.00"))
+        self.assertEqual(parsed.loc[0, "amount_quality"], "derived_from_quantity_and_price")
+
+    def test_parse_wealthsimple_sell_email_marks_amount_missing_when_underiveable(self):
+        email = """
+        Account: TFSA
+        Type: Sell
+        Symbol: PLTR
+        Time: 2026-08-05 09:30:00
+        """
+
+        parsed = parse_wealthsimple_email(email, "Your order filled")
+
+        self.assertEqual(parsed.loc[0, "total_cost"], "")
+        self.assertEqual(parsed.loc[0, "amount_quality"], "missing")
+
+    def test_parse_wealthsimple_dividend_email_leaves_amount_quality_blank(self):
+        # Dividends use "debit", not the trade-amount field, so amount_quality
+        # (which describes total_cost's provenance) does not apply.
+        parsed = parse_wealthsimple_email(
+            "Account: TFSA\nSymbol: VFV\nAmount: $1.25", "Cash dividend received",
+        )
+        self.assertEqual(parsed.loc[0, "amount_quality"], "")
 
     def test_parse_wealthsimple_dividend_email_uses_subject_type_and_received_date_fallback(self):
         email = """

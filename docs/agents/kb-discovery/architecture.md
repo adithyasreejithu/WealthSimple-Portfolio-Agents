@@ -1,7 +1,17 @@
 # KB Discovery Agent
 
-This document is the human-readable companion to the Claude Code agent defined at
-[`.claude/agents/kb-discovery.md`](../../../.claude/agents/kb-discovery.md).
+> **Retired.** This agent was archived 2026-07-16 ("Phase 0: Archive
+> Agent-Development agents/skills as reference") and, unlike `kb-intake`/
+> `stock-analyst`/`stock-data-prep` from that same archive, was never
+> restored. It is not invokable today. The rest of this page is kept as
+> historical reference for the design, not as current documentation. A pure
+> read-only lookup now invokes the `kb-search` skill directly instead of a
+> dedicated subagent -- see `docs/reference/knowledge_base_workflow.md` and
+> `docs/architecture/knowledge_base.md`.
+
+This document was the human-readable companion to the Claude Code agent
+formerly defined at
+[`.claude/agents/_archive/kb-discovery.md`](../../../.claude/agents/_archive/kb-discovery.md).
 The original design rationale is preserved in [`plan.md`](plan.md).
 
 ## Purpose

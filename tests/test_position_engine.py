@@ -241,6 +241,67 @@ class PositionEngineTest(unittest.TestCase):
         self.assertEqual(quantity, Decimal("0.00000000"))
         self.assertIn("oversell_clamped", flags)
 
+    def test_oversell_prorates_realized_gain_to_clamped_quantity(self):
+        # The $600 credit covers the confirmed sale of 5 shares, but only 1
+        # share is actually leaving this position's book (oversold beyond
+        # held quantity). Booking the full $600 against a $100 cost basis
+        # would inflate realized gain to $500 by counting proceeds for 4
+        # shares this position never held; it must prorate to the 1 share
+        # actually sold: (600 * 1/5) - 100 = 20.
+        ticker_id = self._ticker("NVDA", currency="USD")
+        self._buy(ticker_id, date(2025, 1, 1), Decimal("1"), Decimal("100"))
+        self._sell(ticker_id, date(2025, 2, 1), Decimal("5"), Decimal("600"))
+
+        with self.assertLogs("position_engine", level="WARNING") as captured:
+            position_engine.recompute_positions(self.connection)
+
+        _quantity, _book_cad, _book_mkt, realized_cad, _provisional, _flags = self._snapshot(ticker_id)
+        self.assertEqual(realized_cad, Decimal("20.0000"))
+        self.assertTrue(any("Oversell excluded from realized gain" in line for line in captured.output))
+
+    def test_email_derived_sell_proceeds_are_flagged_estimated(self):
+        # A sell whose proceeds came from quantity x fill price (no reported
+        # total) rather than a confirmed brokerage figure must be
+        # distinguishable from a fully-reported sale.
+        ticker_id = self._ticker("PLTR", currency="USD")
+        self._buy(ticker_id, date(2026, 1, 1), Decimal("2"), Decimal("100"))
+        self.connection.execute(
+            """
+            INSERT INTO email_transactions (
+                account, transaction_type, ticker_id, quantity, total_cost, transaction_date,
+                source_symbol, price_currency, amount_quality, ticker_resolution_status, reconciliation_status
+            ) VALUES ('TFSA', 'Sell', ?, 1, 45.00, ?, 'PLTR', 'USD',
+                      'derived_from_quantity_and_price', 'resolved', 'provisional')
+            """,
+            [ticker_id, date(2026, 8, 5)],
+        )
+
+        position_engine.recompute_positions(self.connection)
+        quantity, _book_cad, _book_mkt, realized_cad, _provisional, flags = self._snapshot(ticker_id)
+
+        self.assertEqual(quantity, Decimal("1.00000000"))
+        self.assertEqual(realized_cad, Decimal("-5.0000"))
+        self.assertIn("sell_proceeds_estimated", flags)
+
+    def test_email_derived_buy_cost_is_flagged_estimated(self):
+        ticker_id = self._ticker("PLTR", currency="USD")
+        self.connection.execute(
+            """
+            INSERT INTO email_transactions (
+                account, transaction_type, ticker_id, quantity, total_cost, transaction_date,
+                source_symbol, price_currency, amount_quality, ticker_resolution_status, reconciliation_status
+            ) VALUES ('TFSA', 'Buy', ?, 1, 45.00, ?, 'PLTR', 'USD',
+                      'derived_from_quantity_and_price', 'resolved', 'provisional')
+            """,
+            [ticker_id, date(2026, 8, 5)],
+        )
+
+        position_engine.recompute_positions(self.connection)
+        _quantity, book_cad, _book_mkt, _realized, _provisional, flags = self._snapshot(ticker_id)
+
+        self.assertEqual(book_cad, Decimal("45.0000"))
+        self.assertIn("buy_cost_estimated", flags)
+
     def test_missing_buy_cost_is_flagged_not_silently_zeroed_without_trace(self):
         ticker_id = self._ticker("META", currency="USD")
         self._buy(ticker_id, date(2025, 11, 4), Decimal("0.1919"), None)

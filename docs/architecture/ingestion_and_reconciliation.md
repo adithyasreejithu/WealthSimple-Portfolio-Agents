@@ -65,6 +65,41 @@ Key points:
   `reconciliation_status = 'provisional'`; Interac deposits start
   `not_applicable`. Provisional rows are the most recent activity not yet
   confirmed by a statement or activities export.
+  - **Trade-amount parsing and `amount_quality`.** A filled buy's total is
+    labeled `Total cost`; a filled sell's is labeled `Total value` or `Total
+    proceeds` — `parse_wealthsimple_email` (`email_extractor.py`) recognizes
+    all three into the same `total_cost` field (fixing a real incident where
+    a sell confirmation's proceeds were silently dropped because only `Total
+    cost` was recognized, leaving that sale's cash impact and realized gain
+    both at zero). If no such label matches, the amount is derived as
+    `abs(quantity) * average_price` (the email's own fill price, not the
+    position's book-average cost) rather than left blank. Each row records
+    how its `total_cost` was obtained in `amount_quality`: `reported`
+    (labeled total found), `derived_from_quantity_and_price` (fallback used),
+    or `missing` (neither available). `v_trade_events`/the position
+    engine/`analytics.get_realized_gain_summary` all read this marker to
+    flag a sale's proceeds and realized gain as an estimate instead of
+    presenting a derived figure as a confirmed brokerage amount.
+  - **Idempotent replay enrichment.** Re-uploading a message that already
+    exists (matched by `source`/`source_message_id`) refreshes its
+    `email_transactions` row in place *only* when that row is still
+    unmatched and provisional (`reconciliation_status = 'provisional'`, no
+    `matched_activity_id`/`matched_transaction_id`) — e.g. a replay after an
+    `email_extractor.py` parsing fix picks up a `total_cost` the original
+    parse missed. A row a reconciliation pass has already linked to an
+    activity/statement is authoritative and is never rewritten; if a replay's
+    values disagree with a linked row, the linked values are kept and a
+    warning is logged naming the message id, the differing field(s), and
+    both values, for manual review (`_enrich_or_skip_email_transaction` in
+    `database_command.py`). An enrichment update never counts toward
+    `upload_email_transactions`'s inserted-row return value, so it cannot
+    inflate `email_checkpoints.email_count`.
+  - **Controlled replay:** `python src/app.py pipeline --source email
+    --email-date-from YYYY-MM-DD` overrides the stored checkpoint for one run
+    without moving it backward — `update_email_checkpoint` takes the
+    `GREATEST` of the stored and newly-computed `checked_through_date`, so
+    replaying an old date range can enrich existing rows (see above) without
+    ever regressing the checkpoint a normal run already advanced past.
 - **Price/FX history -> `historical_records`.** `sync_market_data` (per-ticker
   OHLC for owned securities) also calls `ensure_fx_history` (`market_data.py`),
   which creates a `tickers` row for `config.FX_PAIR_SYMBOL` (`USDCAD=X`) on
@@ -73,13 +108,29 @@ Key points:
   no owning transactions, so it never appears in `position_snapshots`,
   `get_market_targets`, or classification output.
 
+**Market-data refresh stage.** `app.py::run_pipeline` calls
+`_run_market_data_refresh` once, after `ensure_positions_fresh`/
+`complete_batch`, regardless of `--source` -- this is the pipeline's
+"everything stored locally gets pulled" step. `sync_market_data` (prices, FX,
+benchmark, ticker metadata) runs unconditionally every call, since
+`MarketTarget.fetch_ranges` is already incremental. `sync_earnings_dividends`
+and `sync_financial_snapshots` are staleness-gated per ticker
+(`market_data.stale_earnings_symbols`/`stale_dividend_symbols`/
+`stale_financial_snapshot_symbols`, each comparing that domain's own
+`fetched_at` column against a `config.py` interval constant) so a routine run
+stays fast instead of re-fetching all three heavier domains for every owned
+ticker every time; `pipeline --full` bypasses every gate. **Classification is
+not part of this stage or of `pipeline` at all** -- it is the standalone
+`app.py classify` command (`docs/reference/cli.md`), run explicitly whenever
+holdings change.
+
 **Portfolio vs. research scope.** `get_market_targets` (`market_data.py`)
 resolves its ticker set from a `LEFT JOIN` against `owned_dates`, kept to
-owned-only by default (`include_research=False`) -- `pipeline` and every
-routine sync command never pass anything else, so a ticker with zero
-transactions is never touched by a routine run, exactly as before this
-parameter existed. Passing `include_research=True` additionally admits a
-ticker with a `security_status.declared_status` of `wishlist` (`market_data.
+owned-only by default (`include_research=False`) -- `pipeline` and this
+stage never pass anything else, so a ticker with zero transactions is never
+touched by a routine run, exactly as before this parameter existed. Passing
+`include_research=True` additionally admits a ticker with a
+`security_status.declared_status` of `wishlist` (`market_data.
 RESEARCH_STATUSES`) even though it has no transactions, tagging each
 returned `MarketTarget.scope` as `"portfolio"` or `"research"`. Only the
 `investment-analyst-resources` skill's on-demand refresh phase passes this
@@ -170,7 +221,17 @@ stream with source precedence already applied:
   Priority 2.
 - **email** (`email_transactions`): only rows still `reconciliation_status =
   'provisional'` — a matched/superseded email row is already represented by
-  whatever it was matched to. Priority 3.
+  whatever it was matched to. Priority 3. `amount_currency` is the row's own
+  `price_currency` (falling back to `CAD`), not hardcoded `CAD` — a prior
+  version of this view always labeled email amounts `CAD` regardless of the
+  security's actual listing currency, which meant the position engine's
+  currency-mismatch FX conversion (below) never fired for a USD-priced email
+  trade and its raw USD figure was booked as if it were already CAD.
+
+Every branch also emits `amount_quality`: `activities`/`statements` rows are
+always `'reported'` (their source never estimates); `email` rows carry
+whatever `email_transactions.amount_quality` recorded (see above),
+defaulting to `'missing'` if unset.
 
 `STKREORG` statement rows (splits recorded by the broker with no quantity) are
 never emitted by the view — they carry no usable data. If a split exists only
@@ -204,10 +265,24 @@ order. State: `quantity`, `book_cad`, `book_mkt`, `realized_cad`.
   `buy_missing_cost` rather than guessing a cost.
 - **SELL** (quantity `q`, CAD proceeds `p`): `sold = min(q, quantity)` — an
   oversell (recorded sells exceeding recorded buys) is clamped rather than
-  driving quantity negative, flagged `oversell_clamped`. Realized gain =
-  `p - sold * avg_cad` where `avg_cad = book_cad / quantity` (average cost is
-  unchanged by a sell); `book_cad -= sold * avg_cad`; `book_mkt` follows the
-  same average-cost formula in market currency; `quantity -= sold`.
+  driving quantity negative, flagged `oversell_clamped`. On an oversell, `p`
+  is prorated to `p * (sold / q)` before computing realized gain — `p` covers
+  the full confirmed `q`, but only `sold` shares are actually leaving this
+  ticker's book, so crediting the unprorated `p` would count proceeds for
+  shares the position never held as pure gain against zero cost (a real
+  incident: `docs/plans/pltr-sale-cash-realized-gain.md`). Cash
+  (`analytics.get_cash_summary`, below) is unaffected by this proration — it
+  rolls forward the full reported/derived proceeds separately, since the
+  brokerage did receive that full amount even though this ticker's book only
+  reflects `sold` shares leaving. Realized gain = `p_used - sold * avg_cad`
+  where `avg_cad = book_cad / quantity` (average cost is unchanged by a
+  sell); `book_cad -= sold * avg_cad`; `book_mkt` follows the same
+  average-cost formula in market currency; `quantity -= sold`. A non-`NULL`
+  `p` whose `amount_quality` is not `'reported'` (derived from quantity x
+  price rather than stated by the source) flags `sell_proceeds_estimated`;
+  the BUY case flags `buy_cost_estimated` symmetrically. Both are separate
+  from `buy_missing_cost`/`sell_missing_proceeds`, which mean no amount was
+  available at all, estimated or otherwise.
 - **SPLIT** (signed delta `d`): `quantity += d`; book values are untouched,
   so average cost per share drops automatically, exactly as a real split does.
 
@@ -259,7 +334,9 @@ surfaced in `analytics.build_data_quality` as `position_engine_<flag>`:
 | --- | --- |
 | `buy_missing_cost` | A BUY event had no cost amount from any source; quantity is correct, book value is understated. |
 | `sell_missing_proceeds` | A SELL event had no proceeds amount; realized gain for that sale used cost as a stand-in (zero gain/loss), not a fabricated number. |
-| `oversell_clamped` | Recorded sells exceeded recorded buys; quantity was clamped to zero instead of going negative. |
+| `buy_cost_estimated` | A BUY event's cost came from a non-`'reported'` `amount_quality` (derived from quantity x fill price, typically an email confirmation with no recognized total label) rather than a source-stated figure. |
+| `sell_proceeds_estimated` | Same, for a SELL event's proceeds. |
+| `oversell_clamped` | Recorded sells exceeded recorded buys; quantity was clamped to zero instead of going negative. Realized-gain proceeds for the sale are prorated to the clamped quantity (see the SELL algorithm above); cash still rolls forward the full reported/derived proceeds. |
 | `negative_quantity` | Internal-only marker used while `oversell_clamped` clamps the running total; not expected to appear in a persisted snapshot. |
 | `fx_stale` | No FX pair close was available dated to an event; the most recent known `transactions.fx_rate` was used instead. |
 | `fx_unavailable` | No FX rate was available at all for a non-CAD event; `1.0` was used as a last resort. |
@@ -268,6 +345,24 @@ surfaced in `analytics.build_data_quality` as `position_engine_<flag>`:
 A ticker with `quantity == 0` but a non-empty flag list (e.g. a fully clamped
 oversell) is still returned by `analytics._get_net_positions` and surfaced
 through `get_excluded_positions`, not silently dropped once it reaches zero.
+
+`analytics.build_data_quality` also emits a handful of flags directly, not
+prefixed with `position_engine_`, sourced from other analytics functions
+rather than `position_snapshots.data_quality_flags`. Notably
+`realized_gain_missing_proceeds`: `get_realized_gain_summary` walks
+`v_trade_events` independently of the position engine, and applies the same
+break-even treatment as `sell_missing_proceeds` above when a SELL has no
+`amount_cad` from any source — imputing proceeds equal to the allocated cost
+(zero realized gain for that sale) instead of booking the full cost basis as
+a fabricated loss, and reporting the affected ticker/date here so the UI can
+badge it as provisional rather than presenting a wrong number silently.
+`get_realized_gain_summary` mirrors the position engine's other two
+corrections independently, since it recomputes weighted-average cost/gain
+itself rather than reading `position_snapshots.realized_gain_cad`: each
+emitted event in `realized_gains.events` (the dashboard's realized-gains
+table) carries the sale's `amount_quality`, and an oversell's proceeds are
+prorated to the clamped (actually-held) quantity before computing gain, for
+the same reason described in the SELL algorithm above.
 
 ## FX Valuation for Reporting
 
@@ -288,6 +383,46 @@ totals sum, so a CAD/USD split no longer mixes nominal values in two
 currencies. `market_value_mkt`, `cost_basis_mkt`, and `unrealized_mkt` carry
 the same figures in the ticker's own listing currency when that view is
 needed instead (e.g. to match a broker export).
+
+## Cash Balance
+
+`analytics.get_cash_summary` layers three sources, each filling a gap the one
+before it cannot cover:
+
+1. **Statement anchor**: the latest `statement_balances` row (every statement
+   line's trailing balance, regardless of whether it resolved to a ticker).
+2. **Activities rollforward**: `activities.net_cash_amount` summed for dates
+   strictly after the anchor, since a statement PDF typically lags the
+   activities CSV export by weeks.
+3. **Provisional email rollforward** (`analytics._provisional_email_cash_events`):
+   the CAD-converted, signed (`+` for SELL, `-` for BUY) `total_cost` of every
+   still-provisional, ticker-resolved email trade, using the same
+   FX-resolution chain as the position engine's `_resolve_fx`. Without this
+   layer, a trade confirmed only by email has no cash effect at all until its
+   statement or activities row eventually arrives — the position engine
+   already reflects the shares moving, but cash silently omits the money,
+   which is exactly the bug `docs/plans/pltr-sale-cash-realized-gain.md`
+   traces (cash stuck at a stale statement balance while a real, evidenced
+   sale sat unreconciled). A row drops out of this layer the moment
+   reconciliation links it to an activity/statement (its
+   `reconciliation_status` leaves `'provisional'`), so the authoritative
+   source's own cash effect (already inside layer 2) takes over without
+   double-counting.
+
+`CashSummary` carries the split out separately: `provisional_adjustment` is
+this layer's total CAD contribution (zero once every trade reconciles), and
+`estimated_adjustment` is the subset of that built from a non-`'reported'`
+`amount_quality` (derived or missing) rather than a source-stated figure.
+`source` gets an `_with_provisional_email` suffix whenever the adjustment is
+nonzero, and the dashboard's Cash KPI (`dashboard/web/src/app/page.tsx`)
+appends the adjustment amount to its sub-label so a provisional balance is
+never presented as indistinguishable from a fully reconciled one.
+
+`get_historical_portfolio_values` applies the same three-source layering to
+its per-date series (a running cumulative sum of `_provisional_email_cash_events`
+merged against the value-date grid), so the trend chart and the Cash KPI
+never disagree about a confirmed-by-email-but-not-yet-reconciled trade's cash
+effect.
 
 ## Consumer Map
 

@@ -1,8 +1,14 @@
 # Holdings Reconciliation Agent
 
-This document is the human-readable companion to the Claude Code agent
-defined at
-[`.claude/agents/holdings-reconciliation.md`](../../../.claude/agents/holdings-reconciliation.md).
+> **Retired.** This agent (and the `reconcile-holdings-report` skill it
+> drove) was archived 2026-07-16 ("Phase 0: Archive Agent-Development
+> agents/skills as reference") and never restored. It is not invokable
+> today. The rest of this page is kept as historical reference for the
+> design, not as current documentation.
+
+This document was the human-readable companion to the Claude Code agent
+formerly defined at
+[`.claude/agents/_archive/holdings-reconciliation.md`](../../../.claude/agents/_archive/holdings-reconciliation.md).
 The original design rationale is preserved in [`plan.md`](plan.md).
 
 ## Purpose

@@ -217,6 +217,29 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_log_event(args: argparse.Namespace) -> int:
+    directory = run_module.resolve_run(args.run_id)
+    metadata = run_module.read_metadata(directory)
+    details = json.loads(args.details) if args.details else None
+    if details is not None and not isinstance(details, dict):
+        raise WorkspaceError("--details must be a JSON object")
+
+    from . import audit as audit_module
+
+    record = audit_module.append_event(
+        directory,
+        run_id=metadata.run_id,
+        event=args.event,
+        actor=args.actor,
+        status=args.status,
+        artifact=args.artifact,
+        details=details,
+        error=args.error,
+    )
+    _print(record)
+    return 0
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
     results = cache_module.gc(older_than_days=args.older_than_days, dry_run=args.dry_run)
     _print({"dry_run": args.dry_run, "older_than_days": args.older_than_days, "runs": results})
@@ -340,6 +363,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Archive without validating -- for retaining an abandoned or failed run.",
     )
     archive.set_defaults(func=_cmd_archive)
+
+    log_event = subcommands.add_parser(
+        "log-event",
+        help="Append a free-form audit event to a run's history -- for an orchestrating "
+             "agent's own actions (preflight checks, stage dispatch, final report) that "
+             "aren't already recorded by another run subcommand.",
+    )
+    log_event.add_argument("--run-id", required=True)
+    log_event.add_argument("--event", required=True, help="Short event name, e.g. preflight_passed.")
+    log_event.add_argument("--actor", required=True, help="Who performed this action, e.g. investment-orchestrator.")
+    log_event.add_argument("--status", default="success", help="e.g. success, failure, skipped.")
+    log_event.add_argument("--details", help="JSON object of extra structured detail.")
+    log_event.add_argument("--artifact", help="Run-relative path this event refers to, if any.")
+    log_event.add_argument("--error", help="Error message, typically paired with --status failure.")
+    log_event.set_defaults(func=_cmd_log_event)
 
     gc = subcommands.add_parser(
         "gc",

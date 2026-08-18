@@ -10,7 +10,7 @@ turns research evidence into Buy/Sell/Hold/Trim/Add/Watchlist/Avoid decisions.
 Every tunable number lives there -- gate thresholds, dimension weights, 1/3/5
 anchor cutoffs, verdict bands, confidence rules. This skill is how those numbers
 change: interactively, at the user's direction, validated, and versioned. KB
-agents (kb-discovery, kb-intake, stock-analyst) read the rubric but never edit
+agents (`kb-intake`, `stock-analyst`) read the rubric but never edit
 it; only this skill does, and only with the user in the loop.
 
 ## When to use

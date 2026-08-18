@@ -89,14 +89,24 @@ degradation in a source is invisible until an analysis quietly scores against
 half-empty data.
 
 Written by `src/skill_trace.py`. Producers today: `investment-analyst-resources`,
-`market-analyst-resources`, and `security-technicals`.
+`market-analyst-resources`, `security-technicals`, `security-status`, and the
+(non-skill) `investment_worksheet` module.
 
-The first two collect data; `security-technicals` collects none — it computes
-over stored prices. It emits a trace anyway because the question the trace
-answers ("was the data any good?") applies equally to a calculation whose
-inputs may be thin: a ticker with sixty days of history cannot produce an
-SMA-200, and that fact belongs in the same place a missing options chain does.
-The rule is therefore **any skill whose output quality depends on input
+The first two collect data; `security-technicals` and `security-status`
+collect none — the former computes over stored prices, the latter resolves a
+ticker's owned/wishlist/avoid/retired status from stored state. Both emit a
+trace anyway because the question the trace answers ("was the data any
+good?") applies equally to a calculation or lookup whose inputs may be thin:
+a ticker with sixty days of history cannot produce an SMA-200, and that fact
+belongs in the same place a missing options chain does.
+`investment_worksheet.build_worksheet_for_run` follows the same reasoning one
+stage later: it records whether the technicals/prior-thesis/market-context
+inputs a worksheet can carry were actually present, so a silently absent
+input (see the evidence-type collision this module's `_find_latest_evidence`
+used to be vulnerable to, fixed by giving `security_technicals`/
+`security_status`/`policy_worksheet` distinct evidence types) shows up here
+too, not just in the worksheet's own `unknowns` list. The rule is therefore
+**any skill whose output quality depends on input
 coverage**, not "any skill that fetches".
 
 ### The three-way split

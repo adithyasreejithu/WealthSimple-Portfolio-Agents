@@ -35,7 +35,7 @@ allocation_targets:
     min_percent: 55
     max_percent: 70
   Income:
-    target_percent: 15
+    target_percent: 10
     min_percent: 10
     max_percent: 20
   Quality:
@@ -43,7 +43,7 @@ allocation_targets:
     min_percent: 10
     max_percent: 20
   Growth:
-    target_percent: 10
+    target_percent: 15
     min_percent: 5
     max_percent: 15
   Alternatives:

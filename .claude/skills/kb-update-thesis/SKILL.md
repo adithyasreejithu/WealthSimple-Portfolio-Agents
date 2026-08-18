@@ -72,6 +72,14 @@ upstream `fetch-stock-research-data`/`evaluate-stock-decision` research and
 scoring for different tickers is safe to run in parallel since it never
 touches these shared files.
 
+## Human-only maintenance script
+
+`scripts/backfill_page_sections.py` is not part of the agent workflow above
+-- it is a one-time, human-run migration for thesis pages whose Company
+Overview / Original Thesis were left blank by an early recommendation ingest
+(see its own module docstring). Do not run it as part of a normal
+create/update/status-change request.
+
 Do not run arbitrary SQL or Python, do not create pages outside
 `Knowledge-Base/stocks/`, and do not touch `Knowledge-Base/ref/*.yaml` or
 `CHANGELOG.md`.

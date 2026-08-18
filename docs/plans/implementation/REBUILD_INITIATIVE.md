@@ -1,6 +1,6 @@
 # Investment Analyst Rebuild Initiative
 
-**Status:** Phases 0 & 1 complete; Phase 2 ready to begin  
+**Status:** Phases 0–4 complete; Phase 5 (side-by-side benchmark) ready to begin
 **Master plan:** [`../investment-analyst-rebuild-roadmap.md`](../investment-analyst-rebuild-roadmap.md)  
 **Phases:** Phases 0–5 are a strict critical path (no skipping, no reordering); 6–12 fan out after Phase 5
 
@@ -29,16 +29,16 @@ Phase 0 (✅ done)
 Phase 1 (✅ done)
   Models & validator: pydantic + cross-file checks
      ↓
-Phase 2 (→ ready to start)
+Phase 2 (✅ done)
   Cheap data gaps: technicals + ratios (no new data source)
      ↓
-Phase 3 (planned)
+Phase 3 (✅ done)
   Worksheet builder: compact analyst context
      ↓
-Phase 4 (planned)
-  Investment Analyst: LLM judgment + rubric scoring
+Phase 4 (✅ done)
+  Investment Analyst: LLM judgment against investment-thesis.v1
      ↓
-Phase 5 (planned)
+Phase 5 (→ ready to start)
   Benchmark: side-by-side comparison with legacy path
 ```
 
@@ -75,29 +75,49 @@ Phase 5 (planned)
 
 ---
 
-### Phase 2: Cheap Data-Gap Closure (Ready to Start)
+### Phase 2: Cheap Data-Gap Closure ✅
 
-**Goals:** Close the two gaps requiring no new data source before judgment work starts
+**Deliverables:** `src/security_technicals.py` (moving averages, beta, drawdown,
+volatility, relative strength vs. XEQT.TO), a normalized ratio module, and a
+fix for the 30d/90d/365d return mislabeling bug.
 
-**Deliverables:** 
-- Technicals module (moving averages, beta, drawdown, volatility, relative strength vs. XEQT.TO)
-- Ratio normalization module (EV/EBITDA, EV/Revenue, Debt/EBITDA, ROE, ROIC, PEG)
-- Fix for the 30d/90d/365d return mislabeling bug
-
-**Dependencies:** Only Phase 0 & 1 (policy file, models, existing historical_records OHLCV)  
-**Gate condition:** Unit tests reproduce hand-computed beta/drawdown/MA values; returns are correctly labeled
-
-**See:** [`../combined-investment-analyst-plan/03-phase-2-*.md`](../combined-investment-analyst-plan/)
+**See:** [`../phase-2/deliverables-checklist.md`](../phase-2/deliverables-checklist.md), [`../phase-2/HANDOFF.md`](../phase-2/HANDOFF.md)
 
 ---
 
-### Phases 3–5
+### Phase 3: Worksheet Builder ✅
 
-**Phase 3: Worksheet Builder** — First integration with `investment-analyst-resources`; deterministic calculations (technicals, ratios, valuation, scenarios)
+**Deliverables:** `src/workspace/investment_worksheet.py` (scope mapper +
+`build_worksheet`/`build_worksheet_for_run`), `financial_metrics.py`,
+`valuation.py`, `scenarios.py`. First integration with
+`investment-analyst-resources`; deterministic worksheet + compact
+analyst-context, TRACE preserved verbatim.
 
-**Phase 4: Investment Analyst Agent** — First LLM judgment; produces `investment-thesis.v1` draft; validates against Phase 1 validator
+**See:** [`../phase-3/deliverables-checklist.md`](../phase-3/deliverables-checklist.md), [`../phase-3/HANDOFF.md`](../phase-3/HANDOFF.md)
 
-**Phase 5: Benchmark** — Side-by-side comparison with legacy path; verdict on which to ship, dual-system, or targeted adoption
+---
+
+### Phase 4: Investment Analyst Agent ✅
+
+**Deliverables:** `.claude/agents/investment-analyst.md` — the sole LLM
+judgment stage — plus three new `run` CLI stages
+(`build-worksheet`/`check-thesis`/`save-thesis`) in `src/workspace/cli.py`
+wrapping new `thesis_validation.py` functions. Produces a validated
+`investment-thesis.v1` artifact against the unmodified Phase 1 validator; a
+scope correction was applied at the start of this phase (the legacy
+`decision-rubric.yml`/buy-sell-hold framing does not apply here — see
+`../phase-4/HANDOFF.md`).
+
+**See:** [`../phase-4/deliverables-checklist.md`](../phase-4/deliverables-checklist.md), [`../phase-4/HANDOFF.md`](../phase-4/HANDOFF.md)
+
+---
+
+### Phase 5: Benchmark (Ready to Start)
+
+Side-by-side comparison of the new `investment-analyst` path against the
+legacy `stock-analyst`/`decision-rubric.yml` path on the same tickers;
+verdict on full replacement, dual system, or targeted adoption (roadmap
+row 5).
 
 ---
 
@@ -216,15 +236,22 @@ The analyst produces a research-only thesis (no portfolio action field). The Por
 
 ## For Next Sessions
 
-### Before Phase 2 Starts
+### Before Phase 5 Starts
 
-1. **Decide on 0.001 vs 0.02 probability tolerance.** The code reads `config/policies/investment-analysis-policy.yml`'s value (0.001). If different, update the policy file before Phase 2 — Phase 2 may also read from it.
+1. **Read `../phase-4/HANDOFF.md` in full**, especially the scope correction
+   record (item 1) — the legacy `decision-rubric.yml`/buy-sell-hold framing
+   does not apply to the `investment-analyst` agent and must not be
+   reintroduced.
+2. **Run spot checks from `../phase-4/HANDOFF.md`** to confirm the system
+   still works: `uv run python -m unittest tests.test_investment_analyst_cli -v`
+   and the full suite.
+3. **Outstanding, carried forward from earlier phases, still unresolved:**
+   whether `tests/tmpqinoi8gr/portfolio.duckdb` (an 11MB binary accidentally
+   committed in `24e6272`, Phase 0) should be removed via a new commit or a
+   history rewrite — needs explicit user approval either way, not something
+   any phase should do unilaterally.
 
-2. **Decide what to do about `tests/tmpqinoi8gr/portfolio.duckdb` in git history.** Commit `24e6272` (Phase 0 refactor) accidentally committed 11MB binary. Either delete it (one new commit, 11MB stays forever) or rewrite history (destructive, needs explicit approval).
-
-3. **Run spot checks from Phase 1 HANDOFF.md** to confirm the system still works.
-
-### During Phase 2 & Beyond
+### During Phase 5 & Beyond
 
 - Keep Phase N implementation tracking (README, deliverables-checklist, HANDOFF) in `docs/plans/implementation/phase-N/`
 - Every phase is a safe stopping point; nothing later assumes phase N+1 exists
@@ -244,5 +271,5 @@ The analyst produces a research-only thesis (no portfolio action field). The Por
 
 ---
 
-**Last updated:** 2026-08-09  
-**Next action:** Approve Phase 1 deliverables and decide on the three items above (tolerance, database file, spot checks), then Phase 2 can begin.
+**Last updated:** 2026-08-11
+**Next action:** Approve Phase 4 deliverables, then Phase 5 (side-by-side benchmark) can begin.

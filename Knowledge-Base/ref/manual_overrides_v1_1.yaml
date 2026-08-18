@@ -149,10 +149,10 @@ overrides:
 
   - ticker: BN
     primary_group: Quality
-    secondary_tags: [Equity, Asset Management, Quality, CAD]
-    rationale: Default to Quality, but mark for review because the final role is still under consideration.
+    secondary_tags: []
+    rationale: Established
     active: true
-    review_needed: true
+    review_needed: false
 
   - ticker: RTX
     primary_group: Quality
@@ -228,5 +228,19 @@ overrides:
     primary_group: Alternatives
     secondary_tags: [ETF, Gold, Hedge, USD]
     rationale: Gold/hedge allocation; alternatives bucket.
+    active: true
+    review_needed: false
+
+  - ticker: LYTE
+    primary_group: Growth
+    secondary_tags: []
+    rationale: Continue to grow in time
+    active: true
+    review_needed: false
+
+  - ticker: NVDU
+    primary_group: Growth
+    secondary_tags: []
+    rationale: Short gain to test leverage
     active: true
     review_needed: false

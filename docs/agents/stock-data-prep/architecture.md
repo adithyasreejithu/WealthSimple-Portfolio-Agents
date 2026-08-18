@@ -98,7 +98,7 @@ the staleness gate:
 | Label | Agent | Prompt |
 | --- | --- | --- |
 | Score the worksheet | stock-analyst | "Run stock-analyst on the worksheet at `<worksheet_path>` for `<TICKER>`." |
-| Redirect pure KB lookups | kb-discovery | "This is a pure lookup of what the KB already knows about `<TICKER>`, not new research — kb-discovery handles that." |
+| Redirect pure KB lookups | *(none — invoke the `kb-search` skill directly)* | "This is a pure lookup of what the KB already knows about `<TICKER>`, not new research — run the `kb-search` skill instead." (No dedicated lookup agent exists; the former `kb-discovery` agent was archived 2026-07-16 and never restored.) |
 
 ## Concurrency
 

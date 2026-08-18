@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +13,9 @@ from dotenv import load_dotenv
 from imap_tools import AND, OR, MailBox
 
 from config import (
+    AMOUNT_QUALITY_DERIVED,
+    AMOUNT_QUALITY_MISSING,
+    AMOUNT_QUALITY_REPORTED,
     EMAIL_BODY_DATE_MAX_DRIFT_DAYS,
     EMAIL_OUTPUT_COLUMNS,
     EXPORT_FOLDER,
@@ -142,6 +146,32 @@ def message_subject_matches_interac(msg: object) -> bool:
 
 
 """
+Extract a trade's total CAD/USD amount from whichever label the fill
+confirmation used. Wealthsimple labels a filled buy's total "Total cost" but
+a filled sell's total "Total value" or "Total proceeds" -- the original
+parser only recognized "Total cost", so a sell confirmation's amount was
+silently dropped.
+"""
+def extract_trade_amount(text: str) -> str:
+    return extract_first(r"(?:Total value|Total proceeds|Total cost):\s*(?:US\$|\$)?(.+)", text) or ""
+
+
+"""
+When a trade confirmation states no total (an unrecognized label, or a
+malformed email), derive the gross amount from quantity x fill price rather
+than leaving the trade amount blank -- a blank amount silently zeroes cash
+impact and realized gain for a real, evidenced trade.
+"""
+def derive_trade_amount(quantity_text: str, avg_price_text: str) -> str | None:
+    try:
+        quantity = Decimal(quantity_text.replace(",", ""))
+        price = Decimal(avg_price_text.replace(",", ""))
+    except (InvalidOperation, ValueError, AttributeError):
+        return None
+    return str(abs(quantity * price))
+
+
+"""
 Parse Wealthsimple order and dividend emails without changing the fields
 already extracted by the reference implementation.
 """
@@ -153,31 +183,52 @@ def parse_wealthsimple_email(email: str, subject: str, received_date: date | Non
         transaction = "Dividend" if wealthsimple_subject_type(subject) == "dividend" else extract_first(r"Type:\s*(.+)", text)
         if not transaction:
             logger.warning("Parsed Wealthsimple email without transaction type | subject=%s", subject)
-        currency_match = re.search(r"(?:Average price|Total cost|Amount):\s*(US\$|CA\$)", text, flags=re.IGNORECASE)
+        currency_match = re.search(
+            r"(?:Average price|Total value|Total proceeds|Total cost|Amount):\s*(US\$|CA\$)",
+            text,
+            flags=re.IGNORECASE,
+        )
         price_currency = (
             "USD" if currency_match and currency_match.group(1).upper() == "US$"
             else "CAD" if currency_match else ""
         )
+        quantity = extract_first(r"Shares:\s*(.+)", text) or ""
+        avg_price = extract_first(r"Average price:\s*(?:US\$|\$)?(.+)", text) or ""
+        total_cost = extract_trade_amount(text)
+        is_trade = bool(transaction) and ("buy" in transaction.lower() or "sell" in transaction.lower())
+        amount_quality = ""
+        if is_trade:
+            if total_cost:
+                amount_quality = AMOUNT_QUALITY_REPORTED
+            else:
+                derived = derive_trade_amount(quantity, avg_price)
+                if derived is not None:
+                    total_cost = derived
+                    amount_quality = AMOUNT_QUALITY_DERIVED
+                else:
+                    amount_quality = AMOUNT_QUALITY_MISSING
         row = {
             "account": extract_first(r"Account:\s*(.+)", text) or "",
             "transaction": transaction or "",
             "ticker_id": "",
             "ticker": extract_first(r"Symbol:\s*(.+)", text) or "",
-            "quantity": extract_first(r"Shares:\s*(.+)", text) or "",
-            "avg_price": extract_first(r"Average price:\s*(?:US\$|\$)?(.+)", text) or "",
-            "total_cost": extract_first(r"Total cost:\s*(?:US\$|\$)?(.+)", text) or "",
+            "quantity": quantity,
+            "avg_price": avg_price,
+            "total_cost": total_cost,
             "debit": extract_first(r"Amount:\s*(?:CA\$|US\$|\$)?(\d+(?:\.\d{1,2})?)", text) or "",
             "date": resolve_email_date(parsed_date, received_date, "Wealthsimple"),
             "price_currency": price_currency,
+            "amount_quality": amount_quality,
             "source_message_id": "",
             "received_at": received_date,
         }
         logger.debug(
-            "Parsed Wealthsimple email | transaction=%s | ticker=%s | quantity=%s | date=%s",
+            "Parsed Wealthsimple email | transaction=%s | ticker=%s | quantity=%s | date=%s | amount_quality=%s",
             row["transaction"],
             row["ticker"],
             row["quantity"],
             row["date"],
+            row["amount_quality"],
         )
         return pd.DataFrame([row], columns=OUTPUT_COLUMNS)
     except Exception:
@@ -244,6 +295,7 @@ def parse_interac_email(email: str, subject: str = "", received_date: date | Non
             "debit": extract_interac_money(text),
             "date": resolve_email_date(extract_interac_date(text), received_date, "Interac"),
             "price_currency": "",
+            "amount_quality": "",
             "source_message_id": "",
             "received_at": received_date,
         }

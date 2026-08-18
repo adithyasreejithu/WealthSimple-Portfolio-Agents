@@ -83,11 +83,16 @@ Updated Thesis edit). There is no `portfolio/decisions/` or
 
 | Agent | Role | Tools |
 |---|---|---|
-| `kb-discovery` | Read-only search and context reporting. | `Bash`, `Read` |
 | `kb-intake` | The only agent that writes to the wiki: document intake, thesis create/update, status changes, portfolio sync. | `Bash`, `Read`, `Edit`, `Write` |
 
-Full per-agent documentation: `docs/agents/kb-discovery/` and
-`docs/agents/kb-intake/`.
+A `kb-discovery` read-only search/context-reporting agent existed alongside
+`kb-intake` at one point but was archived 2026-07-16 and never restored
+(`.claude/agents/_archive/kb-discovery.md`) -- a pure lookup now invokes the
+`kb-search` skill directly rather than a dedicated subagent.
+
+Full per-agent documentation: `docs/agents/kb-intake/`
+(`docs/agents/kb-discovery/` is retained as a historical reference for the
+retired agent).
 
 ## Changelog split
 

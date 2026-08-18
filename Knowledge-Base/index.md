@@ -13,7 +13,8 @@ summary: "Main index of the investment research knowledge base."
 
 LLM-maintained investment research knowledge base. Every page carries YAML
 front matter per [templates/front-matter-spec.md](templates/front-matter-spec.md);
-the `kb-discovery` agent searches it, the `kb-intake` agent writes to it.
+the `kb-search` skill searches it (invoked directly for a pure lookup, or as
+a step inside another agent's workflow), the `kb-intake` agent writes to it.
 
 ## Sections
 

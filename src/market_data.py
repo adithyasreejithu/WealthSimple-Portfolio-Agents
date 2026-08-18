@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -12,6 +12,9 @@ import pandas as pd
 from config import (
     BENCHMARK_TICKERS,
     DATABASE_PATH,
+    DIVIDENDS_REFRESH_INTERVAL_DAYS,
+    EARNINGS_REFRESH_INTERVAL_DAYS,
+    FINANCIAL_SNAPSHOTS_REFRESH_INTERVAL_DAYS,
     FX_PAIR_SYMBOL,
     MINIMUM_PRICE_HISTORY_DAYS,
 )
@@ -22,8 +25,13 @@ from database_command import (
     upload_financial_snapshots,
     upload_security_history,
     upload_security_metadata,
+    upload_upcoming_dividends,
 )
-from earnings_dividends_extractor import fetch_dividend_events, fetch_earnings_events
+from earnings_dividends_extractor import (
+    fetch_dividend_events,
+    fetch_earnings_events,
+    fetch_upcoming_dividends,
+)
 from financial_snapshots_extractor import fetch_financial_snapshots
 from system_logger import get_logger
 from yfinance_extractor import fetch_security_history, fetch_security_info
@@ -136,6 +144,11 @@ class EarningsDividendsSyncResult:
     dividend_rows: int
     error: str | None = None
     failed_symbols: tuple[str, ...] = ()
+    # Appended after the existing fields (rather than grouped with
+    # dividend_rows) so every pre-existing positional construction of this
+    # dataclass elsewhere in this module keeps binding error/failed_symbols
+    # to the same argument position it always has.
+    upcoming_dividend_rows: int = 0
 
     @property
     def succeeded(self) -> bool:
@@ -242,6 +255,89 @@ def get_market_targets(
         target for target in targets
         if target.symbol.upper() in requested or target.provider_symbol.upper() in requested
     ]
+
+
+def _stale_symbols(
+    db_path: Path | str,
+    targets: Iterable[MarketTarget],
+    table: str,
+    max_age_days: int,
+    *,
+    as_of: date | None = None,
+) -> list[str]:
+    """Symbols among `targets` whose `table.fetched_at` is missing or older than `max_age_days`.
+
+    `table` is always one of a fixed set of internal literals passed by the
+    wrapper functions below (never external input), so the f-string is safe.
+    A ticker with no row at all in `table` counts as stale (never fetched).
+    """
+    targets = list(targets)
+    if not targets:
+        return []
+    today = as_of or date.today()
+    cutoff = datetime.combine(today, datetime.min.time()) - timedelta(days=max_age_days)
+    ticker_ids = [target.ticker_id for target in targets]
+    placeholders = ", ".join("?" for _ in ticker_ids)
+    rows = get_shared_connection(db_path).execute(
+        f"SELECT ticker_id, MAX(fetched_at) FROM {table} WHERE ticker_id IN ({placeholders}) GROUP BY ticker_id",
+        ticker_ids,
+    ).fetchall()
+    fresh_ids = {ticker_id for ticker_id, fetched_at in rows if fetched_at is not None and fetched_at >= cutoff}
+    return [target.symbol for target in targets if target.ticker_id not in fresh_ids]
+
+
+def stale_earnings_symbols(
+    db_path: Path | str,
+    targets: Iterable[MarketTarget],
+    *,
+    max_age_days: int = EARNINGS_REFRESH_INTERVAL_DAYS,
+    as_of: date | None = None,
+) -> list[str]:
+    """Owned symbols whose earnings calendar has not been refreshed within `max_age_days`.
+
+    Excludes ETFs -- yfinance never returns an earnings date for a fund
+    (`earnings_dividends_extractor` logs this as expected, not an error), so
+    an ETF's `earnings_events` row count is permanently zero and `_stale_symbols`
+    would otherwise mark it stale (and re-fetch it) on every single call.
+    """
+    equities = [target for target in targets if target.asset_class != "etf"]
+    return _stale_symbols(db_path, equities, "earnings_events", max_age_days, as_of=as_of)
+
+
+def stale_dividend_symbols(
+    db_path: Path | str,
+    targets: Iterable[MarketTarget],
+    *,
+    max_age_days: int = DIVIDENDS_REFRESH_INTERVAL_DAYS,
+    as_of: date | None = None,
+) -> list[str]:
+    """Owned symbols whose dividend schedule has not been refreshed within `max_age_days`.
+
+    Unlike earnings/financials, whether a ticker pays a dividend is not
+    knowable from `asset_class` (a growth stock and a dividend payer are both
+    `security_type='stock'`), so a non-dividend-paying stock's permanently
+    empty `dividend_events` row still reads as stale on every call and gets
+    re-fetched every pipeline run -- a bounded number of extra yfinance calls,
+    not a correctness issue, but this gate does not shrink for that ticker.
+    """
+    return _stale_symbols(db_path, targets, "dividend_events", max_age_days, as_of=as_of)
+
+
+def stale_financial_snapshot_symbols(
+    db_path: Path | str,
+    targets: Iterable[MarketTarget],
+    *,
+    max_age_days: int = FINANCIAL_SNAPSHOTS_REFRESH_INTERVAL_DAYS,
+    as_of: date | None = None,
+) -> list[str]:
+    """Owned symbols whose quarterly financials have not been refreshed within `max_age_days`.
+
+    Excludes ETFs for the same reason as `stale_earnings_symbols`: yfinance
+    never returns quarterly statements for a fund, so an ETF's
+    `financial_snapshots` row count is permanently zero.
+    """
+    equities = [target for target in targets if target.asset_class != "etf"]
+    return _stale_symbols(db_path, equities, "financial_snapshots", max_age_days, as_of=as_of)
 
 
 def _ensure_fx_ticker(db_path: Path | str) -> int:
@@ -523,8 +619,10 @@ def sync_earnings_dividends(
     include_research: bool = False,
     earnings_fetcher: Callable[[Iterable[str]], pd.DataFrame] = fetch_earnings_events,
     dividends_fetcher: Callable[[Iterable[str]], pd.DataFrame] = fetch_dividend_events,
+    upcoming_dividends_fetcher: Callable[[Iterable[str]], pd.DataFrame] = fetch_upcoming_dividends,
     skip_earnings: bool = False,
     skip_dividends: bool = False,
+    skip_upcoming: bool = False,
 ) -> EarningsDividendsSyncResult:
     """Fetch and atomically persist company-declared earnings/dividend calendars.
 
@@ -535,6 +633,11 @@ def sync_earnings_dividends(
     dividend cash in `cash_transactions`/`transactions` -- the two are never
     joined or conflated. Runs on demand only; unlike OHLCV it is not part of
     the automatic post-email sync.
+
+    The upcoming-dividend fetch shares `dividend_events` with the historical
+    fetch (see `upload_upcoming_dividends`) and is written in the same
+    transaction as the other two, so a partial sync can never leave one table
+    updated and another stale relative to it.
     """
     initialize_database(db_path)
     targets = get_market_targets(db_path, symbols, include_research=include_research)
@@ -546,11 +649,14 @@ def sync_earnings_dividends(
 
     earnings = pd.DataFrame()
     dividends = pd.DataFrame()
+    upcoming_dividends = pd.DataFrame()
     try:
         if not skip_earnings:
             earnings = earnings_fetcher(provider_symbols)
         if not skip_dividends:
             dividends = dividends_fetcher(provider_symbols)
+        if not skip_upcoming:
+            upcoming_dividends = upcoming_dividends_fetcher(provider_symbols)
     except Exception as exc:
         logger.exception("Earnings/dividends synchronization fetch failed")
         return EarningsDividendsSyncResult(
@@ -567,6 +673,11 @@ def sync_earnings_dividends(
         dividend_rows = (
             upload_dividend_events(dividends, ticker_ids, db_path) if not dividends.empty else 0
         )
+        upcoming_dividend_rows = (
+            upload_upcoming_dividends(upcoming_dividends, ticker_ids, db_path)
+            if not upcoming_dividends.empty
+            else 0
+        )
         connection.execute("COMMIT")
     except Exception as exc:
         connection.execute("ROLLBACK")
@@ -577,10 +688,12 @@ def sync_earnings_dividends(
         )
 
     logger.info(
-        "Earnings/dividends synchronization complete | tickers=%d | earnings=%d | dividends=%d",
-        len(targets), earnings_rows, dividend_rows,
+        "Earnings/dividends synchronization complete | tickers=%d | earnings=%d | dividends=%d | upcoming=%d",
+        len(targets), earnings_rows, dividend_rows, upcoming_dividend_rows,
     )
-    return EarningsDividendsSyncResult(len(targets), earnings_rows, dividend_rows)
+    return EarningsDividendsSyncResult(
+        len(targets), earnings_rows, dividend_rows, upcoming_dividend_rows=upcoming_dividend_rows
+    )
 
 
 def sync_financial_snapshots(

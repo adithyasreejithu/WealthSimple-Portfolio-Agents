@@ -156,6 +156,43 @@ never trusted from the agent's own reading of the `security-status` skill's
 digest. You cannot trim or sell a position you do not hold; for a non-owned
 subject the entry actions are `Buy`/`Watch`/`Wait`/`Pass`.
 
+## Capacity constraint vs. thesis quality in `rationale`
+
+The policy-consistency gate above is deterministic about the *action*: a
+failing `single_name_cap`/`group_allocation_target` forces `Hold`/`Trim`/
+`Sell` (owned) or `Watch`/`Wait`/`Pass` (not-owned) regardless of the thesis.
+It says nothing about the *prose*, though, and an unqualified `Watch`/`Wait`/
+`Hold` reads to a human as "this stock isn't good enough" even when the real
+reason is that the portfolio (or the security's classifier group) has no
+room left. The agent's workflow (step 7) now requires the `rationale` to say
+which of the two it is whenever a passing, attractive thesis is the one
+being blocked by a failing weight/allocation check: name the failing check
+explicitly as a capacity constraint, and state that the thesis is not the
+reason for the negative-leaning action. This is a prose requirement checked
+only by instruction, not a schema field — `check-decision`/`save-decision`
+do not parse `rationale` text, so getting it right is on the agent at draft
+time, not something the validator will catch after the fact.
+
+## Possible-misclassification flag
+
+A full `group_allocation_target` is not always a pure capacity problem — a
+crowded classifier group is also exactly where a misclassified ticker first
+becomes visible, since it is now competing for room in a group it may not
+actually belong to. The agent's workflow (step 7) has it weigh, specifically
+when `group_allocation_target` is the failing check, whether the thesis's
+own description of the business (`key_claims`, `conclusion`) actually
+matches `policy_worksheet.subject.primary_group`. When there's a
+thesis-grounded reason to think it doesn't, the agent adds one
+`DecisionProposal.uncertainties` entry naming the group and the specific
+mismatch — kept separate from the capacity-constraint rationale above, since
+they are different claims ("no room right now" vs. "may be in the wrong
+group"). This is a flag for human review, never a reclassification the agent
+performs itself: it has no write access to `portfolio_classifications`, and
+`classify-portfolio` (`.claude/skills/classify-portfolio/`) is the only path
+that changes a group. Silence is the default — a full group on a
+well-classified name gets no flag, since raising one without thesis-grounded
+support is noise a reader would learn to ignore.
+
 ## Order guidance
 
 `order_guidance` (`models.OrderGuidance`) is strictly advisory -- a
@@ -215,6 +252,9 @@ those live only in the `security-technicals` artifact, which
   human-gated, unbuilt component.
 - Does not fetch data or build a thesis itself — if no thesis exists for the
   ticker, it hands off to `investment-analyst` rather than doing that work.
+- Does not reclassify a security — a suspected `primary_group` mismatch is
+  raised as an `uncertainties` entry for human review, never acted on
+  directly; only `classify-portfolio` changes `portfolio_classifications`.
 
 ## Guardrails
 

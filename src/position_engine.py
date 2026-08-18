@@ -266,7 +266,8 @@ def _load_events(connection: Any) -> list[tuple]:
     return connection.execute(
         """
         SELECT v.ticker_id, t.currency, v.event_date, v.event_type, v.source,
-               v.source_id, v.quantity, v.amount_cad, v.amount_currency, v.fx_rate
+               v.source_id, v.quantity, v.amount_cad, v.amount_currency, v.fx_rate,
+               v.amount_quality
         FROM v_trade_events v
         JOIN tickers t ON t.ticker_id = v.ticker_id
         ORDER BY v.ticker_id, v.event_date, v.source_priority, v.source_id
@@ -275,12 +276,19 @@ def _load_events(connection: Any) -> list[tuple]:
 
 
 def _apply_buy(
-    state: _TickerState, quantity: Decimal, amount_cad: Decimal | None, fx_rate: Decimal, source: str
+    state: _TickerState,
+    quantity: Decimal,
+    amount_cad: Decimal | None,
+    amount_quality: str | None,
+    fx_rate: Decimal,
+    source: str,
 ) -> Decimal:
     if amount_cad is None:
         state.flags.add("buy_missing_cost")
         cost_cad = Decimal("0")
     else:
+        if amount_quality and amount_quality != "reported":
+            state.flags.add("buy_cost_estimated")
         cost_cad = amount_cad
     state.quantity += quantity
     state.book_cad += cost_cad
@@ -291,10 +299,16 @@ def _apply_buy(
 
 
 def _apply_sell(
-    state: _TickerState, quantity: Decimal, amount_cad: Decimal | None, source: str
+    state: _TickerState,
+    quantity: Decimal,
+    amount_cad: Decimal | None,
+    amount_quality: str | None,
+    ticker_id: int,
+    source: str,
 ) -> Decimal:
     sold = quantity
-    if sold > state.quantity:
+    oversold = quantity - state.quantity if quantity > state.quantity else Decimal("0")
+    if oversold > 0:
         state.flags.add("oversell_clamped")
         sold = state.quantity
     avg_cad = (state.book_cad / state.quantity) if state.quantity > 0 else Decimal("0")
@@ -303,7 +317,22 @@ def _apply_sell(
         state.flags.add("sell_missing_proceeds")
         proceeds_cad = sold * avg_cad
     else:
-        proceeds_cad = amount_cad
+        if amount_quality and amount_quality != "reported":
+            state.flags.add("sell_proceeds_estimated")
+        # The reported/derived amount covers the full confirmed `quantity`,
+        # but only `sold` shares are actually leaving this position's book on
+        # an oversell -- prorate proceeds to `sold` for realized gain so the
+        # unmatched shares' proceeds don't get counted as pure gain against
+        # zero cost. Cash (analytics.get_cash_summary) still rolls forward
+        # the full reported amount separately; only this ledger/realized-gain
+        # figure is prorated.
+        proceeds_cad = amount_cad if oversold == 0 else amount_cad * (sold / quantity)
+        if oversold > 0:
+            logger.warning(
+                "Oversell excluded from realized gain | ticker_id=%s | source=%s | "
+                "unmatched_quantity=%s | unmatched_proceeds_cad=%s",
+                ticker_id, source, oversold, amount_cad - proceeds_cad,
+            )
     state.realized_cad += proceeds_cad - sold * avg_cad
     state.book_cad -= sold * avg_cad
     state.book_mkt -= sold * avg_mkt
@@ -360,6 +389,7 @@ def recompute_positions(connection: Any = None, db_path: str | Path = DATABASE_P
         for (
             ticker_id, currency, event_date, event_type, source, source_id,
             raw_quantity, raw_amount_cad, raw_amount_currency, raw_fx_rate,
+            amount_quality,
         ) in events:
             state = states.setdefault(ticker_id, _TickerState())
             quantity = Decimal(str(raw_quantity))
@@ -381,10 +411,10 @@ def recompute_positions(connection: Any = None, db_path: str | Path = DATABASE_P
 
             cost_cad = proceeds_cad = None
             if event_type == "BUY":
-                cost_cad = _apply_buy(state, quantity, amount_cad, fx_rate, source)
+                cost_cad = _apply_buy(state, quantity, amount_cad, amount_quality, fx_rate, source)
                 ledger_delta = quantity
             elif event_type == "SELL":
-                proceeds_cad = _apply_sell(state, quantity, amount_cad, source)
+                proceeds_cad = _apply_sell(state, quantity, amount_cad, amount_quality, ticker_id, source)
                 ledger_delta = -quantity
             elif event_type == "SPLIT":
                 state.quantity += quantity

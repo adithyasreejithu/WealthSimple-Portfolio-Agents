@@ -59,18 +59,27 @@ Claude Code uses these folders for different jobs:
 
 ## Current Repo Mapping
 
-The repo has `CLAUDE.md` and the `.claude/agents/` tree with seven real
+The repo has `CLAUDE.md` and the `.claude/agents/` tree with eight real
 agents: `portfolio-classifier` (a single deterministic report workflow),
 `kb-intake` and `kb-orchestrator` (writing/orchestrating the research wiki),
 the stock decision-support pipeline `stock-data-prep` and `stock-analyst`
 (mechanical prep vs. rubric judgment; see
 `docs/architecture/decision_support_flow.md`), and the rebuilt Investment
-Analyst track's `investment-analyst` and `investment-portfolio-manager`
-(fundamental judgment vs. portfolio-sizing judgment, sharing the read-only
-`security-status` skill between them; see `docs/agents/investment-analyst/`
-and `docs/agents/investment-portfolio-manager/`). `holdings-reconciliation`
-and `kb-discovery`, present in earlier revisions of this document, no longer
-have a `.claude/agents/*.md` file on disk.
+Analyst track's `investment-analyst`, `investment-portfolio-manager`, and
+`investment-orchestrator` (fundamental judgment vs. portfolio-sizing
+judgment vs. read-only preflight-and-dispatch coordination, the first two
+sharing the read-only `security-status` skill between them; see
+`docs/agents/investment-analyst/`, `docs/agents/investment-portfolio-manager/`,
+and `docs/agents/investment-orchestrator/`). `investment-orchestrator` and
+`kb-orchestrator` are the only two agents in this repo authorized to hold
+`Task`, each an explicit, narrowly-scoped exception -- not a precedent for
+any other agent to acquire it (see their own Guardrails sections).
+`holdings-reconciliation` and
+`kb-discovery`, present in earlier revisions of this document, no longer
+have a `.claude/agents/*.md` file on disk (both archived 2026-07-16 and
+never restored, unlike `kb-intake`/`stock-analyst`/`stock-data-prep`/
+`portfolio-classifier`/`author-decision-rubric` from that same archive,
+which were).
 
 | Current file or folder | What it does now | Recommendation |
 | --- | --- | --- |
@@ -180,17 +189,22 @@ executable mechanism. Agents with no downstream handoff should state that
 explicitly (e.g. "None -- this agent's output is terminal.") rather than
 omitting the section, so its absence is never ambiguous with an oversight.
 
-**The `Task`-holder exception: `kb-orchestrator`.** The KB population workflow
-(`docs/plans/kb-population-agent-rebuild.md`) needs one agent that runs a fixed
-fetch → score → commit sequence per due ticker on demand, rather than relying
-on a human or a scheduled top-level prompt to drive the fan-out. That agent,
-`.claude/agents/kb-orchestrator.md`, is granted `Task` deliberately and is the
-**only** agent in this repo that holds it. Its `Task` use is confined to
-dispatching the fixed sequence (`stock-data-prep`, `stock-analyst`, one
-`kb-intake`); it carries no judgment of its own. This is a narrow,
-explicitly-authorized exception (Adithya's direction), **not** a precedent for
-granting other agents `Task` — the Handoffs-table convention above remains the
-default for every other agent.
+**The `Task`-holder exception: `kb-orchestrator` and `investment-orchestrator`.**
+The KB population workflow (`docs/plans/kb-population-agent-rebuild.md`)
+needs one agent that runs a fixed fetch → score → commit sequence per due
+ticker on demand, rather than relying on a human or a scheduled top-level
+prompt to drive the fan-out. That agent, `.claude/agents/kb-orchestrator.md`,
+was granted `Task` deliberately and was the first agent in this repo to hold
+it. Its `Task` use is confined to dispatching the fixed sequence
+(`stock-data-prep`, `stock-analyst`, one `kb-intake`); it carries no
+judgment of its own. `.claude/agents/investment-orchestrator.md`
+(`docs/agents/investment-orchestrator/`) is a second, independently-justified
+exception for its own fixed `investment-analyst` → `investment-portfolio-manager`
+dispatch sequence, built after a manual run surfaced blockers a read-only
+preflight gate could catch earlier — see that agent's `plan.md`. These are
+narrow, explicitly-authorized exceptions (Adithya's direction in both cases),
+**not** a precedent for granting `Task` to any other agent — the
+Handoffs-table convention above remains the default for every other agent.
 
 ### `.claude/skills/*/SKILL.md`
 

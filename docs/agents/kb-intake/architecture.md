@@ -111,7 +111,7 @@ skills:
 
 | Label | Agent | Prompt |
 | --- | --- | --- |
-| Redirect pure lookups | kb-discovery | "This is a read-only lookup with no write intent — kb-discovery searches the knowledge base without writing." |
+| Redirect pure lookups | *(none — invoke the `kb-search` skill directly)* | "This is a read-only lookup with no write intent — run the `kb-search` skill instead of writing anything." (No dedicated lookup agent exists; the former `kb-discovery` agent was archived 2026-07-16 and never restored, unlike `kb-intake` itself.) |
 
 ## Code Location
 
@@ -126,4 +126,5 @@ skills:
 - `src/kb_pages.py` — shared front-matter/index/log helpers used by all four
   skills; lives in `src/` (not one skill's `scripts/`) per
   [`docs/architecture/claude_agent_skill_structure.md`](../../architecture/claude_agent_skill_structure.md),
-  the same reasoning as `kb-discovery`'s skill dependency.
+  since `kb-search` is a shared dependency used both by this agent and
+  directly by any pure-lookup request.

@@ -25,7 +25,7 @@ Run `uv run python .claude/skills/security-technicals/scripts/security_technical
 - `--no-run` / `--run-id ID` — see below.
 - `--no-trace` — skip the completeness trace.
 - `--no-quote` — skip the live current-price quote (on by default).
-- `--pretty` — pretty-print the JSON digest.
+- `--pretty` / `--no-pretty` — pretty-print the JSON digest (default: pretty).
 
 ## Workflow
 

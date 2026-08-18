@@ -25,7 +25,7 @@ Run `uv run python .claude/skills/security-status/scripts/security_status_cli.py
   (single-ticker runs only).
 - `--no-run` / `--run-id ID` — see below.
 - `--no-trace` — skip the completeness trace.
-- `--pretty` — pretty-print the JSON digest.
+- `--pretty` / `--no-pretty` — pretty-print the JSON digest (default: pretty).
 
 ## Workflow
 

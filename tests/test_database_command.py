@@ -13,10 +13,12 @@ from database_command import (
     get_email_checkpoint,
     normalize_ticker_dataframe,
     update_email_checkpoint,
+    upload_dividend_events,
     upload_email_transactions,
     upload_financial_snapshots,
     upload_portfolio_classifications,
     upload_statement_transactions,
+    upload_upcoming_dividends,
     reconcile_email_transactions,
     reconcile_statement_activities,
     upload_security_metadata,
@@ -230,6 +232,80 @@ class DatabaseCommandTest(unittest.TestCase):
             "SELECT source_symbol, price_currency, ticker_resolution_status FROM email_transactions"
         ).fetchone()
         self.assertEqual(row, ("NEW", "CAD", "pending"))
+
+    def test_replay_enriches_unmatched_provisional_row_in_place(self):
+        """
+        Reproduces the PLTR fix's replay path: the first upload used an
+        older parser that could not read the sell's total, so total_cost/
+        amount_quality were blank. A replay with the fixed parser must
+        update the existing row in place (same email_transaction_id, no
+        second row, no inflated `written` count) since it is still
+        unmatched and provisional.
+        """
+        base_row = {
+            "account": "TFSA", "transaction": "Sell", "ticker_id": None,
+            "ticker": "PLTR", "quantity": "1.0000", "avg_price": "45.00",
+            "total_cost": "", "debit": "", "date": date(2026, 8, 5),
+            "price_currency": "USD", "amount_quality": "missing",
+            "source_message_id": "message-pltr-1", "received_at": date(2026, 8, 5),
+        }
+        self.assertEqual(upload_email_transactions(pd.DataFrame([base_row]), self.db_path), 1)
+
+        replay_row = dict(base_row, total_cost="45.00", amount_quality="derived_from_quantity_and_price")
+        written = upload_email_transactions(pd.DataFrame([replay_row]), self.db_path)
+
+        self.assertEqual(written, 0)
+        rows = database.get_shared_connection(self.db_path).execute(
+            "SELECT total_cost, amount_quality FROM email_transactions"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0], (Decimal("45.00"), "derived_from_quantity_and_price"))
+
+    def test_replay_never_modifies_an_already_linked_row(self):
+        """
+        Once reconciliation links an email row to an activity/statement
+        (reconciliation_status leaves 'provisional'), a replay with richer
+        parsed data must not silently rewrite it -- the linked row is
+        authoritative. It should log a warning and leave the stored values
+        untouched instead.
+        """
+        connection = database.get_shared_connection(self.db_path)
+        ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('PLTR', 'NASDAQ', 'USD', 'Palantir Technologies Inc.', 'stock')
+               RETURNING ticker_id"""
+        ).fetchone()[0]
+        message_id = connection.execute(
+            """INSERT INTO email_messages (source, source_message_id, received_at, content_hash)
+               VALUES ('wealthsimple', 'message-pltr-2', ?, 'hash') RETURNING email_message_id""",
+            [date(2026, 8, 5)],
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO email_transactions (
+                   account, transaction_type, ticker_id, quantity, total_cost, transaction_date,
+                   email_message_id, source_symbol, price_currency, amount_quality,
+                   ticker_resolution_status, reconciliation_status, matched_activity_id
+               ) VALUES ('TFSA', 'Sell', ?, 1, NULL, ?, ?, 'PLTR', 'USD', 'missing',
+                         'resolved', 'superseded', 999)""",
+            [ticker_id, date(2026, 8, 5), message_id],
+        )
+
+        replay_row = {
+            "account": "TFSA", "transaction": "Sell", "ticker_id": ticker_id,
+            "ticker": "PLTR", "quantity": "1.0000", "avg_price": "45.00",
+            "total_cost": "45.00", "debit": "", "date": date(2026, 8, 5),
+            "price_currency": "USD", "amount_quality": "derived_from_quantity_and_price",
+            "source_message_id": "message-pltr-2", "received_at": date(2026, 8, 5),
+        }
+        with self.assertLogs("database_command", level="WARNING") as captured:
+            written = upload_email_transactions(pd.DataFrame([replay_row]), self.db_path)
+
+        self.assertEqual(written, 0)
+        self.assertTrue(any("already-linked" in line for line in captured.output))
+        row = connection.execute(
+            "SELECT total_cost, amount_quality FROM email_transactions"
+        ).fetchone()
+        self.assertEqual(row, (None, "missing"))
 
     def test_interac_deposit_is_not_applicable_not_pending(self):
         data = pd.DataFrame([{
@@ -915,6 +991,108 @@ class FinancialSnapshotsUploadTest(unittest.TestCase):
             "SELECT revenue, net_income, current_ratio FROM financial_snapshots"
         ).fetchone()
         self.assertEqual(row, (None, None, None))
+
+
+class UpcomingDividendsUploadTest(unittest.TestCase):
+    def setUp(self):
+        database.close_connection()
+        self.temp_dir = tempfile.TemporaryDirectory(
+            dir=Path(__file__).resolve().parent
+        )
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
+        self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
+        database.initialize_database(self.db_path)
+        connection = database.get_shared_connection(self.db_path)
+        self.ticker_id = connection.execute(
+            """INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+               VALUES ('AAPL', 'NASDAQ', 'USD', 'Apple Inc.', 'stock') RETURNING ticker_id""",
+        ).fetchone()[0]
+        self.ticker_ids = {"AAPL": self.ticker_id}
+
+    def _row(self, **overrides):
+        row = {
+            "Ticker": "AAPL", "ProviderSymbol": "AAPL", "ExDividendDate": "2026-09-15",
+            "PayDate": "2026-09-30", "DeclaredAmount": 0.26, "Frequency": "quarterly",
+        }
+        row.update(overrides)
+        return row
+
+    def test_inserts_new_upcoming_row_with_pay_date_and_frequency(self):
+        written = upload_upcoming_dividends(pd.DataFrame([self._row()]), self.ticker_ids, self.db_path)
+
+        self.assertEqual(written, 1)
+        row = database.get_shared_connection(self.db_path).execute(
+            "SELECT ex_dividend_date, pay_date, declared_amount, frequency FROM dividend_events"
+        ).fetchone()
+        self.assertEqual(row[0], date(2026, 9, 15))
+        self.assertEqual(row[1], date(2026, 9, 30))
+        self.assertEqual(row[2], Decimal("0.26000000"))
+        self.assertEqual(row[3], "quarterly")
+
+    def test_resync_with_moved_ex_date_retires_the_old_forecast(self):
+        # A forecast that has since moved must not linger alongside the fresh one.
+        upload_upcoming_dividends(pd.DataFrame([self._row()]), self.ticker_ids, self.db_path)
+
+        written = upload_upcoming_dividends(
+            pd.DataFrame([self._row(ExDividendDate="2026-09-22")]), self.ticker_ids, self.db_path
+        )
+
+        self.assertEqual(written, 1)
+        connection = database.get_shared_connection(self.db_path)
+        rows = connection.execute(
+            "SELECT ex_dividend_date FROM dividend_events WHERE ticker_id = ?", [self.ticker_id]
+        ).fetchall()
+        self.assertEqual([r[0] for r in rows], [date(2026, 9, 22)])
+
+    def test_does_not_retire_past_ex_dates(self):
+        # A historical row (from upload_dividend_events) must survive an
+        # upcoming-dividend resync for the same ticker.
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            """INSERT INTO dividend_events (ticker_id, ex_dividend_date, declared_amount)
+               VALUES (?, '2025-01-15', 0.22)""",
+            [self.ticker_id],
+        )
+
+        upload_upcoming_dividends(pd.DataFrame([self._row()]), self.ticker_ids, self.db_path)
+
+        rows = connection.execute(
+            "SELECT ex_dividend_date FROM dividend_events WHERE ticker_id = ? ORDER BY ex_dividend_date",
+            [self.ticker_id],
+        ).fetchall()
+        self.assertEqual([r[0] for r in rows], [date(2025, 1, 15), date(2026, 9, 15)])
+
+    def test_historical_upload_does_not_clobber_pay_date_or_frequency(self):
+        # upload_dividend_events' own ON CONFLICT clause never touches
+        # pay_date/frequency -- confirms that guarantee end-to-end for the
+        # boundary case where the same ex-date is later re-synced as history.
+        upload_upcoming_dividends(pd.DataFrame([self._row()]), self.ticker_ids, self.db_path)
+
+        upload_dividend_events(
+            pd.DataFrame([{
+                "Ticker": "AAPL", "ProviderSymbol": "AAPL",
+                "ExDividendDate": "2026-09-15", "DeclaredAmount": 0.27,
+            }]),
+            self.ticker_ids, self.db_path,
+        )
+
+        row = database.get_shared_connection(self.db_path).execute(
+            "SELECT declared_amount, pay_date, frequency FROM dividend_events"
+        ).fetchone()
+        self.assertEqual(row[0], Decimal("0.27000000"))
+        self.assertEqual(row[1], date(2026, 9, 30))
+        self.assertEqual(row[2], "quarterly")
+
+    def test_missing_ticker_mapping_raises(self):
+        with self.assertRaises(ValueError):
+            upload_upcoming_dividends(pd.DataFrame([self._row(ProviderSymbol="UNKNOWN")]), {}, self.db_path)
+
+    def test_missing_declared_amount_raises(self):
+        with self.assertRaises(ValueError):
+            upload_upcoming_dividends(
+                pd.DataFrame([self._row(DeclaredAmount=None)]), self.ticker_ids, self.db_path
+            )
 
 
 if __name__ == "__main__":
