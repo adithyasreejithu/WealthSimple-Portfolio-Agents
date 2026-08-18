@@ -73,7 +73,29 @@ def get_shared_connection(
         return _connection
 
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    _connection = duckdb.connect(str(resolved_path))
+    try:
+        _connection = duckdb.connect(str(resolved_path))
+    except duckdb.IOException as exc:
+        # DuckDB allows exactly one read-write process per file. The dashboard
+        # API (dashboard/api/main.py) holds a process-wide read-write
+        # connection for as long as it has served at least one request, so a
+        # CLI run started while the dashboard is up fails here with an opaque
+        # "being used by another process" error. Detect that specific case
+        # (rather than every IOException -- a corrupt file raises a
+        # differently-worded IOException too) and re-raise with the actual
+        # fix: stop the API, or use its Refresh button, which releases its
+        # connection before shelling out to this same CLI.
+        if "being used by another process" in str(exc):
+            raise RuntimeError(
+                f"Could not open {resolved_path} for read-write access: {exc}\n"
+                "This usually means the dashboard API is currently running and "
+                "holding the database's write lock (DuckDB allows only one "
+                "read-write connection at a time). Either stop the dashboard "
+                "API process, or use the dashboard's 'Refresh' button instead "
+                "of running this command directly -- the dashboard releases "
+                "its own connection before running the pipeline."
+            ) from exc
+        raise
     _connection_path = resolved_path
     logger.info("Database connection opened: %s", resolved_path)
     return _connection
@@ -399,7 +421,8 @@ def _create_trade_events_view(connection: duckdb.DuckDBPyConnection) -> None:
                 transaction_currency AS amount_currency,
                 CAST(NULL AS DECIMAL(18, 8)) AS fx_rate,
                 'activities' AS source,
-                1 AS source_priority
+                1 AS source_priority,
+                CAST('reported' AS VARCHAR) AS amount_quality
             FROM activities
             WHERE ticker_id IS NOT NULL
               AND (
@@ -418,7 +441,8 @@ def _create_trade_events_view(connection: duckdb.DuckDBPyConnection) -> None:
                 'CAD' AS amount_currency,
                 fx_rate,
                 'statements' AS source,
-                2 AS source_priority
+                2 AS source_priority,
+                CAST('reported' AS VARCHAR) AS amount_quality
             FROM transactions
             WHERE UPPER(transaction_type) IN ('BUY', 'SELL')
               AND superseded_by_activity_id IS NULL
@@ -431,10 +455,11 @@ def _create_trade_events_view(connection: duckdb.DuckDBPyConnection) -> None:
                 CASE WHEN UPPER(transaction_type) LIKE '%SELL%' THEN 'SELL' ELSE 'BUY' END AS event_type,
                 ABS(quantity) AS quantity,
                 total_cost AS amount_cad,
-                'CAD' AS amount_currency,
+                COALESCE(price_currency, 'CAD') AS amount_currency,
                 CAST(NULL AS DECIMAL(18, 8)) AS fx_rate,
                 'email' AS source,
-                3 AS source_priority
+                3 AS source_priority,
+                COALESCE(amount_quality, 'missing') AS amount_quality
             FROM email_transactions
             WHERE ticker_id IS NOT NULL
               AND ticker_resolution_status = 'resolved'
@@ -823,6 +848,7 @@ def _deploy_schema(connection: duckdb.DuckDBPyConnection) -> None:
                 email_message_id BIGINT,
                 source_symbol VARCHAR,
                 price_currency VARCHAR(10),
+                amount_quality VARCHAR,
                 ticker_resolution_status VARCHAR NOT NULL DEFAULT 'resolved',
                 reconciliation_status VARCHAR NOT NULL DEFAULT 'provisional',
                 -- Soft links to transactions.transaction_id / activities.activity_id,

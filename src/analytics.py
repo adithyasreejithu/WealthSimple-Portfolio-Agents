@@ -14,15 +14,19 @@ import pandas as pd
 import yaml
 
 from config import (
+    ANNUALIZATION_PERIODS,
+    CORRELATION_WINDOWS,
     DATABASE_PATH,
     DEFAULT_BENCHMARK_SYMBOL,
     FX_PAIR_SYMBOL,
+    MINIMUM_CORRELATION_OBSERVATIONS,
     POLICY_FILE,
     SINGLE_NAME_MAX_WEIGHT,
     STALE_PRICE_MAX_AGE_DAYS,
     SUSPICIOUS_UNREALIZED_GAIN_THRESHOLD,
     TREND_BENCHMARKS,
     WEALTHSIMPLE_FX_FEE_RATE,
+    WORKSPACE_RUNS_FOLDER,
 )
 from database import get_shared_connection
 from position_engine import (
@@ -106,6 +110,15 @@ class Holding:
 class CashSummary:
     balance: Decimal
     source: str
+    # Portion of `balance` contributed by still-provisional, unreconciled
+    # email BUY/SELL trades (see `_provisional_email_cash_events`) -- zero
+    # once every trade has a matching statement/activities row. Positive
+    # means net cash the emails add (sells outweigh buys since the anchor).
+    provisional_adjustment: Decimal = Decimal("0")
+    # Subset of `provisional_adjustment` built from a derived-from-quantity-
+    # and-price or otherwise non-"reported" amount, i.e. an estimate rather
+    # than a confirmed brokerage figure.
+    estimated_adjustment: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -271,9 +284,201 @@ def resolve_security_status(ticker: str, db_path: str = DATABASE_PATH) -> dict[s
     }
 
 
+def get_data_watermark(db_path: str = DATABASE_PATH) -> datetime | None:
+    """Latest timestamp at which any pipeline-written data actually changed.
+
+    Used to invalidate the dashboard API's report cache. The main `.duckdb`
+    file's mtime is *not* a reliable proxy for this: DuckDB commits land in
+    the `.wal` sidecar and only touch the main file's mtime at checkpoint, so
+    an mtime-keyed cache can serve a stale report indefinitely between
+    checkpoints even though new rows are already committed and queryable.
+    This instead reads the freshness columns each writer already stamps
+    (`computed_at`/`generated_at`/`fetched_at`), so the watermark advances the
+    moment a write commits, regardless of checkpointing.
+    """
+    connection = get_shared_connection(db_path)
+    row = connection.execute(
+        """
+        SELECT GREATEST(
+            COALESCE((SELECT MAX(computed_at) FROM position_snapshots), TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(generated_at) FROM portfolio_classifications), TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(record_date) FROM historical_records)::TIMESTAMP, TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(fetched_at) FROM earnings_events), TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(fetched_at) FROM dividend_events), TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(fetched_at) FROM financial_snapshots), TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(declared_at) FROM security_status), TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(published_at) FROM staged_files), TIMESTAMP '1970-01-01')
+        )
+        """
+    ).fetchone()
+    watermark = row[0] if row is not None else None
+    return watermark if watermark is not None and watermark.year > 1970 else None
+
+
+# Not-owned subjects use the `WishlistAction` vocabulary (Buy/Watch/Wait/Pass),
+# never the owned `PortfolioAction` vocabulary (Buy/Hold/Trim/Sell/Add) -- see
+# `src/workspace/models.py`'s ownership-based action split.
+_WISHLIST_ACTIONS = frozenset({"Buy", "Watch", "Wait", "Pass"})
+
+
+def _latest_workspace_artifact(ticker: str, subdir: str, suffix: str) -> dict[str, Any] | None:
+    """Return the parsed contents of the most recent `<ticker>-*-<suffix>.json`
+    artifact for `ticker` across every run directory, or None if none exists.
+
+    Run-artifact filenames embed an ISO-8601 UTC timestamp
+    (`TICKER-YYYY-MM-DDTHHMMSSZ-suffix.json`, see `workspace/paths.py`'s
+    `RUN_ID_TIMESTAMP_FORMAT`), so a lexicographic sort of the matching
+    filenames is also a chronological sort -- no need to open every candidate
+    file just to compare timestamps.
+    """
+    pattern = f"*/{subdir}/{ticker.upper()}-*-{suffix}.json"
+    matches = sorted(WORKSPACE_RUNS_FOLDER.glob(pattern), key=lambda path: path.name)
+    if not matches:
+        return None
+    try:
+        return json.loads(matches[-1].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def get_wishlist_overview(db_path: str = DATABASE_PATH) -> dict[str, Any]:
+    """Declared-wishlist tickers with their status, classification, and the
+    latest research verdict any agent has recorded for them.
+
+    Three independent sources, joined by ticker symbol:
+    - `security_status` (declared_status, rationale, declared_at/by) -- the
+      same table `resolve_security_status` reads for one ticker at a time,
+      enumerated here instead.
+    - `portfolio_classifications` (primary_group, confidence) -- the same
+      classifier output `get_classification_details` serves for owned
+      holdings.
+    - The most recent `investment-thesis.v1` / decision-proposal artifact
+      under `workspace/runs/*` for that ticker, if any. These are agent
+      judgment, not database state, so a ticker can legitimately have neither
+      yet -- `thesis`/`decision` come back `None` rather than an error.
+
+    A decision artifact's `action_vocabulary_mismatch` flags a not-owned
+    subject whose recorded action uses the owned vocabulary instead of
+    `WishlistAction` (observed in production: an MP decision artifact
+    proposes "Hold" for an unowned ticker) -- surfaced rather than silently
+    rendered as if it were valid.
+    """
+    connection = get_shared_connection(db_path)
+    rows = connection.execute(
+        """
+        SELECT t.ticker_id, t.ticker_symbol, t.security_name,
+               ss.declared_status, ss.rationale, ss.declared_at, ss.declared_by
+        FROM security_status ss
+        JOIN tickers t ON t.ticker_id = ss.ticker_id
+        WHERE ss.declared_status = 'wishlist'
+          AND t.ticker_id NOT IN (SELECT ticker_id FROM position_snapshots WHERE quantity <> 0)
+        ORDER BY t.ticker_symbol
+        """
+    ).fetchall()
+
+    classification_rows = connection.execute(
+        "SELECT ticker_id, primary_group, confidence FROM portfolio_classifications"
+    ).fetchall()
+    classifications = {row[0]: {"primary_group": row[1], "confidence": row[2]} for row in classification_rows}
+
+    entries: list[dict[str, Any]] = []
+    for ticker_id, symbol, name, declared_status, rationale, declared_at, declared_by in rows:
+        thesis = _latest_workspace_artifact(symbol, "agent_outputs", "thesis")
+        decision = _latest_workspace_artifact(symbol, "final", "decision")
+
+        conclusion = (thesis or {}).get("conclusion") or {}
+        verdict: dict[str, Any] | None = None
+        if decision:
+            proposed_action = decision.get("proposed_action")
+            verdict = {
+                "proposed_action": proposed_action,
+                "action_vocabulary_mismatch": bool(proposed_action) and proposed_action not in _WISHLIST_ACTIONS,
+                "confidence": decision.get("confidence"),
+                "summary": decision.get("summary"),
+                "generated_at": decision.get("generated_at"),
+                "failing_policy_checks": [
+                    check for check in decision.get("policy_checks", []) if check.get("result") == "fail"
+                ],
+            }
+
+        entries.append({
+            "ticker": symbol,
+            "ticker_id": ticker_id,
+            "company_name": name,
+            "declaration": {
+                "declared_status": declared_status,
+                "rationale": rationale,
+                "declared_at": declared_at.isoformat() if declared_at is not None else None,
+                "declared_by": declared_by,
+            },
+            "classification": classifications.get(ticker_id),
+            "thesis": {
+                "fundamental_rating": conclusion.get("fundamental_rating"),
+                "valuation_stance": conclusion.get("valuation_stance"),
+                "thesis_direction": conclusion.get("thesis_direction"),
+                "thesis_confidence": conclusion.get("thesis_confidence"),
+                "analysis_horizon": conclusion.get("analysis_horizon"),
+                "as_of": conclusion.get("as_of"),
+                "generated_at": thesis.get("generated_at") if thesis else None,
+            } if thesis else None,
+            "decision": verdict,
+        })
+
+    return {"generated_at": datetime.now().isoformat(), "count": len(entries), "wishlist": entries}
+
+
+def _provisional_email_cash_events(connection: Any) -> list[tuple[date, Decimal, str]]:
+    """Return (event_date, signed CAD amount, amount_quality) for every
+    still-provisional, ticker-resolved email BUY/SELL trade.
+
+    The position engine already counts these through `v_trade_events`, but
+    `statement_balances`/`activities` -- the two sources `get_cash_summary`
+    otherwise reads -- have not yet captured them, so cash would silently
+    omit a confirmed sale or purchase until the next statement arrives. A
+    SELL adds cash, a BUY subtracts it. A row drops out of this query the
+    moment reconciliation links it to an activity or statement row (its
+    `reconciliation_status` leaves 'provisional'), so the authoritative
+    source takes over the cash effect automatically without double-counting.
+    Amounts are FX-converted to CAD using the same event-date resolver the
+    position engine uses (`position_engine._resolve_fx`), so a USD-priced
+    email trade contributes its true CAD value, not its raw USD figure.
+    """
+    rows = connection.execute(
+        """
+        SELECT transaction_date, UPPER(transaction_type) AS direction,
+               total_cost, COALESCE(price_currency, 'CAD') AS currency, amount_quality
+        FROM email_transactions
+        WHERE ticker_id IS NOT NULL
+          AND ticker_resolution_status = 'resolved'
+          AND reconciliation_status = 'provisional'
+          AND (UPPER(transaction_type) LIKE '%BUY%' OR UPPER(transaction_type) LIKE '%SELL%')
+          AND total_cost IS NOT NULL
+        ORDER BY transaction_date
+        """
+    ).fetchall()
+    if not rows:
+        return []
+    fx_series = _build_fx_series(connection)
+    latest_txn_fx_row = connection.execute(
+        "SELECT fx_rate FROM transactions WHERE fx_rate IS NOT NULL AND fx_rate > 0 "
+        "ORDER BY transaction_date DESC LIMIT 1"
+    ).fetchone()
+    latest_txn_fx = Decimal(str(latest_txn_fx_row[0])) if latest_txn_fx_row else None
+
+    events: list[tuple[date, Decimal, str]] = []
+    for event_date, direction, total_cost, currency, amount_quality in rows:
+        event_date = _date(event_date)
+        fx_rate, _ = _resolve_fx(currency, None, event_date, fx_series, latest_txn_fx)
+        amount_cad = _decimal(total_cost) * fx_rate
+        signed = amount_cad if "SELL" in direction else -amount_cad
+        events.append((event_date, signed, amount_quality or "missing"))
+    return events
+
+
 def get_cash_summary(db_path: str = DATABASE_PATH) -> CashSummary:
     """Return the current cash balance, anchored to the latest statement and
-    rolled forward with any CSV-sourced activity since then.
+    rolled forward with any CSV-sourced activity since then, plus any
+    still-provisional email trades neither source has captured yet.
 
     `statement_balances` captures every statement line's trailing balance
     regardless of whether that line resolved to a ticker (unlike
@@ -287,9 +492,20 @@ def get_cash_summary(db_path: str = DATABASE_PATH) -> CashSummary:
     withholding) in CAD regardless of the security's own listing currency,
     so summing `net_cash_amount` for rows strictly after the anchor date and
     adding it to the anchor balance gives a currently-accurate figure
-    without waiting for the next statement.
+    without waiting for the next statement. `_provisional_email_cash_events`
+    layers on top of that for a sale/purchase confirmed by email but not yet
+    in either source at all -- without it, that trade's cash impact would be
+    invisible until its statement posts, even though the position engine
+    already reflects the shares.
     """
     connection = get_shared_connection(db_path)
+    provisional_events = _provisional_email_cash_events(connection)
+    provisional_adjustment = sum((amount for _, amount, _ in provisional_events), Decimal("0"))
+    estimated_adjustment = sum(
+        (amount for _, amount, quality in provisional_events if quality != "reported"),
+        Decimal("0"),
+    )
+
     row = connection.execute(
         """
         SELECT transaction_date, balance
@@ -307,7 +523,14 @@ def get_cash_summary(db_path: str = DATABASE_PATH) -> CashSummary:
             ).fetchone()[0]
         )
         source = "explicit_balance" if rollforward == 0 else "explicit_balance_rolled_forward"
-        return CashSummary(balance=_decimal(anchor_balance) + rollforward, source=source)
+        if provisional_adjustment != 0:
+            source += "_with_provisional_email"
+        return CashSummary(
+            balance=_decimal(anchor_balance) + rollforward + provisional_adjustment,
+            source=source,
+            provisional_adjustment=provisional_adjustment,
+            estimated_adjustment=estimated_adjustment,
+        )
 
     # Fall back to net cash flow when the source set does not store a direct balance.
     row = connection.execute(
@@ -316,7 +539,13 @@ def get_cash_summary(db_path: str = DATABASE_PATH) -> CashSummary:
         FROM cash_transactions
         """
     ).fetchone()
-    return CashSummary(balance=_decimal(row[0]), source="net_cash_flow")
+    source = "net_cash_flow" + ("_with_provisional_email" if provisional_adjustment != 0 else "")
+    return CashSummary(
+        balance=_decimal(row[0]) + provisional_adjustment,
+        source=source,
+        provisional_adjustment=provisional_adjustment,
+        estimated_adjustment=estimated_adjustment,
+    )
 
 
 def get_portfolio_summary(db_path: str = DATABASE_PATH) -> PortfolioSummary:
@@ -529,6 +758,322 @@ def get_price_history(
     }
 
 
+def get_return_correlation(
+    db_path: str = DATABASE_PATH,
+    *,
+    symbols: list[str] | None = None,
+    window_days: int = ANNUALIZATION_PERIODS,
+) -> dict[str, Any]:
+    """Pairwise daily-return correlation and annualized covariance across holdings.
+
+    Reads local-currency closes directly from `historical_records` -- this
+    deliberately does not route through `get_historical_portfolio_values` or
+    any CAD conversion, and is therefore independent of that series' known
+    valuation-timing issues (see docs/plans/valuation-integrity-and-risk-analytics.md).
+    CAD-converting every series would inject the same CAD/USD daily return into
+    every USD-denominated holding, inflating their pairwise correlation by a
+    shared currency factor that has nothing to do with how the underlying
+    securities actually co-move; local currency answers "do these securities
+    move together", which is what a correlation matrix is for.
+
+    `symbols` defaults to every currently-held ticker (see `get_holdings`).
+    `window_days` is a trading-day count, one of `config.CORRELATION_WINDOWS`'
+    values by convention though any positive int is accepted.
+
+    Alignment is two-pass, because this portfolio spans exchanges (NASDAQ,
+    TSX, NSE/BSE via INDA) with different holiday calendars -- a raw union of
+    every requested symbol's dates would let one symbol's single missing date
+    (a market closed elsewhere) null out every OTHER symbol's row on that
+    date too, and with enough symbols selected that reliably empties the
+    entire matrix. So: first, within the trailing `window_days` slice of the
+    date union, a symbol whose own non-null count falls short of
+    `MINIMUM_CORRELATION_OBSERVATIONS` is dropped as genuinely thin (a short
+    backfill, not a calendar mismatch) and reported via `unavailable_tickers`.
+    Second, the surviving symbols are reduced to the *intersection* of dates
+    where all of them have a price -- this is what guarantees a fully dense
+    return matrix (no pairwise-missing cells) rather than requiring one from
+    the union directly. `observations` is the resulting overlapping
+    trading-day count, which may be less than `window_days` when the
+    selection's shared calendar is narrower than any single symbol's own
+    history; compare the two to see whether the full window was achieved.
+    """
+    connection = get_shared_connection(db_path)
+    if symbols is None:
+        symbols = [h.ticker_symbol for h in get_holdings(db_path)]
+    symbols = sorted({s.upper() for s in symbols})
+    empty = {
+        "window_days": window_days,
+        "tickers": [],
+        "unavailable_tickers": symbols,
+        "observations": 0,
+        "start_date": None,
+        "end_date": None,
+        "correlation": {},
+        "covariance": {},
+    }
+    if not symbols:
+        return {**empty, "available": False, "reason": "No symbols requested.", "unavailable_tickers": []}
+
+    placeholders = ",".join("?" for _ in symbols)
+    rows = connection.execute(
+        f"""
+        SELECT UPPER(t.ticker_symbol), h.record_date, h.close
+        FROM historical_records h
+        JOIN tickers t ON t.ticker_id = h.ticker_id
+        WHERE UPPER(t.ticker_symbol) IN ({placeholders})
+        ORDER BY h.record_date
+        """,
+        symbols,
+    ).fetchall()
+    if not rows:
+        return {**empty, "available": False, "reason": "No stored price history for the requested tickers."}
+
+    frame = pd.DataFrame(rows, columns=["symbol", "date", "close"])
+    frame["close"] = frame["close"].astype(float)
+    wide = frame.pivot_table(index="date", columns="symbol", values="close", aggfunc="last").sort_index()
+
+    # +1 row: pct_change needs one prior close to produce window_days returns.
+    tail = wide.tail(window_days + 1)
+
+    # Pass 1: drop symbols whose own history is too thin for this window --
+    # kept separate from the intersection step below so one thin symbol
+    # cannot shrink the shared calendar for everyone else.
+    thin = {col for col in tail.columns if tail[col].notna().sum() < MINIMUM_CORRELATION_OBSERVATIONS}
+    candidates = sorted(col for col in tail.columns if col not in thin)
+    unavailable = sorted(set(symbols) - set(candidates))
+
+    if len(candidates) < 2:
+        return {
+            **empty,
+            "available": False,
+            "reason": (
+                f"Fewer than two tickers have at least {MINIMUM_CORRELATION_OBSERVATIONS} "
+                f"trading days of price history in the trailing {window_days}-day window."
+            ),
+            "unavailable_tickers": unavailable,
+        }
+
+    # Pass 2: intersect to dates where every surviving symbol has a price --
+    # this is what guarantees the return matrix below is fully dense.
+    dense = tail[candidates].dropna()
+    returns = dense.pct_change().dropna(how="any")
+    observations = len(returns)
+    if observations < MINIMUM_CORRELATION_OBSERVATIONS:
+        return {
+            **empty,
+            "available": False,
+            "reason": (
+                f"Only {observations} trading day(s) are common to every selected ticker "
+                f"in this window; at least {MINIMUM_CORRELATION_OBSERVATIONS} are required."
+            ),
+            "tickers": candidates,
+            "unavailable_tickers": unavailable,
+        }
+
+    correlation = returns.corr()
+    covariance = returns.cov() * ANNUALIZATION_PERIODS
+    return {
+        "available": True,
+        "window_days": window_days,
+        "observations": observations,
+        "start_date": _date(returns.index[0]),
+        "end_date": _date(returns.index[-1]),
+        "tickers": candidates,
+        "unavailable_tickers": unavailable,
+        "correlation": {a: {b: float(correlation.loc[a, b]) for b in candidates} for a in candidates},
+        "covariance": {a: {b: float(covariance.loc[a, b]) for b in candidates} for a in candidates},
+    }
+
+
+def get_group_return_correlation(
+    db_path: str = DATABASE_PATH,
+    *,
+    groups: list[str] | None = None,
+    window_days: int = ANNUALIZATION_PERIODS,
+) -> dict[str, Any]:
+    """Correlation and covariance of current-weight classification-group baskets.
+
+    Each group is a synthetic daily-return series made from its currently held
+    constituents, weighted by current market value and renormalized inside the
+    group. Constituents with thin stored price history are excluded and their
+    missing weight is exposed through ``group_metadata``. The resulting series
+    are comparative proxies, not historical portfolio allocation returns.
+    """
+    holdings = [holding for holding in get_holdings(db_path) if holding.market_value > 0]
+    total_value = sum((holding.market_value for holding in holdings), Decimal("0"))
+    classifications = _get_classifications(db_path, [holding.ticker_id for holding in holdings])
+    members: dict[str, list[Holding]] = {}
+    for holding in holdings:
+        group = (classifications.get(holding.ticker_id) or {}).get("primary_group")
+        if group:
+            members.setdefault(str(group), []).append(holding)
+
+    requested = sorted(set(groups)) if groups else sorted(members)
+    empty = {
+        "window_days": window_days,
+        "tickers": [],
+        "unavailable_tickers": [],
+        "unavailable_groups": requested,
+        "observations": 0,
+        "start_date": None,
+        "end_date": None,
+        "correlation": {},
+        "covariance": {},
+        "group_metadata": {},
+        "unclassified_weight": (
+            float(sum((h.market_value for h in holdings if h.ticker_id not in classifications), Decimal("0")) / total_value)
+            if total_value > 0
+            else 0.0
+        ),
+    }
+    if len(requested) < 2:
+        return {**empty, "available": False, "reason": "Select at least two classification groups."}
+
+    selected_members = [holding for group in requested for holding in members.get(group, [])]
+    symbols = sorted({holding.ticker_symbol.upper() for holding in selected_members})
+    if not symbols:
+        return {**empty, "available": False, "reason": "No current holdings belong to the selected groups."}
+
+    placeholders = ",".join("?" for _ in symbols)
+    rows = get_shared_connection(db_path).execute(
+        f"""
+        SELECT UPPER(t.ticker_symbol), h.record_date, h.close
+        FROM historical_records h
+        JOIN tickers t ON t.ticker_id = h.ticker_id
+        WHERE UPPER(t.ticker_symbol) IN ({placeholders})
+        ORDER BY h.record_date
+        """,
+        symbols,
+    ).fetchall()
+    if not rows:
+        return {**empty, "available": False, "reason": "No stored price history for holdings in the selected groups."}
+
+    frame = pd.DataFrame(rows, columns=["symbol", "date", "close"])
+    frame["close"] = frame["close"].astype(float)
+    prices = frame.pivot_table(index="date", columns="symbol", values="close", aggfunc="last").sort_index().tail(window_days + 1)
+    returns = prices.pct_change(fill_method=None)
+    usable_symbols = {symbol for symbol in prices.columns if prices[symbol].notna().sum() >= MINIMUM_CORRELATION_OBSERVATIONS}
+
+    basket_series: dict[str, pd.Series] = {}
+    metadata: dict[str, dict[str, Any]] = {}
+    unavailable_groups: list[str] = []
+    unavailable_symbols: set[str] = set()
+    for group in requested:
+        group_members = members.get(group, [])
+        group_value = sum((h.market_value for h in group_members), Decimal("0"))
+        covered = [h for h in group_members if h.ticker_symbol.upper() in usable_symbols]
+        covered_value = sum((h.market_value for h in covered), Decimal("0"))
+        missing = sorted(h.ticker_symbol for h in group_members if h.ticker_symbol.upper() not in usable_symbols)
+        unavailable_symbols.update(missing)
+        metadata[group] = {
+            "portfolio_weight": float(group_value / total_value) if total_value > 0 else 0.0,
+            "constituent_coverage": float(covered_value / group_value) if group_value > 0 else 0.0,
+            "constituents": sorted(h.ticker_symbol for h in covered),
+            "unavailable_constituents": missing,
+        }
+        if not covered or covered_value <= 0:
+            unavailable_groups.append(group)
+            continue
+        weights = {h.ticker_symbol.upper(): float(h.market_value / covered_value) for h in covered}
+        group_returns = returns[list(weights)]
+        weighted = group_returns.mul(pd.Series(weights), axis="columns")
+        available_weight = group_returns.notna().mul(pd.Series(weights), axis="columns").sum(axis=1)
+        basket_series[group] = weighted.sum(axis=1, min_count=1).div(available_weight.where(available_weight > 0))
+
+    if len(basket_series) < 2:
+        return {
+            **empty,
+            "available": False,
+            "reason": f"Fewer than two groups have constituents with at least {MINIMUM_CORRELATION_OBSERVATIONS} trading days of price history.",
+            "unavailable_tickers": sorted(unavailable_symbols),
+            "unavailable_groups": unavailable_groups,
+            "group_metadata": metadata,
+        }
+
+    basket = pd.DataFrame(basket_series).dropna(how="any")
+    if len(basket) < MINIMUM_CORRELATION_OBSERVATIONS:
+        return {
+            **empty,
+            "available": False,
+            "reason": f"Only {len(basket)} common group-return observations are available; at least {MINIMUM_CORRELATION_OBSERVATIONS} are required.",
+            "tickers": sorted(basket_series),
+            "unavailable_tickers": sorted(unavailable_symbols),
+            "unavailable_groups": unavailable_groups,
+            "group_metadata": metadata,
+        }
+
+    labels = sorted(basket.columns)
+    correlation = basket.corr()
+    covariance = basket.cov() * ANNUALIZATION_PERIODS
+    return {
+        **empty,
+        "available": True,
+        "tickers": labels,
+        "unavailable_tickers": sorted(unavailable_symbols),
+        "unavailable_groups": unavailable_groups,
+        "observations": len(basket),
+        "start_date": _date(basket.index[0]),
+        "end_date": _date(basket.index[-1]),
+        "correlation": {a: {b: float(correlation.loc[a, b]) for b in labels} for a in labels},
+        "covariance": {a: {b: float(covariance.loc[a, b]) for b in labels} for a in labels},
+        "group_metadata": metadata,
+    }
+
+
+def get_portfolio_volatility_from_covariance(
+    covariance: dict[str, dict[str, float]], weights: dict[str, float]
+) -> dict[str, Any]:
+    """Current-weight portfolio volatility and per-ticker risk contribution.
+
+    Bottom-up from a security-level covariance matrix (see
+    `get_return_correlation`), so this is independent of the portfolio-level
+    valuation series and its known timing issues. `weights` need not sum to
+    exactly 1.0 or cover every ticker in `covariance` -- only tickers present
+    in both are used, renormalized to the weight they represent among
+    themselves, and the excluded weight is reported so the caller can judge
+    coverage.
+
+    Marginal contribution to risk follows the standard decomposition
+    ``sigma_p = sum_i (w_i * (Sigma w)_i) / sigma_p``, i.e. each ticker's share
+    of portfolio variance divided by portfolio volatility; the per-ticker
+    shares sum to `portfolio_volatility` by construction.
+    """
+    tickers = sorted(set(covariance) & set(weights))
+    if len(tickers) < 2:
+        return {
+            "available": False,
+            "reason": "Fewer than two tickers overlap between the covariance matrix and the supplied weights.",
+            "portfolio_volatility": None,
+            "covered_weight": None,
+            "risk_contribution": {},
+        }
+    covered_weight = sum(weights[t] for t in tickers)
+    if covered_weight <= 0:
+        return {
+            "available": False,
+            "reason": "Covered tickers carry zero or negative combined weight.",
+            "portfolio_volatility": None,
+            "covered_weight": covered_weight,
+            "risk_contribution": {},
+        }
+    w = pd.Series({t: weights[t] / covered_weight for t in tickers})
+    sigma = pd.DataFrame({a: {b: covariance[a][b] for b in tickers} for a in tickers})
+    sigma_w = sigma.dot(w)
+    portfolio_variance = float(w.dot(sigma_w))
+    portfolio_volatility = portfolio_variance ** 0.5 if portfolio_variance > 0 else 0.0
+    contribution = (
+        {t: float(w[t] * sigma_w[t] / portfolio_volatility) for t in tickers}
+        if portfolio_volatility > 0
+        else {t: 0.0 for t in tickers}
+    )
+    return {
+        "available": True,
+        "portfolio_volatility": portfolio_volatility,
+        "covered_weight": covered_weight,
+        "risk_contribution": contribution,
+    }
+
+
 def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[str, Any]]:
     """Build a chronological valuation series (securities + cash) as one set-based query.
 
@@ -547,6 +1092,7 @@ def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[s
     """
     connection = get_shared_connection(db_path)
     ensure_positions_fresh(connection)
+    provisional_events = _provisional_email_cash_events(connection)
     rows = connection.execute(
         """
         WITH day_end_state AS (
@@ -715,12 +1261,22 @@ def get_historical_portfolio_values(db_path: str = DATABASE_PATH) -> list[dict[s
         [FX_PAIR_SYMBOL],
     ).fetchall()
     results: list[dict[str, Any]] = []
+    provisional_index = 0
+    cumulative_provisional = Decimal("0")
     for value_date, securities_value, cash_balance in rows:
+        value_date = _date(value_date)
+        # Fold in every still-provisional email trade dated on or before this
+        # grid point, mirroring get_cash_summary's current-balance treatment
+        # so the trend chart and the Cash KPI never disagree about a
+        # confirmed-by-email-but-not-yet-reconciled trade's cash effect.
+        while provisional_index < len(provisional_events) and provisional_events[provisional_index][0] <= value_date:
+            cumulative_provisional += provisional_events[provisional_index][1]
+            provisional_index += 1
         securities = _decimal(securities_value)
-        cash = _decimal(cash_balance)
+        cash = _decimal(cash_balance) + cumulative_provisional
         results.append(
             {
-                "date": _date(value_date),
+                "date": value_date,
                 "securities_value": securities,
                 "cash_balance": cash,
                 "portfolio_value": securities + cash,
@@ -1074,7 +1630,7 @@ def get_realized_gain_summary(
     rows = connection.execute(
         f"""
         SELECT v.event_date, v.event_type, v.ticker_id, v.quantity, v.amount_cad,
-               v.amount_currency, v.fx_rate, t.ticker_symbol
+               v.amount_currency, v.fx_rate, t.ticker_symbol, v.amount_quality
         FROM v_trade_events v JOIN tickers t ON t.ticker_id = v.ticker_id
         WHERE v.event_type IN ('BUY', 'SELL', 'SPLIT') {clause}
         ORDER BY v.event_date, v.source_priority, v.source_id
@@ -1088,7 +1644,9 @@ def get_realized_gain_summary(
     latest_txn_fx = _decimal(latest_txn_fx_row[0]) if latest_txn_fx_row else None
     state: dict[int, tuple[Decimal, Decimal]] = {}
     gains: dict[str, Decimal] = {}
-    for event_date, kind, ticker_id, quantity, amount_cad, amount_currency, fx_rate, symbol in rows:
+    events: list[dict[str, Any]] = []
+    missing_proceeds: list[dict[str, Any]] = []
+    for event_date, kind, ticker_id, quantity, amount_cad, amount_currency, fx_rate, symbol, amount_quality in rows:
         held, cost = state.get(int(ticker_id), (Decimal("0"), Decimal("0")))
         qty = _decimal(quantity)
         # The view's amount column is only truly CAD when amount_currency says
@@ -1111,13 +1669,42 @@ def get_realized_gain_summary(
             continue
         sold = min(qty, held)
         allocated_cost = (cost / held) * sold if held > 0 else Decimal("0")
+        quality = str(amount_quality) if amount_quality else "missing"
+        if amount_cad is None:
+            # No source has reported proceeds for this sale (typically a
+            # provisional email row awaiting a superseding activities/
+            # statement export). Impute break-even rather than booking the
+            # full cost basis as a fabricated loss.
+            amount = allocated_cost
+            missing_proceeds.append({"ticker_symbol": str(symbol), "event_date": _date(event_date)})
+        elif qty > sold and qty > 0:
+            # Oversell: the reported/derived amount covers the full confirmed
+            # `qty`, but only `sold` shares are actually leaving this
+            # ticker's tracked position here -- prorate to `sold` so the
+            # unmatched shares' proceeds aren't counted as pure gain against
+            # zero cost (mirrors position_engine._apply_sell's oversell
+            # handling; see docs/plans/pltr-sale-cash-realized-gain.md).
+            amount = amount * (sold / qty)
         if date_from is None or _date(event_date) >= date_from:
-            gains[str(symbol)] = gains.get(str(symbol), Decimal("0")) + amount - allocated_cost
+            realized_gain = amount - allocated_cost
+            gains[str(symbol)] = gains.get(str(symbol), Decimal("0")) + realized_gain
+            events.append(
+                {
+                    "event_date": _date(event_date),
+                    "ticker_symbol": str(symbol),
+                    "realized_gain_cad": realized_gain,
+                    # 'reported' | 'derived_from_quantity_and_price' | 'missing'
+                    # -- see config.AMOUNT_QUALITY_* and email_extractor.py.
+                    "amount_quality": quality,
+                }
+            )
         state[int(ticker_id)] = (held - sold, cost - allocated_cost)
     return {
         "source": "v_trade_events",
         "by_ticker": gains,
+        "events": events,
         "total_realized_gain": sum(gains.values(), Decimal("0")),
+        "missing_proceeds": missing_proceeds,
     }
 
 
@@ -1744,26 +2331,30 @@ def get_dividend_history(
     portfolio_value: Decimal = Decimal("0"),
     book_cost: Decimal = Decimal("0"),
 ) -> dict[str, Any]:
-    """Return dividend income by month/currency plus trailing yield and growth figures."""
+    """Return dividend income by month/currency/ticker plus trailing yield and growth figures."""
     connection = get_shared_connection(db_path)
     if source == "email":
         clause, params = _date_filters(date_from, date_to, "et.transaction_date")
         query = f"""
-            SELECT et.transaction_date, COALESCE(t.currency, 'UNKNOWN'), et.debit
+            SELECT et.transaction_date, COALESCE(t.currency, 'UNKNOWN'), et.debit,
+                   et.ticker_id, t.ticker_symbol
             FROM email_transactions et LEFT JOIN tickers t ON t.ticker_id = et.ticker_id
             WHERE LOWER(et.transaction_type) = 'dividend' {clause}
         """
     elif source == "activities":
-        clause, params = _date_filters(date_from, date_to, "transaction_date")
+        clause, params = _date_filters(date_from, date_to, "a.transaction_date")
         query = f"""
-            SELECT transaction_date, COALESCE(transaction_currency, 'UNKNOWN'), net_cash_amount
-            FROM activities WHERE activity_code = 'DIV' AND COALESCE(net_cash_amount, 0) > 0 {clause}
+            SELECT a.transaction_date, COALESCE(a.transaction_currency, 'UNKNOWN'), a.net_cash_amount,
+                   a.ticker_id, t.ticker_symbol
+            FROM activities a LEFT JOIN tickers t ON t.ticker_id = a.ticker_id
+            WHERE a.activity_code = 'DIV' AND COALESCE(a.net_cash_amount, 0) > 0 {clause}
         """
     elif source == "statements":
-        clause, params = _date_filters(date_from, date_to, "transaction_date")
+        clause, params = _date_filters(date_from, date_to, "tr.transaction_date")
         query = f"""
-            SELECT transaction_date, 'CAD', credit
-            FROM transactions WHERE UPPER(transaction_type) = 'DIV' {clause}
+            SELECT tr.transaction_date, 'CAD', tr.credit, tr.ticker_id, t.ticker_symbol
+            FROM transactions tr LEFT JOIN tickers t ON t.ticker_id = tr.ticker_id
+            WHERE UPPER(tr.transaction_type) = 'DIV' {clause}
         """
     else:
         raise ValueError("dividend source must be email, activities, or statements")
@@ -1773,8 +2364,18 @@ def get_dividend_history(
     by_currency: dict[str, Decimal] = {}
     by_year: dict[int, Decimal] = {}
     t12m_by_currency: dict[str, Decimal] = {}
+    # Keyed by ticker_symbol (falling back to "Unknown" for a row with no
+    # resolved ticker_id, e.g. an unmatched email dividend); all-time and
+    # trailing-12-month totals kept per currency since amounts are never
+    # summed across currencies -- see by_month's own mixed-currency caveat.
+    by_ticker: dict[str, dict[str, Any]] = {}
+    # month -> ticker_symbol -> amount, currencies summed within a cell (same
+    # simplification by_month already makes and discloses) -- feeds the
+    # dashboard's stacked-by-payer monthly bars, which by_ticker's totals
+    # alone cannot support.
+    by_ticker_month: dict[str, dict[str, Decimal]] = {}
     twelve_months_ago = date.today() - timedelta(days=365)
-    for transaction_date, currency, amount in rows:
+    for transaction_date, currency, amount, ticker_id, ticker_symbol in rows:
         day = _date(transaction_date)
         value = _decimal(amount)
         month_key = f"{day.year:04d}-{day.month:02d}"
@@ -1783,6 +2384,25 @@ def get_dividend_history(
         by_year[day.year] = by_year.get(day.year, Decimal("0")) + value
         if day >= twelve_months_ago:
             t12m_by_currency[currency] = t12m_by_currency.get(currency, Decimal("0")) + value
+
+        symbol_key = ticker_symbol or "Unknown"
+        month_bucket = by_ticker_month.setdefault(month_key, {})
+        month_bucket[symbol_key] = month_bucket.get(symbol_key, Decimal("0")) + value
+        ticker_entry = by_ticker.setdefault(
+            symbol_key,
+            {
+                "ticker_id": int(ticker_id) if ticker_id is not None else None,
+                "totals_by_currency": {},
+                "trailing_12_month_by_currency": {},
+                "transaction_count": 0,
+            },
+        )
+        totals = ticker_entry["totals_by_currency"]
+        totals[currency] = totals.get(currency, Decimal("0")) + value
+        ticker_entry["transaction_count"] += 1
+        if day >= twelve_months_ago:
+            t12m = ticker_entry["trailing_12_month_by_currency"]
+            t12m[currency] = t12m.get(currency, Decimal("0")) + value
 
     cad_t12m = t12m_by_currency.get("CAD", Decimal("0"))
     yield_on_cost = (
@@ -1822,6 +2442,8 @@ def get_dividend_history(
         "transaction_count": len(rows),
         "by_month": {month: by_month[month] for month in sorted(by_month)},
         "totals_by_currency": by_currency,
+        "by_ticker": by_ticker,
+        "by_ticker_month": {month: by_ticker_month[month] for month in sorted(by_ticker_month)},
         "trailing_12_month": {
             "totals_by_currency": t12m_by_currency,
             "yield_on_portfolio_value": trailing_yield,
@@ -1831,18 +2453,157 @@ def get_dividend_history(
     }
 
 
+def get_upcoming_income_events(
+    db_path: str = DATABASE_PATH,
+    *,
+    horizon_days: int = 90,
+    holdings: list[Holding] | None = None,
+) -> dict[str, Any]:
+    """Forward-looking dividend and earnings events for currently-held tickers.
+
+    Reads `dividend_events`/`earnings_events` -- company-declared market data
+    populated by `market_data.sync_earnings_dividends` -- never the user's own
+    received dividend cash (`email_transactions`/`activities`/`transactions`,
+    already covered by `get_dividend_history`). Both tables are on-demand
+    synced, not part of the automatic pipeline refresh, so `synced_at` reports
+    each table's most recent `fetched_at` alongside the results: an empty
+    dividend list may mean nothing is scheduled, or it may mean the sync
+    hasn't run recently, and the two must not be presented identically.
+
+    Expected dividend cash is ``declared_amount * quantity`` in the security's
+    own currency -- amounts are never summed across currencies, matching
+    `get_dividend_history`'s convention. `declared_amount` on a still-future
+    row may be the issuer's last confirmed per-payment rate carried forward
+    rather than a newly declared one; callers should present it as expected,
+    not confirmed, income.
+    """
+    connection = get_shared_connection(db_path)
+    if holdings is None:
+        holdings = get_holdings(db_path)
+    by_ticker_id = {h.ticker_id: h for h in holdings}
+    total_value = sum((h.market_value for h in holdings), Decimal("0"))
+    if not by_ticker_id:
+        return {
+            "horizon_days": horizon_days,
+            "dividends": [],
+            "earnings": [],
+            "totals_by_currency": {},
+            "synced_at": {"dividends": None, "earnings": None},
+        }
+
+    placeholders = ",".join("?" for _ in by_ticker_id)
+    ticker_ids = list(by_ticker_id)
+    horizon_end = date.today() + timedelta(days=horizon_days)
+
+    dividend_rows = connection.execute(
+        f"""
+        SELECT de.ticker_id, t.ticker_symbol, de.ex_dividend_date, de.pay_date,
+               de.declared_amount, de.frequency
+        FROM dividend_events de JOIN tickers t ON t.ticker_id = de.ticker_id
+        WHERE de.ticker_id IN ({placeholders})
+          AND de.ex_dividend_date >= CURRENT_DATE AND de.ex_dividend_date <= ?
+        ORDER BY de.ex_dividend_date
+        """,
+        [*ticker_ids, horizon_end],
+    ).fetchall()
+
+    earnings_rows = connection.execute(
+        f"""
+        SELECT ee.ticker_id, t.ticker_symbol, ee.report_date, ee.period, ee.eps_estimate
+        FROM earnings_events ee JOIN tickers t ON t.ticker_id = ee.ticker_id
+        WHERE ee.ticker_id IN ({placeholders})
+          AND ee.report_date >= CURRENT_DATE AND ee.report_date <= ?
+          AND ee.eps_actual IS NULL
+        ORDER BY ee.report_date
+        """,
+        [*ticker_ids, horizon_end],
+    ).fetchall()
+
+    dividends: list[dict[str, Any]] = []
+    totals_by_currency: dict[str, Decimal] = {}
+    for ticker_id, symbol, ex_date, pay_date, declared_amount, frequency in dividend_rows:
+        holding = by_ticker_id[int(ticker_id)]
+        amount = _decimal(declared_amount)
+        expected_cash = amount * holding.quantity
+        totals_by_currency[holding.currency] = (
+            totals_by_currency.get(holding.currency, Decimal("0")) + expected_cash
+        )
+        dividends.append(
+            {
+                "ticker_id": int(ticker_id),
+                "ticker_symbol": symbol,
+                "ex_dividend_date": _date(ex_date),
+                "pay_date": _date(pay_date) if pay_date is not None else None,
+                "declared_amount": amount,
+                "frequency": frequency,
+                "quantity": holding.quantity,
+                "currency": holding.currency,
+                "expected_cash": expected_cash,
+            }
+        )
+
+    earnings: list[dict[str, Any]] = []
+    for ticker_id, symbol, report_date, period, eps_estimate in earnings_rows:
+        holding = by_ticker_id[int(ticker_id)]
+        earnings.append(
+            {
+                "ticker_id": int(ticker_id),
+                "ticker_symbol": symbol,
+                "report_date": _date(report_date),
+                "period": period,
+                "eps_estimate": float(eps_estimate) if eps_estimate is not None else None,
+                "weight": float(holding.market_value / total_value) if total_value > 0 else 0.0,
+            }
+        )
+
+    synced_at_row = connection.execute(
+        """
+        SELECT
+            (SELECT MAX(fetched_at) FROM dividend_events WHERE ticker_id IN ({placeholders})),
+            (SELECT MAX(fetched_at) FROM earnings_events WHERE ticker_id IN ({placeholders}))
+        """.format(placeholders=placeholders),
+        [*ticker_ids, *ticker_ids],
+    ).fetchone()
+
+    return {
+        "horizon_days": horizon_days,
+        "dividends": dividends,
+        "earnings": earnings,
+        "totals_by_currency": totals_by_currency,
+        "synced_at": {
+            "dividends": synced_at_row[0].isoformat() if synced_at_row and synced_at_row[0] else None,
+            "earnings": synced_at_row[1].isoformat() if synced_at_row and synced_at_row[1] else None,
+        },
+    }
+
+
 def build_data_quality(
     holdings: list[Holding],
     excluded_positions: list[Holding],
     classifications: dict[int, dict[str, Any]],
     *,
     missing_sector_tickers: list[str] | None = None,
+    missing_realized_proceeds: list[dict[str, Any]] | None = None,
     today: date | None = None,
 ) -> dict[str, Any]:
     """Flag positions that need attention instead of silently including or excluding them."""
     today = today or date.today()
     missing_sector = set(missing_sector_tickers or [])
     flags: list[dict[str, Any]] = []
+
+    for entry in missing_realized_proceeds or []:
+        flags.append(
+            {
+                "code": "realized_gain_missing_proceeds",
+                "ticker_symbol": entry["ticker_symbol"],
+                "detail": (
+                    f"Sale on {entry['event_date']} has no reported proceeds (likely a "
+                    "provisional email row awaiting a superseding activities/statement "
+                    "export); realized gain for this sale is booked as break-even, not a loss."
+                ),
+                "severity": "warning",
+            }
+        )
 
     for holding in excluded_positions:
         flags.append(
@@ -1931,18 +2692,25 @@ def build_data_quality(
             )
         info = classifications.get(holding.ticker_id)
         if info is None:
+            # No portfolio_classifications row at all -- distinct from
+            # classification_review below (a row exists but the classifier
+            # flagged it). This silently distorts group allocation until a
+            # classify run picks the holding up, so it is a warning rather
+            # than info: a currently-owned holding is simply missing from
+            # the classifier's output (e.g. a newly resolved ticker before
+            # the next classification run).
             flags.append(
                 {
-                    "code": "missing_classification",
+                    "code": "unclassified_holding",
                     "ticker_symbol": holding.ticker_symbol,
                     "detail": "No portfolio_classifications row for this ticker.",
-                    "severity": "info",
+                    "severity": "warning",
                 }
             )
         elif info.get("review_needed"):
             flags.append(
                 {
-                    "code": "missing_classification",
+                    "code": "classification_review",
                     "ticker_symbol": holding.ticker_symbol,
                     "detail": "Classifier flagged this ticker for manual review.",
                     "severity": "info",
@@ -2276,16 +3044,17 @@ def portfolio_report(
         if not block["available"]:
             _mark_unavailable(f"activity.average_holding_period.{horizon}", block["reason"])
 
+    # --- Summary ---
+    realized_gains = get_realized_gain_summary(db_path, date_from=date_from, date_to=date_to)
+
     # --- Data quality ---
     data_quality = build_data_quality(
         holding_objs,
         excluded_objs,
         group_allocation["classifications"],
         missing_sector_tickers=sector_allocation["missing_sector_tickers"],
+        missing_realized_proceeds=realized_gains["missing_proceeds"],
     )
-
-    # --- Summary ---
-    realized_gains = get_realized_gain_summary(db_path, date_from=date_from, date_to=date_to)
     securities_value = sum((h.market_value for h in holding_objs), Decimal("0"))
     summary = {
         "portfolio_value": summary_obj.portfolio_value,

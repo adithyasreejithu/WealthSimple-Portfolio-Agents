@@ -1,9 +1,10 @@
 import json
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 import database
 from analytics import (
@@ -12,6 +13,7 @@ from analytics import (
     get_cash_summary,
     get_classification_details,
     get_currency_exposure,
+    get_data_watermark,
     get_dividend_history,
     get_etf_overlap,
     get_excluded_positions,
@@ -19,17 +21,22 @@ from analytics import (
     get_expense_ratios,
     get_external_flow_series,
     get_group_allocation,
+    get_group_return_correlation,
     get_historical_portfolio_values,
     get_holdings,
     get_look_through_sector_exposure,
+    get_portfolio_volatility_from_covariance,
     get_position,
     get_portfolio_summary,
     get_dividend_summary,
     get_fx_fee_summary,
     get_realized_gain_summary,
+    get_return_correlation,
     get_sector_allocation,
     get_trend_overlay_series,
     get_turnover_and_holding_period,
+    get_upcoming_income_events,
+    get_wishlist_overview,
     load_allocation_targets,
     portfolio_report,
 )
@@ -215,6 +222,66 @@ class AnalyticsTest(unittest.TestCase):
         self.assertEqual(cash.balance, Decimal("0.00"))
         self.assertEqual(cash.source, "explicit_balance")
 
+    def test_cash_balance_rolls_forward_with_a_provisional_email_sale(self):
+        """
+        Reproduces the PLTR production incident directly: cash was stuck at
+        $0.31 (the statement anchor) because a real, evidenced sale existed
+        only as a provisional email row -- neither `statement_balances` nor
+        `activities` had captured it yet. A still-provisional, ticker-
+        resolved email SELL must roll cash forward by its full CAD proceeds
+        even though no statement or activities row has caught up to it.
+        """
+        ticker_id = self._ticker("PLTR", currency="USD")
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO statement_balances (transaction_date, transaction_type, balance) "
+            "VALUES ('2026-05-21', 'BUY', 0.31)"
+        )
+        connection.execute(
+            """
+            INSERT INTO email_transactions (
+                account, transaction_type, ticker_id, quantity, total_cost, transaction_date,
+                source_symbol, price_currency, amount_quality, ticker_resolution_status, reconciliation_status
+            ) VALUES ('TFSA', 'Sell', ?, 1, 45.00, ?, 'PLTR', 'CAD',
+                      'derived_from_quantity_and_price', 'resolved', 'provisional')
+            """,
+            [ticker_id, date(2026, 8, 5)],
+        )
+
+        cash = get_cash_summary(self.db_path)
+
+        self.assertEqual(cash.balance, Decimal("45.31"))
+        self.assertEqual(cash.provisional_adjustment, Decimal("45.00"))
+        self.assertEqual(cash.estimated_adjustment, Decimal("45.00"))
+        self.assertIn("_with_provisional_email", cash.source)
+
+    def test_cash_balance_excludes_a_reconciled_email_sale_to_avoid_double_counting(self):
+        # Once reconciliation links the email row to an activity/statement,
+        # its cash effect flows through that authoritative source instead --
+        # it must drop out of the provisional adjustment entirely.
+        ticker_id = self._ticker("PLTR", currency="USD")
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO statement_balances (transaction_date, transaction_type, balance) "
+            "VALUES ('2026-05-21', 'BUY', 0.31)"
+        )
+        connection.execute(
+            """
+            INSERT INTO email_transactions (
+                account, transaction_type, ticker_id, quantity, total_cost, transaction_date,
+                source_symbol, price_currency, amount_quality, ticker_resolution_status,
+                reconciliation_status, matched_activity_id
+            ) VALUES ('TFSA', 'Sell', ?, 1, 45.00, ?, 'PLTR', 'CAD',
+                      'derived_from_quantity_and_price', 'resolved', 'superseded', 1)
+            """,
+            [ticker_id, date(2026, 8, 5)],
+        )
+
+        cash = get_cash_summary(self.db_path)
+
+        self.assertEqual(cash.balance, Decimal("0.31"))
+        self.assertEqual(cash.provisional_adjustment, Decimal("0"))
+
     def test_net_cash_flow_is_used_when_no_balance_exists(self):
         connection = database.get_shared_connection(self.db_path)
         connection.executemany(
@@ -305,6 +372,48 @@ class AnalyticsTest(unittest.TestCase):
         self.assertEqual(by_date[date(2025, 1, 4)]["portfolio_value"], Decimal("432"))
         # Provisional email BUY of 2 on Jan 5 leaves qty 6 at close 110.
         self.assertEqual(by_date[date(2025, 1, 5)]["portfolio_value"], Decimal("660"))
+
+    def test_historical_cash_balance_reflects_a_provisional_email_sale_from_its_own_date_forward(self):
+        # Mirrors get_cash_summary's provisional rollforward, but for the
+        # trend chart's historical series: a still-provisional email sale's
+        # CAD proceeds must appear from its own transaction_date forward, not
+        # only in the current-balance snapshot -- otherwise the Cash KPI and
+        # the trend chart would disagree about the same evidenced sale.
+        ticker_id = self._ticker("PLTR", currency="USD")
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO statement_balances (transaction_date, transaction_type, balance) "
+            "VALUES ('2026-08-01', 'BUY', 0.31)"
+        )
+        connection.execute(
+            """
+            INSERT INTO transactions (
+                transaction_date, transaction_type, ticker_id, quantity,
+                execution_date, debit, credit, fx_rate
+            ) VALUES (?, 'BUY', ?, 2, ?, 100, NULL, NULL)
+            """,
+            [date(2026, 8, 1), ticker_id, date(2026, 8, 1)],
+        )
+        connection.execute(
+            """
+            INSERT INTO email_transactions (
+                account, transaction_type, ticker_id, quantity, total_cost, transaction_date,
+                source_symbol, price_currency, amount_quality, ticker_resolution_status, reconciliation_status
+            ) VALUES ('TFSA', 'Sell', ?, 1, 45.00, ?, 'PLTR', 'CAD',
+                      'derived_from_quantity_and_price', 'resolved', 'provisional')
+            """,
+            [ticker_id, date(2026, 8, 5)],
+        )
+        connection.execute(
+            "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [ticker_id, date(2026, 8, 5), 45.0, 45.0, 45.0, 45.0, 45.0, 100],
+        )
+
+        values = get_historical_portfolio_values(self.db_path)
+        by_date = {row["date"]: row for row in values}
+
+        self.assertEqual(by_date[date(2026, 8, 1)]["cash_balance"], Decimal("0.31"))
+        self.assertEqual(by_date[date(2026, 8, 5)]["cash_balance"], Decimal("45.31"))
 
     def test_historical_values_never_go_negative_from_over_sell(self):
         ticker_id = self._ticker()
@@ -524,6 +633,34 @@ class AnalyticsTest(unittest.TestCase):
         result = get_realized_gain_summary(self.db_path, date_from=date(2025, 1, 1))
 
         self.assertEqual(result["total_realized_gain"], Decimal("20"))
+        self.assertEqual(
+            result["events"],
+            [{
+                "event_date": date(2025, 1, 1), "ticker_symbol": "AAPL", "realized_gain_cad": Decimal("20"),
+                "amount_quality": "reported",
+            }],
+        )
+
+    def test_realized_gain_events_keep_each_sale_separate(self):
+        ticker_id = self._ticker()
+        connection = database.get_shared_connection(self.db_path)
+        connection.executemany(
+            """INSERT INTO transactions (
+                transaction_date, transaction_type, ticker_id, quantity,
+                execution_date, debit, credit, fx_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
+            [
+                (date(2024, 1, 1), "BUY", ticker_id, Decimal("10"), date(2024, 1, 1), Decimal("100"), None),
+                (date(2025, 1, 1), "SELL", ticker_id, Decimal("-2"), date(2025, 1, 1), None, Decimal("30")),
+                (date(2025, 2, 1), "SELL", ticker_id, Decimal("-3"), date(2025, 2, 1), None, Decimal("24")),
+            ],
+        )
+
+        result = get_realized_gain_summary(self.db_path)
+
+        self.assertEqual([event["event_date"] for event in result["events"]], [date(2025, 1, 1), date(2025, 2, 1)])
+        self.assertEqual([event["realized_gain_cad"] for event in result["events"]], [Decimal("10"), Decimal("-6")])
+        self.assertEqual(result["by_ticker"]["AAPL"], Decimal("4"))
 
     def test_realized_gain_converts_usd_activity_amounts(self):
         # Activities rows carry net_cash_amount in transaction_currency; both
@@ -561,6 +698,35 @@ class AnalyticsTest(unittest.TestCase):
 
         # proceeds 1200 USD * 1.40 minus cost 1000 USD * 1.35
         self.assertEqual(result["total_realized_gain"], Decimal("330"))
+
+    def test_realized_gain_imputes_break_even_when_proceeds_missing(self):
+        # A provisional email sell with no total_cost must not be booked as a
+        # fabricated loss of the full cost basis; it should net to zero and be
+        # surfaced via missing_proceeds instead.
+        ticker_id = self._ticker()
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            """INSERT INTO transactions (
+                transaction_date, transaction_type, ticker_id, quantity,
+                execution_date, debit, credit, fx_rate
+            ) VALUES (?, 'BUY', ?, 10, ?, 100, NULL, NULL)""",
+            [date(2024, 1, 1), ticker_id, date(2024, 1, 1)],
+        )
+        connection.execute(
+            """INSERT INTO email_transactions (
+                   account, transaction_type, ticker_id, quantity, transaction_date,
+                   source_symbol, price_currency, ticker_resolution_status, reconciliation_status
+               ) VALUES ('TFSA', 'Sell', ?, -4, ?, 'AAPL', 'USD', 'resolved', 'provisional')""",
+            [ticker_id, date(2025, 1, 1)],
+        )
+
+        result = get_realized_gain_summary(self.db_path, date_from=date(2025, 1, 1))
+
+        self.assertEqual(result["total_realized_gain"], Decimal("0"))
+        self.assertEqual(
+            result["missing_proceeds"],
+            [{"ticker_symbol": "AAPL", "event_date": date(2025, 1, 1)}],
+        )
 
     def test_report_holdings_carry_portfolio_weight(self):
         connection = database.get_shared_connection(self.db_path)
@@ -662,6 +828,135 @@ class AnalyticsTest(unittest.TestCase):
             {"date": date(2025, 1, 2), "amount": Decimal("600")},
             {"date": date(2025, 1, 5), "amount": Decimal("50")},
         ])
+
+    def test_data_watermark_advances_on_write_without_needing_a_checkpoint(self):
+        """Regression: the dashboard API's report cache used to key on the
+        main .duckdb file's mtime, which only advances at checkpoint -- a
+        write that only lands in the .wal sidecar left it stuck. The
+        watermark instead reads freshness columns each writer stamps, so it
+        must differ before/after a write regardless of checkpointing."""
+        before = get_data_watermark(self.db_path)
+        ticker_id = self._ticker()
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO portfolio_classifications "
+            "(ticker_id, primary_group, review_needed, generated_at) "
+            "VALUES (?, 'Core', false, now())",
+            [ticker_id],
+        )
+        after = get_data_watermark(self.db_path)
+        self.assertNotEqual(before, after)
+
+
+class WishlistOverviewTest(unittest.TestCase):
+    def setUp(self):
+        database.close_connection()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
+        self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
+        database.initialize_database(self.db_path)
+        self.runs_root = Path(self.temp_dir.name) / "runs"
+        self.runs_root.mkdir()
+        self.patcher = mock.patch("analytics.WORKSPACE_RUNS_FOLDER", self.runs_root)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def _ticker(self, symbol, currency="USD"):
+        connection = database.get_shared_connection(self.db_path)
+        return connection.execute(
+            "INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type) "
+            "VALUES (?, 'NASDAQ', ?, ?, 'stock') RETURNING ticker_id",
+            [symbol, currency, f"{symbol} Inc."],
+        ).fetchone()[0]
+
+    def _declare_wishlist(self, ticker_id, rationale="research candidate"):
+        database.get_shared_connection(self.db_path).execute(
+            "INSERT INTO security_status (ticker_id, declared_status, rationale, declared_at, declared_by) "
+            "VALUES (?, 'wishlist', ?, now(), 'test')",
+            [ticker_id, rationale],
+        )
+
+    def _write_artifact(self, subdir, filename, payload):
+        run_dir = self.runs_root / "test-run" / subdir
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / filename).write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_owned_ticker_is_excluded_even_if_still_declared_wishlist(self):
+        ticker_id = self._ticker("OWNED")
+        self._declare_wishlist(ticker_id)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO position_snapshots "
+            "(ticker_id, quantity, book_value_cad, book_value_mkt, realized_gain_cad, computed_at) "
+            "VALUES (?, 5, 100, 100, 0, now())",
+            [ticker_id],
+        )
+
+        result = get_wishlist_overview(self.db_path)
+
+        self.assertEqual(result["wishlist"], [])
+
+    def test_wishlist_ticker_joins_classification_and_latest_thesis(self):
+        ticker_id = self._ticker("WISH")
+        self._declare_wishlist(ticker_id, rationale="promising margin story")
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            "INSERT INTO portfolio_classifications "
+            "(ticker_id, primary_group, confidence, review_needed, generated_at) "
+            "VALUES (?, 'Growth', 'medium', false, now())",
+            [ticker_id],
+        )
+        self._write_artifact(
+            "agent_outputs", "WISH-2026-01-01T000000Z-thesis.json",
+            {"generated_at": "2026-01-01T00:00:00Z", "conclusion": {
+                "fundamental_rating": "attractive", "thesis_confidence": "medium",
+            }},
+        )
+        self._write_artifact(
+            "agent_outputs", "WISH-2026-02-01T000000Z-thesis.json",
+            {"generated_at": "2026-02-01T00:00:00Z", "conclusion": {
+                "fundamental_rating": "neutral", "thesis_confidence": "low",
+            }},
+        )
+
+        result = get_wishlist_overview(self.db_path)
+
+        self.assertEqual(result["count"], 1)
+        entry = result["wishlist"][0]
+        self.assertEqual(entry["ticker"], "WISH")
+        self.assertEqual(entry["declaration"]["rationale"], "promising margin story")
+        self.assertEqual(entry["classification"], {"primary_group": "Growth", "confidence": "medium"})
+        # Filenames sort chronologically, so the Feb artifact must win over Jan.
+        self.assertEqual(entry["thesis"]["fundamental_rating"], "neutral")
+        self.assertIsNone(entry["decision"])
+
+    def test_decision_action_outside_wishlist_vocabulary_is_flagged(self):
+        ticker_id = self._ticker("MISMATCH")
+        self._declare_wishlist(ticker_id)
+        self._write_artifact(
+            "final", "MISMATCH-2026-01-01T000000Z-decision.json",
+            {"generated_at": "2026-01-01T00:00:00Z", "proposed_action": "Hold",
+             "confidence": "medium", "summary": "test", "policy_checks": []},
+        )
+
+        entry = get_wishlist_overview(self.db_path)["wishlist"][0]
+
+        self.assertEqual(entry["decision"]["proposed_action"], "Hold")
+        self.assertTrue(entry["decision"]["action_vocabulary_mismatch"])
+
+    def test_decision_action_inside_wishlist_vocabulary_is_not_flagged(self):
+        ticker_id = self._ticker("OK")
+        self._declare_wishlist(ticker_id)
+        self._write_artifact(
+            "final", "OK-2026-01-01T000000Z-decision.json",
+            {"generated_at": "2026-01-01T00:00:00Z", "proposed_action": "Watch",
+             "confidence": "medium", "summary": "test", "policy_checks": []},
+        )
+
+        entry = get_wishlist_overview(self.db_path)["wishlist"][0]
+
+        self.assertFalse(entry["decision"]["action_vocabulary_mismatch"])
 
 
 class AnalyticsAllocationTest(unittest.TestCase):
@@ -940,7 +1235,23 @@ class AnalyticsAllocationTest(unittest.TestCase):
         codes = {flag["code"] for flag in result["flags"]}
         self.assertIn("stale_price", codes)
         self.assertIn("suspicious_gain", codes)
-        self.assertIn("missing_classification", codes)
+        self.assertIn("unclassified_holding", codes)
+
+    def test_data_quality_flags_missing_realized_proceeds(self):
+        result = build_data_quality(
+            [],
+            [],
+            {},
+            missing_realized_proceeds=[
+                {"ticker_symbol": "PLTR", "event_date": date(2026, 8, 5)}
+            ],
+            today=date.today(),
+        )
+
+        flags = [f for f in result["flags"] if f["code"] == "realized_gain_missing_proceeds"]
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0]["ticker_symbol"], "PLTR")
+        self.assertEqual(flags[0]["severity"], "warning")
 
     def test_benchmark_returns_none_on_fetch_failure(self):
         def failing_fetch(symbols, start, end):
@@ -1062,6 +1373,280 @@ class AnalyticsAllocationTest(unittest.TestCase):
 
     def test_get_price_history_unknown_symbol_returns_none(self):
         self.assertIsNone(get_price_history("NOPE", self.db_path))
+
+    def _prices(self, ticker_id, closes, start=date(2025, 1, 2)):
+        connection = database.get_shared_connection(self.db_path)
+        connection.executemany(
+            "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                [ticker_id, start + timedelta(days=i), close, close, close, close, close, 100]
+                for i, close in enumerate(closes)
+            ],
+        )
+
+    def test_get_return_correlation_perfectly_correlated_tickers(self):
+        a_id = self._ticker(symbol="AAA")
+        b_id = self._ticker(symbol="BBB", exchange="NASDAQ")
+        # B is exactly 2x A at every point -- returns are scale-invariant, so
+        # the two series' daily returns are identical and correlation is 1.0.
+        values_a = [100 + i for i in range(26)]
+        self._prices(a_id, values_a)
+        self._prices(b_id, [2 * v for v in values_a])
+
+        result = get_return_correlation(self.db_path, symbols=["AAA", "BBB"], window_days=20)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["tickers"], ["AAA", "BBB"])
+        self.assertEqual(result["unavailable_tickers"], [])
+        self.assertEqual(result["observations"], 20)
+        self.assertAlmostEqual(result["correlation"]["AAA"]["BBB"], 1.0, places=6)
+        self.assertAlmostEqual(result["correlation"]["AAA"]["AAA"], 1.0, places=6)
+        self.assertIn("BBB", result["covariance"]["AAA"])
+
+    def test_get_return_correlation_excludes_short_history_ticker(self):
+        a_id = self._ticker(symbol="AAA")
+        b_id = self._ticker(symbol="BBB", exchange="NASDAQ")
+        c_id = self._ticker(symbol="CCC", exchange="NASDAQ")
+        values = [100 + i for i in range(26)]
+        self._prices(a_id, values)
+        self._prices(b_id, [2 * v for v in values])
+        self._prices(c_id, values[:3])  # far short of the 20-day window
+
+        result = get_return_correlation(self.db_path, symbols=["AAA", "BBB", "CCC"], window_days=20)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["tickers"], ["AAA", "BBB"])
+        self.assertEqual(result["unavailable_tickers"], ["CCC"])
+
+    def test_get_return_correlation_no_symbols_requested(self):
+        result = get_return_correlation(self.db_path, symbols=[])
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "No symbols requested.")
+
+    def test_get_return_correlation_too_few_observations(self):
+        # Both tickers individually have fewer observations than the window
+        # requires, so both are dropped as thin before any intersection step.
+        a_id = self._ticker(symbol="AAA")
+        b_id = self._ticker(symbol="BBB", exchange="NASDAQ")
+        values = [100 + i for i in range(6)]
+        self._prices(a_id, values)
+        self._prices(b_id, [2 * v for v in values])
+
+        result = get_return_correlation(self.db_path, symbols=["AAA", "BBB"], window_days=20)
+
+        self.assertFalse(result["available"])
+        self.assertIn("trading days of price history", result["reason"])
+
+    def test_get_return_correlation_does_not_null_out_on_a_single_missing_date(self):
+        # Regression: a raw union of dates previously let one ticker's single
+        # missing date (a market closed elsewhere) null out every OTHER
+        # ticker's row on that date too, emptying the whole matrix once
+        # enough tickers were selected. A and B have a full 40-day calendar;
+        # only one shared date is missing for C, well inside the window.
+        a_id = self._ticker(symbol="AAA")
+        b_id = self._ticker(symbol="BBB", exchange="NASDAQ")
+        c_id = self._ticker(symbol="CCC", exchange="TSX")
+        values = [100 + i for i in range(40)]
+        self._prices(a_id, values)
+        self._prices(b_id, [2 * v for v in values])
+        # CCC (a different exchange) is missing exactly one date in the
+        # middle of the window -- e.g. a holiday A and B still traded on.
+        c_dates = [date(2025, 1, 2) + timedelta(days=i) for i in range(40) if i != 35]
+        connection = database.get_shared_connection(self.db_path)
+        connection.executemany(
+            "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [[c_id, d, 50.0, 50.0, 50.0, 50.0, 50.0, 100] for d in c_dates],
+        )
+
+        result = get_return_correlation(
+            self.db_path, symbols=["AAA", "BBB", "CCC"], window_days=30
+        )
+
+        # AAA and BBB must not be collateral damage from CCC's one gap.
+        self.assertTrue(result["available"])
+        self.assertIn("AAA", result["tickers"])
+        self.assertIn("BBB", result["tickers"])
+        self.assertGreater(result["observations"], 0)
+
+    def test_get_return_correlation_too_few_common_dates_after_thin_filter(self):
+        # Both tickers individually clear the observation floor (35 rows
+        # each, well above the 20-row minimum), but their date ranges only
+        # overlap in 10 places -- the pass-2 intersection gate, distinct from
+        # pass-1's per-ticker thinness check.
+        a_id = self._ticker(symbol="AAA")
+        b_id = self._ticker(symbol="BBB", exchange="NASDAQ")
+        base = date(2025, 1, 1)
+        a_dates = [base + timedelta(days=i) for i in range(35)]  # offsets 0-34
+        b_dates = [base + timedelta(days=i) for i in range(25, 60)]  # offsets 25-59
+        connection = database.get_shared_connection(self.db_path)
+        connection.executemany(
+            "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [[a_id, d, 100.0, 100.0, 100.0, 100.0, 100.0, 100] for d in a_dates],
+        )
+        connection.executemany(
+            "INSERT INTO historical_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [[b_id, d, 100.0, 100.0, 100.0, 100.0, 100.0, 100] for d in b_dates],
+        )
+
+        result = get_return_correlation(self.db_path, symbols=["AAA", "BBB"], window_days=60)
+
+        self.assertFalse(result["available"])
+        self.assertIn("common to every selected ticker", result["reason"])
+
+    def test_group_return_correlation_builds_current_weight_baskets(self):
+        core_id = self._ticker(symbol="AAA")
+        growth_id = self._ticker(symbol="BBB")
+        self._buy(core_id, 10, 1000)
+        self._buy(growth_id, 20, 2000)
+        self._classify(core_id, "Core")
+        self._classify(growth_id, "Growth")
+        values = [100 + i for i in range(26)]
+        self._prices(core_id, values)
+        self._prices(growth_id, [2 * value for value in values])
+
+        result = get_group_return_correlation(self.db_path, groups=["Core", "Growth"], window_days=20)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["tickers"], ["Core", "Growth"])
+        self.assertAlmostEqual(result["correlation"]["Core"]["Growth"], 1.0, places=6)
+        # Current market values are 10 * 125 for Core and 20 * 250 for Growth.
+        self.assertAlmostEqual(result["group_metadata"]["Core"]["portfolio_weight"], 0.2)
+        self.assertEqual(result["group_metadata"]["Growth"]["constituents"], ["BBB"])
+
+    def test_group_return_correlation_requires_two_usable_groups(self):
+        core_id = self._ticker(symbol="AAA")
+        growth_id = self._ticker(symbol="BBB")
+        self._buy(core_id, 10, 1000)
+        self._buy(growth_id, 20, 2000)
+        self._classify(core_id, "Core")
+        self._classify(growth_id, "Growth")
+        self._prices(core_id, [100 + i for i in range(26)])
+        self._prices(growth_id, [100, 101, 102])
+
+        result = get_group_return_correlation(self.db_path, groups=["Core", "Growth"], window_days=20)
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["unavailable_groups"], ["Growth"])
+        self.assertEqual(result["group_metadata"]["Growth"]["unavailable_constituents"], ["BBB"])
+
+    def test_dividend_history_by_ticker_and_by_ticker_month(self):
+        ticker_id = self._ticker(symbol="AAPL")
+        connection = database.get_shared_connection(self.db_path)
+        connection.executemany(
+            """INSERT INTO email_transactions (
+                account, transaction_type, ticker_id, debit, transaction_date
+            ) VALUES ('TFSA', 'Dividend', ?, ?, ?)""",
+            [
+                (ticker_id, Decimal("4.00"), date(2025, 3, 15)),
+                (ticker_id, Decimal("5.00"), date(2025, 6, 15)),
+            ],
+        )
+
+        result = get_dividend_history(
+            self.db_path, date_from=date(2025, 1, 1), date_to=date(2025, 12, 31)
+        )
+
+        self.assertEqual(result["by_ticker"]["AAPL"]["transaction_count"], 2)
+        self.assertEqual(result["by_ticker"]["AAPL"]["totals_by_currency"]["USD"], Decimal("9.00"))
+        self.assertEqual(result["by_ticker_month"]["2025-03"]["AAPL"], Decimal("4.00"))
+        self.assertEqual(result["by_ticker_month"]["2025-06"]["AAPL"], Decimal("5.00"))
+
+    def test_upcoming_income_events_computes_expected_cash_and_filters_past(self):
+        ticker_id = self._ticker(symbol="AAPL", currency="USD")
+        self._buy(ticker_id, 10, 1000)
+        self._price(ticker_id, 100)
+        connection = database.get_shared_connection(self.db_path)
+        future_ex_date = date.today() + timedelta(days=10)
+        past_ex_date = date.today() - timedelta(days=10)
+        connection.execute(
+            """INSERT INTO dividend_events (
+                ticker_id, ex_dividend_date, pay_date, declared_amount, frequency
+            ) VALUES (?, ?, ?, ?, ?)""",
+            [ticker_id, future_ex_date, future_ex_date + timedelta(days=14), Decimal("0.50"), "quarterly"],
+        )
+        connection.execute(
+            """INSERT INTO dividend_events (
+                ticker_id, ex_dividend_date, pay_date, declared_amount, frequency
+            ) VALUES (?, ?, ?, ?, ?)""",
+            [ticker_id, past_ex_date, None, Decimal("0.40"), "quarterly"],
+        )
+        future_report_date = date.today() + timedelta(days=20)
+        connection.execute(
+            "INSERT INTO earnings_events (ticker_id, report_date, eps_estimate) VALUES (?, ?, ?)",
+            [ticker_id, future_report_date, 1.23],
+        )
+
+        result = get_upcoming_income_events(self.db_path, horizon_days=90)
+
+        self.assertEqual(len(result["dividends"]), 1)
+        dividend = result["dividends"][0]
+        self.assertEqual(dividend["ticker_symbol"], "AAPL")
+        self.assertEqual(dividend["ex_dividend_date"], future_ex_date)
+        self.assertEqual(dividend["currency"], "USD")
+        self.assertEqual(dividend["expected_cash"], Decimal("5.00"))  # 0.50 * 10 shares
+        self.assertEqual(len(result["earnings"]), 1)
+        self.assertEqual(result["earnings"][0]["report_date"], future_report_date)
+        self.assertAlmostEqual(result["earnings"][0]["weight"], 1.0)
+        self.assertIsNotNone(result["synced_at"]["dividends"])
+        self.assertIsNotNone(result["synced_at"]["earnings"])
+
+    def test_upcoming_income_events_excludes_confirmed_earnings(self):
+        ticker_id = self._ticker(symbol="AAPL")
+        self._buy(ticker_id, 10, 1000)
+        self._price(ticker_id, 100)
+        connection = database.get_shared_connection(self.db_path)
+        connection.execute(
+            """INSERT INTO earnings_events (
+                ticker_id, report_date, eps_estimate, eps_actual
+            ) VALUES (?, ?, ?, ?)""",
+            [ticker_id, date.today() + timedelta(days=5), 1.0, 1.05],
+        )
+
+        result = get_upcoming_income_events(self.db_path, horizon_days=90)
+
+        self.assertEqual(result["earnings"], [])
+
+    def test_upcoming_income_events_no_holdings_returns_empty(self):
+        result = get_upcoming_income_events(self.db_path)
+        self.assertEqual(result["dividends"], [])
+        self.assertEqual(result["earnings"], [])
+        self.assertIsNone(result["synced_at"]["dividends"])
+
+
+class PortfolioVolatilityFromCovarianceTest(unittest.TestCase):
+    def test_computes_volatility_and_contribution_sums_to_total(self):
+        covariance = {
+            "AAA": {"AAA": 0.04, "BBB": 0.01},
+            "BBB": {"AAA": 0.01, "BBB": 0.09},
+        }
+        weights = {"AAA": 0.6, "BBB": 0.4}
+
+        result = get_portfolio_volatility_from_covariance(covariance, weights)
+
+        self.assertTrue(result["available"])
+        self.assertAlmostEqual(result["covered_weight"], 1.0)
+        total_contribution = sum(result["risk_contribution"].values())
+        self.assertAlmostEqual(total_contribution, result["portfolio_volatility"], places=8)
+
+    def test_fewer_than_two_overlapping_tickers_is_unavailable(self):
+        covariance = {"AAA": {"AAA": 0.04}}
+        weights = {"AAA": 0.3, "BBB": 0.7}  # BBB absent from the covariance matrix
+
+        result = get_portfolio_volatility_from_covariance(covariance, weights)
+
+        self.assertFalse(result["available"])
+        self.assertIn("Fewer than two tickers", result["reason"])
+
+    def test_zero_covered_weight_is_unavailable(self):
+        covariance = {
+            "AAA": {"AAA": 0.04, "BBB": 0.0},
+            "BBB": {"AAA": 0.0, "BBB": 0.01},
+        }
+        weights = {"AAA": -0.2, "BBB": 0.2}
+
+        result = get_portfolio_volatility_from_covariance(covariance, weights)
+
+        self.assertFalse(result["available"])
 
 
 class EtfOverlapTest(unittest.TestCase):

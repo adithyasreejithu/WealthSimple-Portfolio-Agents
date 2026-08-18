@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from config import DATABASE_PATH, DATABASE_SCHEMA_VERSION
 from database import REQUIRED_TABLES, SCHEMA_COMPONENT
 from market_data import RESEARCH_STATUSES
-from position_engine import FINGERPRINT_COMPONENT, compute_fingerprint
+from position_engine import FINGERPRINT_COMPONENT, compute_fingerprint, latest_fx_rate
 
 
 def _json_value(value: Any) -> Any:
@@ -96,8 +96,30 @@ def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[s
     try:
         _validate_database(connection)
         _validate_positions_fresh(connection)
+        # `historical_records.close` is in the security's listing currency,
+        # but `position_snapshots.book_value_cad` (aliased `cost_basis`
+        # below) is always CAD. Convert the latest close to CAD per listing
+        # currency before pricing the position -- otherwise every non-CAD
+        # holding's market value, weight, and unrealized gain % are wrong by
+        # roughly the FX rate (a USD holding's gain % came out inflated by
+        # ~1.4x). Reuses `position_engine.latest_fx_rate`, the same
+        # CAD-per-unit lookup the write-path valuation
+        # (`analytics._get_net_positions`) already uses, so this read-only
+        # path values positions identically to the live dashboard.
+        currencies = [
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT t.currency FROM position_snapshots s "
+                "JOIN tickers t USING (ticker_id) WHERE s.quantity <> 0"
+            ).fetchall()
+        ]
+        fx_rates = {currency: latest_fx_rate(connection, currency)[0] for currency in currencies}
+        fx_rows_sql = ", ".join(["(?, ?)"] * len(fx_rates)) or "(NULL, NULL)"
+        fx_params: list[Any] = []
+        for currency, rate in fx_rates.items():
+            fx_params.extend([currency, float(rate)])
         rows = connection.execute(
-            """
+            f"""
             WITH ledger_stats AS (
                 SELECT ticker_id,
                        MIN(CASE WHEN event_type = 'BUY' THEN event_date END) first_purchase_date,
@@ -120,6 +142,7 @@ def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[s
                 SELECT ticker_id, close,
                        ROW_NUMBER() OVER (PARTITION BY ticker_id ORDER BY record_date DESC) rn
                 FROM historical_records
+            ), fx_rates(currency, cad_per_unit) AS (VALUES {fx_rows_sql}
             ), base AS (
                 SELECT t.ticker_id, t.ticker_symbol ticker, t.security_name company_name,
                        t.security_type asset_class, t.currency, t.financial_currency, t.exchange,
@@ -131,7 +154,8 @@ def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[s
                        COALESCE(ls.number_of_buys, 0) number_of_buys,
                        COALESCE(ls.number_of_sells, 0) number_of_sells,
                        COALESCE(d.dividends_received, 0) dividends_received, a.account_type,
-                       CASE WHEN lp.close IS NULL THEN NULL ELSE s.quantity * lp.close END position_market_value
+                       CASE WHEN lp.close IS NULL THEN NULL
+                            ELSE s.quantity * lp.close * COALESCE(fx.cad_per_unit, 1) END position_market_value
                 FROM position_snapshots s JOIN tickers t USING (ticker_id)
                 LEFT JOIN ledger_stats ls USING (ticker_id)
                 LEFT JOIN dividends d USING (ticker_id)
@@ -141,12 +165,14 @@ def read_classification_data(db_path: str | Path = DATABASE_PATH) -> list[dict[s
                 LEFT JOIN ticker_provider_mappings m ON m.ticker_id = t.ticker_id
                     AND m.provider = 'yahoo' AND m.verification_status = 'verified'
                 LEFT JOIN latest_prices lp ON lp.ticker_id = t.ticker_id AND lp.rn = 1
+                LEFT JOIN fx_rates fx ON fx.currency = t.currency
                 WHERE s.quantity <> 0
             )
             SELECT *, CASE WHEN SUM(position_market_value) OVER () > 0
                            THEN 100 * position_market_value / SUM(position_market_value) OVER () END current_weight_percent
             FROM base ORDER BY ticker, exchange
-            """
+            """,
+            fx_params,
         )
         columns = [item[0] for item in rows.description]
         records = [dict(zip(columns, row)) for row in rows.fetchall()]

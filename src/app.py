@@ -39,7 +39,18 @@ from database_command import (
 from analytics import portfolio_report
 from email_extractor import fetch_email_transactions
 from holdings_reconciler import format_report, reconcile_holdings
-from market_data import sync_earnings_dividends, sync_financial_snapshots, sync_market_data
+from market_data import (
+    EarningsDividendsSyncResult,
+    FinancialSnapshotsSyncResult,
+    MarketSyncResult,
+    get_market_targets,
+    stale_dividend_symbols,
+    stale_earnings_symbols,
+    stale_financial_snapshot_symbols,
+    sync_earnings_dividends,
+    sync_financial_snapshots,
+    sync_market_data,
+)
 from position_engine import ensure_positions_fresh, recompute_positions
 from statement_extractor import extract_statement_pdf
 from staging import (
@@ -75,7 +86,7 @@ class PipelineResult:
 
     @property
     def succeeded(self) -> bool:
-        return all(result.status in {"succeeded", "skipped"} for result in self.results)
+        return all(result.status in {"succeeded", "skipped", "degraded"} for result in self.results)
 
 
 def check_data_files(data_dir: Path | str = DATA_FOLDER) -> list[Path]:
@@ -228,6 +239,106 @@ def _sync_email_history(db_path: Path | str) -> str | None:
     return result.error or "historical price synchronization failed"
 
 
+def _domain_status(result: MarketSyncResult | EarningsDividendsSyncResult | FinancialSnapshotsSyncResult) -> str:
+    """Classify a market-data sync result for `SourceResult`/`PipelineResult`.
+
+    `sync_market_data`/`sync_earnings_dividends`/`sync_financial_snapshots`
+    already isolate failures per symbol and write through everything that did
+    succeed (see market_data.py's per-target try/except and the per-symbol
+    `ThreadPoolExecutor` isolation in `_fetch_one_earnings`/
+    `_fetch_one_financial_snapshots`, which already treat a fund ticker
+    having no earnings/fundamentals as an expected outcome, not an error).
+    But every failure path that fails ALL requested symbols -- a total fetch
+    failure, or a rolled-back write -- also sets every target in
+    `failed_symbols`, which is exactly the signal needed to distinguish
+    "isolated, expected gaps" from "this sync is actually broken":
+      - every symbol failed (or none were requested) -> failed
+      - some symbols failed, the rest wrote through   -> degraded
+      - no failures                                   -> succeeded
+    """
+    if result.succeeded:
+        return "succeeded"
+    if not result.failed_symbols or len(result.failed_symbols) >= result.tickers:
+        return "failed"
+    return "degraded"
+
+
+def _run_market_data_refresh(
+    db_path: Path | str,
+    *,
+    full: bool = False,
+    skip: bool = False,
+    as_of: date | None = None,
+) -> list[SourceResult]:
+    """Refresh every market-data domain `historical_records`/`earnings_events`/
+    `dividend_events`/`financial_snapshots` store, for every currently owned ticker.
+
+    Prices, FX, and the benchmark (inside `sync_market_data`) refresh every run --
+    `MarketTarget.fetch_ranges` is already incremental from the last stored date, so
+    there is nothing to gate. Earnings, dividends, and quarterly financials are each
+    staleness-gated per `config.py`'s *_REFRESH_INTERVAL_DAYS constants (see
+    docs/architecture/ingestion_and_reconciliation.md) so a routine run stays fast
+    while nothing goes stale beyond its configured interval. `full=True` bypasses
+    every gate and refreshes every domain for every owned ticker; `skip=True` skips
+    this stage entirely for a fast ingest-only run.
+    """
+    if skip:
+        return [SourceResult("market-data", None, "skipped")]
+
+    results: list[SourceResult] = []
+    market_result = sync_market_data(db_path, as_of=as_of, full=full)
+    results.append(
+        SourceResult(
+            "market-data",
+            None,
+            _domain_status(market_result),
+            market_result.rows,
+            market_result.error,
+        )
+    )
+
+    targets = get_market_targets(db_path)
+    if full:
+        earnings_dividends_symbols: list[str] | None = None
+        financial_snapshot_symbols: list[str] | None = None
+    else:
+        earnings_dividends_symbols = sorted(
+            set(stale_earnings_symbols(db_path, targets, as_of=as_of))
+            | set(stale_dividend_symbols(db_path, targets, as_of=as_of))
+        )
+        financial_snapshot_symbols = stale_financial_snapshot_symbols(db_path, targets, as_of=as_of)
+
+    if full or earnings_dividends_symbols:
+        ed_result = sync_earnings_dividends(db_path, earnings_dividends_symbols)
+        results.append(
+            SourceResult(
+                "earnings-dividends",
+                None,
+                _domain_status(ed_result),
+                ed_result.earnings_rows + ed_result.dividend_rows + ed_result.upcoming_dividend_rows,
+                ed_result.error,
+            )
+        )
+    else:
+        results.append(SourceResult("earnings-dividends", None, "skipped"))
+
+    if full or financial_snapshot_symbols:
+        fs_result = sync_financial_snapshots(db_path, financial_snapshot_symbols)
+        results.append(
+            SourceResult(
+                "financial-snapshots",
+                None,
+                _domain_status(fs_result),
+                fs_result.snapshot_rows,
+                fs_result.error,
+            )
+        )
+    else:
+        results.append(SourceResult("financial-snapshots", None, "skipped"))
+
+    return results
+
+
 def _run_portfolio_classification(db_path: Path | str) -> SourceResult:
     """Classify current holdings and persist the result, as the final step of
     a full pipeline run. The classification workflow itself stays read-only
@@ -287,10 +398,12 @@ def _stage_email_batch(
     batch_id: int,
     db_path: Path | str,
     sequence: int,
+    email_date_from: date | None = None,
 ) -> tuple[list[tuple[int, pd.DataFrame]], int, list[SourceResult]]:
     results: list[SourceResult] = []
     try:
-        data = fetch_email_transactions(start_date=get_email_checkpoint(db_path))
+        start_date = email_date_from if email_date_from is not None else get_email_checkpoint(db_path)
+        data = fetch_email_transactions(start_date=start_date)
         staged_id = stage_dataframe(batch_id, "email", None, sequence, data, db_path)
         return [(staged_id, data)], sequence + 1, results
     except Exception as exc:
@@ -565,8 +678,21 @@ def run_pipeline(
     source: str = "all",
     data_dir: Path | str = DATA_FOLDER,
     db_path: Path | str = DATABASE_PATH,
+    email_date_from: date | None = None,
+    *,
+    full: bool = False,
+    skip_market_data: bool = False,
 ) -> PipelineResult:
-    """Stage all selected sources, resolve shared ticker evidence, then publish in order."""
+    """Stage all selected sources, resolve shared ticker evidence, then publish in order.
+
+    Ingestion is followed by a market-data refresh stage
+    (`_run_market_data_refresh`) that runs regardless of `source`, refreshing
+    every locally stored market-data domain for every currently owned ticker
+    -- prices/FX/benchmark unconditionally, earnings/dividends/quarterly
+    financials staleness-gated. `full` bypasses the gates; `skip_market_data`
+    skips the stage entirely for a fast ingest-only run. Classification is a
+    separate command (`classify`) and is never run from here.
+    """
     initialize_database(db_path)
     batch_id = create_batch(db_path)
     results: list[SourceResult] = []
@@ -606,21 +732,17 @@ def run_pipeline(
                     results.append(SourceResult("statement", file, "failed", error=str(exc)))
 
     if source in {"all", "email"}:
-        email_staged, sequence, stage_results = _stage_email_batch(batch_id, db_path, sequence)
+        email_staged, sequence, stage_results = _stage_email_batch(
+            batch_id, db_path, sequence, email_date_from
+        )
         results.extend(stage_results)
         for staged_file_id, data in email_staged:
             resolve_batch(batch_id, db_path, [staged_file_id])
             pending_symbols = _pending_email_symbols(staged_file_id, db_path)
             try:
                 rows = _publish_email_batch(staged_file_id, data, db_path)
-                history_error = _sync_email_history(db_path)
-                partial_errors = []
                 if pending_symbols:
-                    partial_errors.append(_pending_email_error(pending_symbols))
-                if history_error:
-                    partial_errors.append(history_error)
-                if partial_errors:
-                    error = "; ".join(partial_errors)
+                    error = _pending_email_error(pending_symbols)
                     mark_file(staged_file_id, "partial", error, db_path)
                     logger.warning("Email pipeline %s", error)
                     results.append(SourceResult("email", None, "partial", rows, error))
@@ -684,8 +806,7 @@ def run_pipeline(
     if not results:
         results.append(SourceResult(source, None, "skipped"))
 
-    if source == "all":
-        results.append(_run_portfolio_classification(db_path))
+    results.extend(_run_market_data_refresh(db_path, full=full, skip=skip_market_data))
 
     return PipelineResult(tuple(results))
 
@@ -700,6 +821,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--data-folder", type=Path, default=DATA_FOLDER)
     parser.add_argument("--database", type=Path, default=DATABASE_PATH)
+    parser.add_argument(
+        "--email-date-from",
+        type=date.fromisoformat,
+        default=None,
+        help=(
+            "Override the stored email checkpoint for a controlled replay "
+            "(e.g. after an email-parsing fix). Only affects --source email/all; "
+            "the checkpoint itself never moves backward regardless of this value."
+        ),
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "Bypass the market-data staleness gates: refresh earnings, dividends, "
+            "and quarterly financials for every owned ticker regardless of when "
+            "each was last fetched."
+        ),
+    )
+    parser.add_argument(
+        "--skip-market-data",
+        action="store_true",
+        help="Skip the market-data refresh stage entirely, for a fast ingest-only run.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1028,7 +1173,14 @@ def _run_pipeline_command(argv: list[str]) -> int:
     """Run the pipeline for canonical and legacy command forms."""
     args = parse_args(argv)
     try:
-        result = run_pipeline(args.source, args.data_folder, args.database)
+        result = run_pipeline(
+            args.source,
+            args.data_folder,
+            args.database,
+            args.email_date_from,
+            full=args.full,
+            skip_market_data=args.skip_market_data,
+        )
     except Exception:
         logger.exception("Pipeline startup failed")
         return 1
@@ -1151,19 +1303,21 @@ def _run_earnings_dividends_sync_command(argv: list[str]) -> int:
         help="Optionally limit synchronization to canonical or Yahoo symbols.",
     )
     parser.add_argument("--skip-earnings", action="store_true", help="Skip the earnings calendar sync.")
-    parser.add_argument("--skip-dividends", action="store_true", help="Skip the dividend schedule sync.")
+    parser.add_argument("--skip-dividends", action="store_true", help="Skip the historical dividend schedule sync.")
+    parser.add_argument("--skip-upcoming", action="store_true", help="Skip the upcoming ex-dividend forecast sync.")
     args = parser.parse_args(argv)
     result = sync_earnings_dividends(
         args.database,
         args.tickers,
         skip_earnings=args.skip_earnings,
         skip_dividends=args.skip_dividends,
+        skip_upcoming=args.skip_upcoming,
     )
     error_text = f" - {result.error}" if result.error else ""
     print(
         f"earnings-dividends: {'succeeded' if result.succeeded else 'failed'} "
         f"({result.earnings_rows} earnings row(s), {result.dividend_rows} dividend row(s), "
-        f"{result.tickers} ticker(s)){error_text}"
+        f"{result.upcoming_dividend_rows} upcoming dividend row(s), {result.tickers} ticker(s)){error_text}"
     )
     return 0 if result.succeeded else 1
 

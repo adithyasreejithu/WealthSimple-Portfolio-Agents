@@ -446,10 +446,22 @@ def _merge_singleton_table(
     return {"kept": "none", "dropped_loser_row": True}
 
 
+# Every table with a `FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)`
+# except `transactions` (handled separately by `_move_transactions`, since it
+# also participates in a ticker_id-inclusive UNIQUE constraint that needs the
+# same incoming-FK detach/restore dance). Verified against
+# `duckdb_constraints()` -- this list previously omitted `dividend_events`,
+# `earnings_events`, `financial_snapshots`, `position_ledger`,
+# `position_snapshots`, and `security_status`, which surfaced as a
+# foreign-key violation partway through a real rename (a non-transactional,
+# multi-step function -- see `_rename_ticker_symbol`'s docstring) once one of
+# the omitted tables actually had rows for the ticker being renamed.
 _TICKER_REFERENCING_TABLES = (
     "email_transactions", "activities", "staged_records",
     "historical_records", "ticker_provider_mappings", "stock_details",
     "etf_details", "portfolio_classifications", "ticker_symbol_history",
+    "dividend_events", "earnings_events", "financial_snapshots",
+    "position_ledger", "position_snapshots", "security_status",
 )
 
 

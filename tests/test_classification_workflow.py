@@ -86,6 +86,27 @@ class ClassificationWorkflowTest(unittest.TestCase):
         self.assertEqual(record["field_provenance"]["provisional_quantity"], "database")
         self.assertEqual(record["field_provenance"]["has_provisional_activity"], "derived")
 
+    def test_usd_holding_market_value_and_gain_are_fx_converted_to_cad(self):
+        """Regression: `historical_records.close` is in the listing currency,
+        but `position_snapshots.book_value_cad` is always CAD. Without
+        converting the close to CAD first, a USD holding's
+        position_market_value/current_weight_percent/unrealized_gain_loss_percent
+        come out wrong by roughly the USD/CAD rate."""
+        connection = duckdb.connect(str(self.db_path))
+        ticker_id = connection.execute("SELECT ticker_id FROM tickers").fetchone()[0]
+        connection.execute(
+            "INSERT INTO transactions (transaction_date, transaction_type, ticker_id, quantity, "
+            "execution_date, debit, fx_rate) VALUES (?, 'BUY', ?, 1, ?, 1.30, 1.30)",
+            [date(2025, 1, 5), ticker_id, date(2025, 1, 5)],
+        )
+        position_engine.recompute_positions(connection)
+        connection.close()
+
+        record = workflow.read_classification_data(self.db_path)[0]
+        # quantity=3 (2 from setUp + 1 here), close=123 USD, fx=1.30 CAD/USD.
+        self.assertAlmostEqual(record["position_market_value"], 3 * 123 * 1.30)
+        self.assertNotAlmostEqual(record["position_market_value"], 3 * 123)
+
     def test_stale_positions_raise_actionable_error(self):
         connection = duckdb.connect(str(self.db_path))
         ticker_id = connection.execute("SELECT ticker_id FROM tickers").fetchone()[0]

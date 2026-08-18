@@ -4,6 +4,7 @@ import tempfile
 import types
 import unittest
 from contextlib import redirect_stdout
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -68,10 +69,7 @@ class AppPipelineTest(unittest.TestCase):
         with (
             patch.object(app, "extract_statement_pdf", return_value=empty_statement),
             patch.object(app, "fetch_email_transactions", return_value=empty_email),
-            patch.object(
-                app, "_run_portfolio_classification",
-                return_value=app.SourceResult("classification", None, "succeeded", 0),
-            ),
+            patch.object(app, "_run_market_data_refresh", return_value=[]),
         ):
             result = app.run_pipeline("all", self.data_dir, self.data_dir / "db.duckdb")
 
@@ -81,7 +79,11 @@ class AppPipelineTest(unittest.TestCase):
         self.assertEqual(staged_order, ["statement", "email", "export"])
         self.assertTrue(result.succeeded)
 
-    def test_email_pipeline_syncs_market_data_after_publication(self):
+    def test_pipeline_refreshes_market_data_after_batch_completion(self):
+        """Market-data refresh is a post-ingestion tail stage, not part of the
+        email branch -- it runs once, after `complete_batch`, regardless of
+        which sources staged anything (see `run_pipeline`'s docstring).
+        """
         events = []
         email_data = pd.DataFrame(columns=[
             "account", "transaction", "ticker_id", "ticker", "quantity", "avg_price",
@@ -102,34 +104,43 @@ class AppPipelineTest(unittest.TestCase):
             patch.object(
                 app,
                 "sync_market_data",
-                side_effect=lambda *_: events.append("market") or MarketSyncResult(1, 2),
+                side_effect=lambda *a, **k: events.append("market") or MarketSyncResult(1, 2),
             ) as sync,
-            patch.object(
-                app, "_run_portfolio_classification",
-                return_value=app.SourceResult("classification", None, "succeeded", 0),
-            ),
+            patch.object(app, "get_market_targets", return_value=[]),
         ):
             result = app.run_pipeline("all", self.data_dir, self.data_dir / "db.duckdb")
 
-        self.assertEqual(events, ["email", "market", "batch"])
-        sync.assert_called_once_with(self.data_dir / "db.duckdb")
-        self.assertEqual(result.results[-2], app.SourceResult("email", None, "succeeded", 0))
-        self.assertEqual(result.results[-1], app.SourceResult("classification", None, "succeeded", 0))
+        self.assertEqual(events, ["email", "batch", "market"])
+        sync.assert_called_once_with(self.data_dir / "db.duckdb", as_of=None, full=False)
+        by_source = {r.source: r for r in result.results}
+        self.assertEqual(by_source["email"], app.SourceResult("email", None, "succeeded", 0))
+        self.assertEqual(by_source["market-data"], app.SourceResult("market-data", None, "succeeded", 2))
+        self.assertEqual(by_source["earnings-dividends"].status, "skipped")
+        self.assertEqual(by_source["financial-snapshots"].status, "skipped")
+        self.assertNotIn("classification", by_source)
 
-    def test_source_specific_pipeline_does_not_sync_market_data(self):
+    def test_source_specific_pipeline_still_refreshes_market_data(self):
+        """The refresh stage is orthogonal to which ingestion source ran --
+        a `--source statements` run still refreshes prices/earnings/dividends/
+        financials for every currently owned ticker (see run_pipeline's
+        docstring: the pipeline pulls everything stored locally)."""
         with (
             patch.object(app, "initialize_database"),
             patch.object(app, "create_batch", return_value=7),
             patch.object(app, "_stage_statement_files", return_value=([], 1, [])),
             patch.object(app, "complete_batch"),
             patch.object(app, "ensure_positions_fresh"),
-            patch.object(app, "sync_market_data") as sync,
+            patch.object(app, "sync_market_data", return_value=MarketSyncResult(0, 0)) as sync,
+            patch.object(app, "get_market_targets", return_value=[]),
         ):
             app.run_pipeline("statements", self.data_dir, self.data_dir / "db.duckdb")
 
-        sync.assert_not_called()
+        sync.assert_called_once()
 
-    def test_failed_ingestion_does_not_sync_market_data(self):
+    def test_failed_ingestion_still_refreshes_market_data(self):
+        """A failed statement publish should not block refreshing market data
+        for tickers unrelated to that failure -- only the pipeline result's
+        overall success reflects the ingestion failure."""
         failed = app.SourceResult("statement", None, "failed", error="bad statement")
         with (
             patch.object(app, "initialize_database"),
@@ -139,29 +150,73 @@ class AppPipelineTest(unittest.TestCase):
             patch.object(app, "_stage_export_files", return_value=([], 3, [])),
             patch.object(app, "complete_batch"),
             patch.object(app, "ensure_positions_fresh"),
-            patch.object(app, "sync_market_data") as sync,
-            patch.object(
-                app, "_run_portfolio_classification",
-                return_value=app.SourceResult("classification", None, "succeeded", 0),
-            ),
+            patch.object(app, "sync_market_data", return_value=MarketSyncResult(0, 0)) as sync,
+            patch.object(app, "get_market_targets", return_value=[]),
         ):
             result = app.run_pipeline("all", self.data_dir, self.data_dir / "db.duckdb")
 
-        sync.assert_not_called()
+        sync.assert_called_once()
         self.assertFalse(result.succeeded)
 
-    def test_full_pipeline_skips_classification_for_partial_source(self):
+    def test_pipeline_never_runs_classification(self):
+        """Classification is its own command (`classify`), never part of
+        `pipeline` for any --source value -- see run_pipeline's docstring."""
         with (
             patch.object(app, "initialize_database"),
             patch.object(app, "create_batch", return_value=7),
             patch.object(app, "_stage_statement_files", return_value=([], 1, [])),
             patch.object(app, "complete_batch"),
             patch.object(app, "ensure_positions_fresh"),
+            patch.object(app, "sync_market_data", return_value=MarketSyncResult(0, 0)),
+            patch.object(app, "get_market_targets", return_value=[]),
             patch.object(app, "_run_portfolio_classification") as classify,
         ):
-            app.run_pipeline("statements", self.data_dir, self.data_dir / "db.duckdb")
+            result = app.run_pipeline("statements", self.data_dir, self.data_dir / "db.duckdb")
 
         classify.assert_not_called()
+        self.assertNotIn("classification", {r.source for r in result.results})
+
+    def test_pipeline_full_flag_bypasses_staleness_gates(self):
+        with (
+            patch.object(app, "initialize_database"),
+            patch.object(app, "create_batch", return_value=7),
+            patch.object(app, "_stage_statement_files", return_value=([], 1, [])),
+            patch.object(app, "complete_batch"),
+            patch.object(app, "ensure_positions_fresh"),
+            patch.object(app, "sync_market_data", return_value=MarketSyncResult(0, 0)) as sync,
+            patch.object(app, "get_market_targets", return_value=[]),
+            patch.object(
+                app, "sync_earnings_dividends",
+                return_value=EarningsDividendsSyncResult(0, 0, 0),
+            ) as ed_sync,
+            patch.object(
+                app, "sync_financial_snapshots",
+                return_value=FinancialSnapshotsSyncResult(0, 0),
+            ) as fs_sync,
+        ):
+            app.run_pipeline("statements", self.data_dir, self.data_dir / "db.duckdb", full=True)
+
+        sync.assert_called_once_with(self.data_dir / "db.duckdb", as_of=None, full=True)
+        # full=True bypasses the gates entirely (symbols=None), even with no owned tickers.
+        ed_sync.assert_called_once_with(self.data_dir / "db.duckdb", None)
+        fs_sync.assert_called_once_with(self.data_dir / "db.duckdb", None)
+
+    def test_pipeline_skip_market_data_flag_skips_the_whole_stage(self):
+        with (
+            patch.object(app, "initialize_database"),
+            patch.object(app, "create_batch", return_value=7),
+            patch.object(app, "_stage_statement_files", return_value=([], 1, [])),
+            patch.object(app, "complete_batch"),
+            patch.object(app, "ensure_positions_fresh"),
+            patch.object(app, "sync_market_data") as sync,
+        ):
+            result = app.run_pipeline(
+                "statements", self.data_dir, self.data_dir / "db.duckdb", skip_market_data=True
+            )
+
+        sync.assert_not_called()
+        by_source = {r.source: r for r in result.results}
+        self.assertEqual(by_source["market-data"].status, "skipped")
 
     def test_run_portfolio_classification_persists_and_reports_rows(self):
         fake_module = types.ModuleType("classification_workflow")
@@ -239,6 +294,98 @@ class AppPipelineTest(unittest.TestCase):
             output = app.main(["classify"])
 
         self.assertEqual(output, 1)
+
+    def test_market_data_refresh_gates_earnings_dividends_and_financial_snapshots(self):
+        """Only symbols due for refresh (per stale_*_symbols) are passed through;
+        a domain with nothing due is skipped without calling its sync function."""
+        targets_sentinel = object()
+        with (
+            patch.object(app, "sync_market_data", return_value=MarketSyncResult(2, 5)) as market_sync,
+            patch.object(app, "get_market_targets", return_value=targets_sentinel) as targets,
+            patch.object(app, "stale_earnings_symbols", return_value=["AAPL"]),
+            patch.object(app, "stale_dividend_symbols", return_value=["ENB"]),
+            patch.object(app, "stale_financial_snapshot_symbols", return_value=[]),
+            patch.object(
+                app, "sync_earnings_dividends",
+                return_value=EarningsDividendsSyncResult(2, 3, 1, upcoming_dividend_rows=1),
+            ) as ed_sync,
+            patch.object(app, "sync_financial_snapshots") as fs_sync,
+        ):
+            results = app._run_market_data_refresh(self.data_dir / "db.duckdb")
+
+        market_sync.assert_called_once_with(self.data_dir / "db.duckdb", as_of=None, full=False)
+        targets.assert_called_once_with(self.data_dir / "db.duckdb")
+        ed_sync.assert_called_once_with(self.data_dir / "db.duckdb", ["AAPL", "ENB"])
+        fs_sync.assert_not_called()
+        by_source = {r.source: r for r in results}
+        self.assertEqual(by_source["market-data"], app.SourceResult("market-data", None, "succeeded", 5))
+        self.assertEqual(by_source["earnings-dividends"], app.SourceResult("earnings-dividends", None, "succeeded", 5))
+        self.assertEqual(by_source["financial-snapshots"], app.SourceResult("financial-snapshots", None, "skipped"))
+
+    def test_market_data_refresh_never_widens_to_research_tickers(self):
+        """The pipeline's refresh stage stays owned-only after `market_data.
+        get_market_targets` grew an `include_research` widening for the
+        investment-analyst-resources skill's on-demand research path --
+        `_run_market_data_refresh` must never pass it (or any other new
+        kwarg) through to `sync_market_data`/`sync_earnings_dividends`/
+        `sync_financial_snapshots`, so a declared-wishlist ticker is never
+        pulled into a routine `pipeline` run."""
+        with (
+            patch.object(app, "sync_market_data", return_value=MarketSyncResult(0, 0)) as market_sync,
+            patch.object(app, "get_market_targets", return_value=[]),
+            patch.object(app, "stale_earnings_symbols", return_value=[]),
+            patch.object(app, "stale_dividend_symbols", return_value=[]),
+            patch.object(app, "stale_financial_snapshot_symbols", return_value=[]),
+        ):
+            app._run_market_data_refresh(self.data_dir / "db.duckdb")
+
+        market_sync.assert_called_once_with(self.data_dir / "db.duckdb", as_of=None, full=False)
+
+    def test_market_data_refresh_skip_flag_produces_single_skipped_result(self):
+        with patch.object(app, "sync_market_data") as market_sync:
+            results = app._run_market_data_refresh(self.data_dir / "db.duckdb", skip=True)
+
+        market_sync.assert_not_called()
+        self.assertEqual(results, [app.SourceResult("market-data", None, "skipped")])
+
+    def test_market_data_refresh_reports_degraded_when_some_symbols_fail(self):
+        """A thin/newly-listed ticker with an isolated fetch gap (e.g. no
+        history before its actual listing date) must not read the same as a
+        genuinely broken sync -- the domain is `degraded`, not `failed`, so
+        it doesn't fail the whole pipeline/dashboard job."""
+        with (
+            patch.object(
+                app, "sync_market_data",
+                return_value=MarketSyncResult(3, 2, error="history fetch failed for: XNDU", failed_symbols=("XNDU",)),
+            ),
+            patch.object(app, "get_market_targets", return_value=[]),
+            patch.object(app, "stale_earnings_symbols", return_value=[]),
+            patch.object(app, "stale_dividend_symbols", return_value=[]),
+            patch.object(app, "stale_financial_snapshot_symbols", return_value=[]),
+        ):
+            results = app._run_market_data_refresh(self.data_dir / "db.duckdb")
+
+        by_source = {r.source: r for r in results}
+        market_data_result = by_source["market-data"]
+        self.assertEqual(market_data_result.status, "degraded")
+        self.assertEqual(market_data_result.rows, 2)
+        self.assertEqual(market_data_result.error, "history fetch failed for: XNDU")
+
+    def test_market_data_refresh_reports_failed_when_every_symbol_fails(self):
+        with (
+            patch.object(
+                app, "sync_market_data",
+                return_value=MarketSyncResult(2, 0, error="history fetch failed for: A, B", failed_symbols=("A", "B")),
+            ),
+            patch.object(app, "get_market_targets", return_value=[]),
+            patch.object(app, "stale_earnings_symbols", return_value=[]),
+            patch.object(app, "stale_dividend_symbols", return_value=[]),
+            patch.object(app, "stale_financial_snapshot_symbols", return_value=[]),
+        ):
+            results = app._run_market_data_refresh(self.data_dir / "db.duckdb")
+
+        by_source = {r.source: r for r in results}
+        self.assertEqual(by_source["market-data"].status, "failed")
 
     def test_analytics_command_prints_report(self):
         report = {
@@ -323,7 +470,30 @@ class AppPipelineTest(unittest.TestCase):
 
         self.assertEqual(output, 0)
         run_pipeline.assert_called_once_with(
-            "email", self.data_dir, self.data_dir / "db.duckdb"
+            "email", self.data_dir, self.data_dir / "db.duckdb", None,
+            full=False, skip_market_data=False,
+        )
+
+    def test_pipeline_subcommand_forwards_email_date_from_override(self):
+        result = app.PipelineResult((app.SourceResult("email", None, "skipped"),))
+
+        with patch.object(app, "run_pipeline", return_value=result) as run_pipeline:
+            output = app.main([
+                "pipeline",
+                "--source",
+                "email",
+                "--data-folder",
+                str(self.data_dir),
+                "--database",
+                str(self.data_dir / "db.duckdb"),
+                "--email-date-from",
+                "2026-08-05",
+            ])
+
+        self.assertEqual(output, 0)
+        run_pipeline.assert_called_once_with(
+            "email", self.data_dir, self.data_dir / "db.duckdb", date(2026, 8, 5),
+            full=False, skip_market_data=False,
         )
 
     def test_resolve_tickers_with_no_pending_skips_retry(self):
@@ -424,6 +594,7 @@ class AppPipelineTest(unittest.TestCase):
         printed = "".join(call.args[0] for call in write.call_args_list)
         for command in (
             "pipeline",
+            "classify",
             "analytics",
             "statements",
             "email",
@@ -482,7 +653,7 @@ class AppPipelineTest(unittest.TestCase):
         self.assertEqual(output, 0)
         sync.assert_called_once_with(
             self.data_dir / "db.duckdb", ["AAPL", "VFV.TO"],
-            skip_earnings=False, skip_dividends=False,
+            skip_earnings=False, skip_dividends=False, skip_upcoming=False,
         )
 
     def test_earnings_dividends_sync_skip_flags_are_forwarded(self):
@@ -492,7 +663,17 @@ class AppPipelineTest(unittest.TestCase):
 
         self.assertEqual(output, 0)
         sync.assert_called_once_with(
-            app.DATABASE_PATH, None, skip_earnings=True, skip_dividends=False,
+            app.DATABASE_PATH, None, skip_earnings=True, skip_dividends=False, skip_upcoming=False,
+        )
+
+    def test_earnings_dividends_sync_skip_upcoming_flag_is_forwarded(self):
+        expected = EarningsDividendsSyncResult(1, 5, 3, upcoming_dividend_rows=0)
+        with patch.object(app, "sync_earnings_dividends", return_value=expected) as sync:
+            output = app.main(["earnings-dividends-sync", "--skip-upcoming"])
+
+        self.assertEqual(output, 0)
+        sync.assert_called_once_with(
+            app.DATABASE_PATH, None, skip_earnings=False, skip_dividends=False, skip_upcoming=True,
         )
 
     def test_earnings_dividends_sync_failure_returns_nonzero(self):
@@ -585,6 +766,69 @@ class AppPipelineTest(unittest.TestCase):
 
         self.assertEqual(ok_output, 0)
         self.assertEqual(mismatch_output, 1)
+
+
+class DomainStatusTest(unittest.TestCase):
+    """`_domain_status` distinguishes an isolated, expected per-symbol gap
+    (a thin/newly-listed ticker, a fund with no earnings/fundamentals) from a
+    genuinely broken sync, across all three market-data sync result types."""
+
+    def test_no_failures_is_succeeded(self):
+        self.assertEqual(app._domain_status(MarketSyncResult(5, 5)), "succeeded")
+
+    def test_some_symbols_failed_is_degraded(self):
+        result = MarketSyncResult(5, 4, error="history fetch failed for: X", failed_symbols=("X",))
+        self.assertEqual(app._domain_status(result), "degraded")
+
+    def test_every_symbol_failed_is_failed(self):
+        result = MarketSyncResult(2, 0, error="history fetch failed for: A, B", failed_symbols=("A", "B"))
+        self.assertEqual(app._domain_status(result), "failed")
+
+    def test_write_rollback_marks_every_target_failed_and_is_failed(self):
+        """A rolled-back write leaves every target in `failed_symbols` with
+        zero rows (see sync_market_data's rollback path) -- this must still
+        be `failed`, not `degraded`, since nothing was actually persisted."""
+        result = MarketSyncResult(3, 0, error="bad row", failed_symbols=("A", "B", "C"))
+        self.assertEqual(app._domain_status(result), "failed")
+
+    def test_total_fetch_failure_with_no_targets_processed_is_failed(self):
+        result = EarningsDividendsSyncResult(2, 0, 0, error="provider failed", failed_symbols=("A", "B"))
+        self.assertEqual(app._domain_status(result), "failed")
+
+    def test_partial_earnings_dividends_failure_is_degraded(self):
+        result = EarningsDividendsSyncResult(3, 2, 1, error="fetch failed for: C", failed_symbols=("C",))
+        self.assertEqual(app._domain_status(result), "degraded")
+
+    def test_partial_financial_snapshots_failure_is_degraded(self):
+        result = FinancialSnapshotsSyncResult(4, 3, error="fetch failed for: LYTE", failed_symbols=("LYTE",))
+        self.assertEqual(app._domain_status(result), "degraded")
+
+    def test_every_financial_snapshots_symbol_failed_is_failed(self):
+        result = FinancialSnapshotsSyncResult(1, 0, error="provider failed", failed_symbols=("A",))
+        self.assertEqual(app._domain_status(result), "failed")
+
+
+class PipelineResultSucceededTest(unittest.TestCase):
+    """`PipelineResult.succeeded` drives the CLI exit code and (via
+    dashboard/api/main.py's `_run_cli`) the dashboard job status, so a
+    `degraded` domain must not fail the whole pipeline while a genuinely
+    `failed` one still must."""
+
+    def test_degraded_alongside_succeeded_and_skipped_still_succeeds(self):
+        result = app.PipelineResult((
+            app.SourceResult("email", None, "succeeded", 3),
+            app.SourceResult("market-data", None, "degraded", 5, "history fetch failed for: XNDU"),
+            app.SourceResult("financial-snapshots", None, "skipped"),
+        ))
+        self.assertTrue(result.succeeded)
+
+    def test_any_failed_result_still_fails_the_pipeline(self):
+        result = app.PipelineResult((
+            app.SourceResult("email", None, "succeeded", 3),
+            app.SourceResult("market-data", None, "degraded", 5, "history fetch failed for: XNDU"),
+            app.SourceResult("statement", None, "failed", error="unresolved ticker(s): FOO"),
+        ))
+        self.assertFalse(result.succeeded)
 
 
 class RetryQuarantinedExportsTest(unittest.TestCase):

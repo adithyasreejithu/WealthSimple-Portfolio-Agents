@@ -69,6 +69,28 @@ class StagingTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row, (cad_id, "CAD", "email_price_currency"))
 
+    def test_email_trade_with_weak_currency_evidence_does_not_reuse_mismatched_ticker(self):
+        """Regression: a research-only USD ticker created ahead of any purchase
+        must not silently absorb a later email-sourced trade whose inferred
+        listing currency contradicts it -- that must land as unresolved
+        (pending confirmation) instead, unlike the statement-sourced case
+        where FX-rate evidence is definitive."""
+        self._ticker("NVDU", "NASDAQGM", "USD", "Direxion Daily Nvda Bull 2X Shares")
+        batch = staging.create_batch(self.db_path)
+        staged_file = staging.stage_dataframe(batch, "email", None, 1, pd.DataFrame([{
+            "date": "2025-04-01", "transaction": "Limit Buy", "ticker": "NVDU",
+            "quantity": "3", "price_currency": "",
+        }]), self.db_path)
+
+        staging.resolve_batch(batch, self.db_path)
+
+        row = database.get_shared_connection(self.db_path).execute(
+            "SELECT ticker_id, resolution_status, resolution_method, inferred_listing_currency "
+            "FROM staged_records WHERE staged_file_id = ?",
+            [staged_file],
+        ).fetchone()
+        self.assertEqual(row, (None, "unresolved", "unresolved", "CAD"))
+
     def test_resolution_uses_ticker_table_and_ignores_symbol_history(self):
         ticker_id = self._ticker("SPLG", "NYSE", "USD", "State Street SPDR Portfolio S&P 500 ETF")
         other_ticker_id = self._ticker("SPYM", "NYSE", "USD", "State Street SPDR Portfolio S&P 500 ETF")

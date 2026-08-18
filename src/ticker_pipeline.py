@@ -141,7 +141,19 @@ def resolve_or_enrich_ticker(
             "existing_ticker",
             False,
         )
-    if source_type != "email_currency" and len(candidates) == 1:
+    # Accepting a sole existing candidate whose currency *contradicts* the
+    # inferred listing currency is only safe when that inference came from a
+    # statement's explicit FX-rate column -- hard evidence. For weaker
+    # evidence (an email/export row, or no FX signal at all) this used to
+    # silently reuse whatever ticker already happened to exist under this
+    # base symbol, even a research-only placeholder created for a different
+    # listing entirely (observed: NVDU's US-listed Direxion research ticker,
+    # created ahead of any purchase, silently absorbed a later real purchase
+    # of the CAD-listed NVDU because it was the only existing candidate).
+    # Falling through here instead routes to the `unresolved` branch below,
+    # which lands the symbol in the pending-ticker queue for a human to
+    # confirm, rather than guessing.
+    if source_type == "statement" and len(candidates) == 1:
         return ResolutionResult(
             candidates[0]["ticker_id"],
             base_symbol,

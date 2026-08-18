@@ -27,11 +27,14 @@ the locked environment automatically when you run `uv run` commands.
 
 ## Pipeline
 
-Run every source through the staged pipeline:
+Run every source through the staged pipeline, then refresh every locally
+stored market-data domain for every currently owned ticker:
 
 ```powershell
 uv run python src/app.py pipeline
 uv run python src/app.py pipeline --source statements --data-folder Data --database Data/PRD_WealthSimple.duckdb
+uv run python src/app.py pipeline --full
+uv run python src/app.py pipeline --skip-market-data
 ```
 
 Options:
@@ -40,20 +43,76 @@ Options:
 - `--data-folder PATH` selects the input folder; default: repository `Data/`.
 - `--database PATH` selects the DuckDB database; default: `DB_PATH` or the
   configured production database.
+- `--email-date-from YYYY-MM-DD` overrides the stored email checkpoint for
+  one controlled replay (only affects `--source email`/`all`) — for example,
+  after fixing an `email_extractor.py` parsing gap, to reparse messages the
+  mailbox already delivered without waiting for new mail. Existing
+  `email_transactions` rows are enriched in place rather than duplicated, but
+  only while still unmatched and provisional; a row a reconciliation pass
+  already linked to an activity/statement is never rewritten (see
+  "Reconciliation Passes" in `docs/architecture/ingestion_and_reconciliation.md`).
+  The stored checkpoint itself never moves backward regardless of the date
+  passed here.
+- `--full` bypasses the market-data staleness gates below, refreshing
+  earnings, dividends, and quarterly financials for every owned ticker
+  regardless of when each was last fetched.
+- `--skip-market-data` skips the market-data refresh stage entirely, for a
+  fast ingest-only run.
 
 The legacy form `uv run python src/app.py --source all` remains supported.
 
-A full (`--source all`, the default) run also classifies current holdings and
-persists the result as its final step — the same work `portfolio-classify` +
-`classification-sync` do (see "Portfolio Classification" below), run
-automatically so a routine pipeline run always reflects current
-classifications without a separate manual step. It prints as one more
-`classification: succeeded/failed (N row(s))` line in the results. A
-classification failure (e.g. a transient yfinance error) never rolls back
-ingestion that already completed, matching how a market-data sync failure is
-handled — it only affects the reported exit code, the same way a `partial`
-email result already does. Partial-source runs (`--source
-export/statements/email`) never trigger it.
+**Running while the dashboard API is up.** DuckDB allows only one read-write
+connection per database file, and the dashboard API (`dashboard/api/main.py`)
+holds one for as long as it has served at least one request. Running
+`pipeline` (or any other write command) directly from a terminal while the
+dashboard is up therefore fails to acquire the lock; the error names the
+dashboard API as the likely cause and points at the fix (stop the API, or use
+its Refresh button, which releases its own connection before running the
+pipeline for you).
+
+**Market-data refresh stage.** After ingestion (`ensure_positions_fresh` +
+`complete_batch`), every `pipeline` run — regardless of `--source` — refreshes
+every market-data domain the database stores locally, for every currently
+owned ticker:
+
+| Domain | Table | Refresh cadence |
+| --- | --- | --- |
+| Prices, FX, benchmark, ticker metadata | `historical_records`, `tickers`, `stock_details`, `etf_details` | every run (already incremental from the last stored date) |
+| Earnings calendar | `earnings_events` | staleness-gated, 1 day |
+| Dividend schedule (historical + upcoming) | `dividend_events` | staleness-gated, 7 days |
+| Quarterly financials | `financial_snapshots` | staleness-gated, 30 days |
+
+The staleness gates (`config.py`'s `EARNINGS_REFRESH_INTERVAL_DAYS`,
+`DIVIDENDS_REFRESH_INTERVAL_DAYS`, `FINANCIAL_SNAPSHOTS_REFRESH_INTERVAL_DAYS`)
+keep a routine run fast by only refreshing a ticker whose domain has gone
+stale, instead of re-fetching all three heavier domains for every owned
+ticker on every run. A ticker with no row yet in a domain's table counts as
+stale (never fetched) — except the earnings and financial-snapshots gates
+exclude ETFs, since yfinance structurally never returns an earnings date or
+quarterly statement for a fund, so an ETF's row count there would otherwise
+stay permanently zero and the gate would re-fetch it forever
+(`market_data.MarketTarget.asset_class`, from `tickers.security_type`). The
+dividend gate has no equivalent exclusion — whether an individual stock pays
+a dividend isn't knowable statically, so a non-dividend-paying stock is
+re-fetched every run; this is a bounded number of extra yfinance calls, not
+a correctness issue. Each domain reports its own
+`succeeded`/`degraded`/`failed`/`skipped` result line (`market-data`,
+`earnings-dividends`, `financial-snapshots`); a failure in one domain never
+blocks the others or rolls back ingestion that already completed, matching
+how a market-data sync failure was already handled. **Classification is not
+part of `pipeline`** — see "Portfolio Classification" below.
+
+**`degraded` vs `failed`.** Each of these three sync functions already
+isolates failures per symbol — one thin, newly-listed, or fund-type ticker
+having no fundamentals/earnings/full price history never blocks the rest
+from fetching and writing normally. `degraded` reports that expected,
+isolated condition (some requested symbols had a gap, everything else wrote
+through); it still lists the affected symbols and the reason in the result
+line, but does **not** fail the overall `pipeline` exit code or the
+dashboard's "Run Data Pipeline" job. `failed` is reserved for a domain where
+*nothing* usable came out of it — every requested symbol failed, or the
+database write itself rolled back — and does fail the pipeline, exactly as
+before. See `src/app.py`'s `_domain_status` for the exact classification.
 
 ## Analytics
 
@@ -128,6 +187,12 @@ uv run python src/app.py pipeline --source email
 The database pipeline is incremental and deduplicates messages by message ID. Known
 tickers publish immediately. Unknown tickers are retained as pending while unrelated
 trades continue to publish; a pending run exits nonzero and prints the required action.
+
+To replay a past date range against a mailbox the parser previously read incompletely
+(rather than waiting for new mail), use `pipeline`'s `--email-date-from` (see
+"Pipeline" above) instead of this command's own `--date-from` — the pipeline form
+persists the replay's results and enriches existing rows in place, while this
+extractor-only command just prints/exports what it read.
 
 ## YFinance
 
@@ -208,13 +273,23 @@ uv run python src/app.py earnings-dividends --tickers CDZ.TO --skip-earnings
 
 - `--tickers SYMBOL [SYMBOL ...]` is required; pass Yahoo provider symbols.
 - `--skip-earnings` omits the earnings calendar fetch.
-- `--skip-dividends` omits the dividend schedule fetch (skipping both is rejected).
+- `--skip-dividends` omits the historical dividend schedule fetch.
+- `--skip-upcoming` omits the upcoming ex-dividend forecast fetch (skipping
+  all three is rejected).
 - `--cache-dir PATH` selects the yfinance cache.
 - `--ignore-proxy` clears proxy environment variables for the run.
 - This is an ad-hoc fetch-and-print command; it does not write to the database.
 - ETF/fund tickers legitimately return no earnings events (yfinance prints a
   misleading "No earnings dates found" message but raises no error); that is a
-  normal outcome, not a failure.
+  normal outcome, not a failure. The same applies to the upcoming-dividend
+  fetch: yfinance's `calendar` is commonly empty for ETFs, funds, and smaller
+  names.
+- The upcoming-dividend fetch reports at most the *next* scheduled
+  ex-dividend/pay date per ticker (yfinance does not expose a full forward
+  calendar). Its declared amount is **projected** from the issuer's most
+  recent historical per-payment amount, not a newly declared figure, and its
+  frequency is inferred from the spacing between the last several ex-dates —
+  present this as expected, not confirmed, income.
 
 ### Database synchronization
 
@@ -222,23 +297,40 @@ uv run python src/app.py earnings-dividends --tickers CDZ.TO --skip-earnings
 uv run python src/app.py earnings-dividends-sync
 uv run python src/app.py earnings-dividends-sync --database Data/PRD_WealthSimple.duckdb --tickers AAPL VFV.TO
 uv run python src/app.py earnings-dividends-sync --skip-dividends
+uv run python src/app.py earnings-dividends-sync --skip-upcoming
 ```
 
 - `--database PATH` selects the DuckDB database.
 - `--tickers SYMBOL [SYMBOL ...]` optionally limits the run by canonical or
   Yahoo provider symbol. Scope is otherwise the same owned + verified-Yahoo-mapping
   ticker set as `yfinance-sync`.
-- `--skip-earnings` / `--skip-dividends` limit the sync to one data type.
+- `--skip-earnings` / `--skip-dividends` / `--skip-upcoming` limit the sync to
+  the remaining data types.
 - Unlike OHLCV history, this is **not** date-windowed: every run re-fetches each
   ticker's full available earnings/dividend window and reconciles it against
-  stored data. Dividends upsert on `(ticker_id, ex_dividend_date)`. Earnings
+  stored data. Dividends (historical and upcoming) upsert on
+  `(ticker_id, ex_dividend_date)` in the same `dividend_events` table. Earnings
   upsert on `(ticker_id, report_date)`, and before each ticker's batch is
   inserted, still-unreported future rows (`report_date >= CURRENT_DATE AND
   eps_actual IS NULL`) are deleted so an abandoned/revised speculative date is
   retired; confirmed past rows are never deleted. `Surprise(%)` is stored as
   returned (already in percentage points).
+- The upcoming-dividend sync follows the same retire-then-upsert pattern: for
+  each synced ticker, existing still-future rows
+  (`ex_dividend_date >= CURRENT_DATE`) are deleted before the fresh forecast is
+  written, so a forecast that has since moved or been withdrawn does not
+  linger. Historical rows (`ex_dividend_date` in the past) are never touched by
+  this step, and a later historical re-sync of the same ex-date cannot clobber
+  the `pay_date`/`frequency` the upcoming sync wrote.
+- All three fetches (earnings, historical dividends, upcoming dividends) write
+  in the **same transaction**, so a partial sync can never leave one table
+  updated and another stale relative to it.
 - This sync is **not** auto-triggered by the pipeline (unlike `yfinance-sync`);
-  run it on demand before a knowledge-base pass or dashboard refresh.
+  run it on demand before a knowledge-base pass or dashboard refresh. The
+  dashboard's "Upcoming income" panel on the Income tab and its Refresh action
+  both depend on this: Refresh runs the ingestion pipeline only, not this sync
+  (see `docs/architecture/dashboard_api.md`), so the panel reflects whenever
+  this command was last run manually, not the dashboard's own refresh cycle.
 - The command exits nonzero when fetching or database publication fails.
 
 ## Financial Snapshots
@@ -445,9 +537,11 @@ every ticker declared `wishlist` (`database status --set wishlist`) and
 persists the result into the `portfolio_classifications` table in one step —
 the classification workflow's read-only pass (approved YAML rules, ephemeral
 allowlisted yfinance enrichment) followed by the sync. Each row's
-`fields.ownership_status` is `"owned"` or `"wishlist"`. Run it explicitly
-whenever holdings change outside a full pipeline run, e.g. after resolving a
-new ticker or after declaring/clearing a wishlist ticker.
+`fields.ownership_status` is `"owned"` or `"wishlist"`. **Classification is
+never triggered automatically by `pipeline`** — run `classify` explicitly
+whenever holdings change, e.g. after resolving a new ticker (the dashboard's
+resolve-ticker action already chains this; the CLI does not), or after
+declaring/clearing a wishlist ticker.
 
 - `--database PATH` selects the DuckDB database.
 
@@ -476,10 +570,7 @@ before this widening existed at all), which would otherwise silently erase
 that ticker's classification. Run `classify` (or `portfolio-classify`) again
 to regenerate a current export. `--input PATH` selects the JSON file to sync,
 defaulting to the same path `portfolio-classify` writes to when `--output` is
-omitted; `--database PATH` selects the DuckDB database. (A full `pipeline`
-run also classifies current holdings automatically as its final step — see
-"Pipeline" above — but these standalone commands remain independent for ad
-hoc use.)
+omitted; `--database PATH` selects the DuckDB database.
 
 See `docs/agents/portfolio-classifier/architecture.md` for the full workflow
 design and the `classify-portfolio` skill for the underlying scripts.
@@ -749,6 +840,53 @@ analyst's cache must survive for the portfolio-manager stage that follows in
 the same run. A run shared by a ticker fan-out has one status for the whole
 run — do not set a terminal status until every ticker has finished, or the
 first to finish purges cache the others still need.
+
+### `run log-event`
+
+Appends one free-form event to the run's `audit_log.jsonl` — the same
+append-only file `register-evidence`/`save-thesis`/`save-decision`/etc.
+already write to, but for an action none of those subcommands cover. Exists
+for an orchestrating agent (`investment-orchestrator`, `kb-orchestrator`) to
+record its own steps — a preflight check result, which stage it dispatched,
+its final report — into the run it is coordinating, so the run's audit
+history is not missing everything that happened outside a specialist
+subagent's own writes.
+
+- `--run-id RUN_ID` (required)
+- `--event NAME` (required) — short event name. No enforced enum, but every
+  existing producer in `src/workspace/` follows the same terse,
+  snake_case `<noun>_<past-tense-verb>` shape (`run_created`,
+  `manifest_built`, `cache_purged`, `pm_drafted`, `evidence_registered`) —
+  match it rather than inventing a longer or differently-shaped name, so a
+  reader scanning `audit_log.jsonl` months later (or `grep`-ing across many
+  runs) sees a small, consistent vocabulary instead of one-off phrasing per
+  caller. `investment-orchestrator`'s own six events
+  (`preflight_passed`, `analyst_dispatched`, `analyst_completed`,
+  `pm_dispatched`, `pm_completed`, `orchestration_completed` — see
+  `docs/agents/investment-orchestrator/architecture.md`'s "Audit trail"
+  table) are the reference example of this convention applied to a new
+  producer.
+- `--actor NAME` (required) — who performed this action, e.g.
+  `investment-orchestrator`.
+- `--status STATUS` (default `success`) — free text, e.g. `success`,
+  `failure`, `skipped`.
+- `--details JSON` — a JSON object of extra structured detail (rejected if it
+  is not an object).
+- `--artifact PATH` — a run-relative path this event refers to, if any.
+- `--error TEXT` — an error message, typically paired with `--status failure`.
+
+```powershell
+uv run python src/app.py run log-event --run-id <run-id> `
+    --event preflight_passed --actor investment-orchestrator `
+    --details '{"ticker_id": 42, "status": "owned"}'
+uv run python src/app.py run log-event --run-id <run-id> `
+    --event analyst_dispatched --actor investment-orchestrator `
+    --details '{"ticker": "PLTR"}'
+```
+
+Keys that look like secrets (`password`, `token`, `api_key`, `prompt`, etc.)
+are dropped from `--details` before writing, the same scrubbing every audit
+event goes through (`src/workspace/audit.py`).
 
 ### `run archive`
 

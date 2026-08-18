@@ -587,6 +587,80 @@ class MergeTickersTest(unittest.TestCase):
         )
 
 
+class RenameTickerSymbolTest(unittest.TestCase):
+    """Regression coverage for `_TICKER_REFERENCING_TABLES` -- it previously
+    omitted `dividend_events`, `earnings_events`, `financial_snapshots`,
+    `position_ledger`, `position_snapshots`, and `security_status`, all of
+    which have a real `FOREIGN KEY (ticker_id) REFERENCES tickers(ticker_id)`
+    (confirmed against `duckdb_constraints()`). Renaming a ticker that had
+    rows in any of those tables raised a `ConstraintException` partway
+    through the rename -- after the placeholder ticker and the *listed*
+    tables' rows had already moved, since `_rename_ticker_symbol` runs
+    outside a transaction (see its docstring)."""
+
+    def setUp(self):
+        database.close_connection()
+        self.temp_dir = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(database.close_connection)
+        self.db_path = Path(self.temp_dir.name) / "portfolio.duckdb"
+        database.initialize_database(self.db_path)
+        self.connection = database.get_shared_connection(self.db_path)
+
+    def _insert_ticker(self, symbol, exchange="TORONTO", currency="CAD", name=None):
+        ticker_id = self.connection.execute(
+            """
+            INSERT INTO tickers (ticker_symbol, exchange, currency, security_name, security_type)
+            VALUES (?, ?, ?, ?, 'etf') RETURNING ticker_id
+            """,
+            [symbol, exchange, currency, name or f"{symbol} Fund"],
+        ).fetchone()[0]
+        return int(ticker_id)
+
+    def test_rename_moves_a_previously_omitted_table_without_raising(self):
+        ticker_id = self._insert_ticker("NVDU")
+        self.connection.execute(
+            """
+            INSERT INTO dividend_events (ticker_id, ex_dividend_date, declared_amount)
+            VALUES (?, ?, ?)
+            """,
+            [ticker_id, date(2026, 6, 1), 0.5],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO security_status (ticker_id, declared_status, declared_at, declared_by)
+            VALUES (?, 'wishlist', ?, 'test')
+            """,
+            [ticker_id, date(2026, 1, 1)],
+        )
+
+        ticker_mapping._rename_ticker_symbol(self.connection, ticker_id, "NVDU_US")
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT ticker_symbol FROM tickers WHERE ticker_id = ?", [ticker_id]
+            ).fetchone()[0],
+            "NVDU_US",
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT declared_amount FROM dividend_events WHERE ticker_id = ?", [ticker_id]
+            ).fetchone()[0],
+            0.5,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT declared_status FROM security_status WHERE ticker_id = ?", [ticker_id]
+            ).fetchone()[0],
+            "wishlist",
+        )
+        # No leftover placeholder row from the park-then-restore dance.
+        leftover = self.connection.execute(
+            "SELECT COUNT(*) FROM tickers WHERE ticker_symbol LIKE '__MERGE_HOLD%'"
+        ).fetchone()[0]
+        self.assertEqual(leftover, 0)
+
+
 class FormatTextTest(unittest.TestCase):
     def test_format_text_renders_list_of_dicts_as_table(self):
         rows = [

@@ -3,12 +3,17 @@
 // explorer, which fetches price history from the browser.
 //
 // Every response reflects the last pipeline run — the API caches the full
-// report on the DuckDB file's mtime — so we always request fresh
-// (`cache: "no-store"`) rather than layer Next's cache on top.
+// report on a database watermark that advances on every write (see
+// analytics.get_data_watermark), invalidated further on every completed
+// action job — so we always request fresh (`cache: "no-store"`) rather than
+// layer Next's cache on top.
 
 import type {
   ActionsState,
   Classifications,
+  CorrelationMatrix,
+  GroupCorrelationMatrix,
+  CorrelationWindow,
   EtfOverlap,
   Health,
   Job,
@@ -19,6 +24,8 @@ import type {
   ReportEnvelope,
   Summary,
   TrendPoint,
+  UpcomingIncome,
+  WishlistOverview,
 } from "./types";
 
 export const API_BASE =
@@ -67,6 +74,19 @@ export const getClassifications = () =>
 export const getEtfOverlap = () => getJson<EtfOverlap>("/api/etfs/overlap");
 export const getPriceHistory = (symbol: string, range: HistoryRange = "1y") =>
   getJson<PriceHistory>(`/api/stocks/${encodeURIComponent(symbol)}/history?range=${range}`);
+export const getCorrelation = (symbols: string[], window: CorrelationWindow = "1y") => {
+  const params = new URLSearchParams({ window });
+  symbols.forEach((s) => params.append("symbols", s));
+  return getJson<CorrelationMatrix>(`/api/portfolio/correlation?${params.toString()}`);
+};
+export const getGroupCorrelation = (groups: string[], window: CorrelationWindow = "1y") => {
+  const params = new URLSearchParams({ window });
+  groups.forEach((group) => params.append("groups", group));
+  return getJson<GroupCorrelationMatrix>(`/api/portfolio/group-correlation?${params.toString()}`);
+};
+export const getUpcomingIncome = (horizon = 90) =>
+  getJson<UpcomingIncome>(`/api/income/upcoming?horizon=${horizon}`);
+export const getWishlist = () => getJson<WishlistOverview>("/api/wishlist");
 
 // --- Actions -------------------------------------------------------------
 // The only calls that change state. They are browser-side (the forms are
@@ -89,7 +109,9 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
     });
   } catch {
     throw new ApiError(
-      `Cannot reach the dashboard API at ${API_BASE}. Is uvicorn running on port 8000?`,
+      `Cannot reach the dashboard API at ${API_BASE}. Is uvicorn running on port 8000, ` +
+        "and does DASHBOARD_CORS_ORIGINS on the API include this page's origin " +
+        `(${typeof window !== "undefined" ? window.location.origin : "unknown"})?`,
       0,
     );
   }

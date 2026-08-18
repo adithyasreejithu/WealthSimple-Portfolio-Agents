@@ -96,7 +96,14 @@ export interface Concentration {
 
 export interface ReportSummary {
   portfolio_value: number;
-  cash: { balance: number; source: string };
+  cash: {
+    balance: number;
+    source: string;
+    /** CAD portion of `balance` from still-provisional, unreconciled email trades. Zero once reconciled. */
+    provisional_adjustment: number;
+    /** Subset of provisional_adjustment built from a derived or missing (not 'reported') amount. */
+    estimated_adjustment: number;
+  };
   securities_value: number;
   book_cost: number;
   holdings_count: number;
@@ -161,6 +168,17 @@ export interface Report {
     transaction_count: number;
     by_month: Record<string, number>;
     totals_by_currency: Record<string, number>;
+    by_ticker: Record<
+      string,
+      {
+        ticker_id: number | null;
+        totals_by_currency: Record<string, number>;
+        trailing_12_month_by_currency: Record<string, number>;
+        transaction_count: number;
+      }
+    >;
+    /** month -> ticker_symbol -> amount, currencies summed within a cell (see by_month). */
+    by_ticker_month: Record<string, Record<string, number>>;
     trailing_12_month: {
       totals_by_currency: Record<string, number>;
       yield_on_portfolio_value: Availability & { value: number };
@@ -195,7 +213,18 @@ export interface Report {
       closed: Availability & { days: number | null };
     };
   };
-  realized_gains: { source: string; by_ticker: Record<string, number>; total_realized_gain: number };
+  realized_gains: {
+    source: string;
+    by_ticker: Record<string, number>;
+    events: {
+      event_date: string;
+      ticker_symbol: string;
+      realized_gain_cad: number;
+      /** 'reported' | 'derived_from_quantity_and_price' | 'missing' -- see config.AMOUNT_QUALITY_*. */
+      amount_quality: string;
+    }[];
+    total_realized_gain: number;
+  };
   data_quality: {
     flags: DataQualityFlag[];
     excluded_negative_positions: unknown[];
@@ -361,3 +390,128 @@ export interface Health {
 }
 
 export type HistoryRange = "1m" | "3m" | "6m" | "1y" | "3y" | "max";
+
+/** Matches config.CORRELATION_WINDOWS' keys on the API. */
+export type CorrelationWindow = "3m" | "1y" | "3y";
+
+export interface PortfolioRiskFromCovariance {
+  available: boolean;
+  reason?: string;
+  portfolio_volatility: number | null;
+  covered_weight: number | null;
+  risk_contribution: Record<string, number>;
+}
+
+export interface CorrelationMatrix {
+  available: boolean;
+  reason?: string;
+  window_days: number;
+  observations: number;
+  start_date: string | null;
+  end_date: string | null;
+  tickers: string[];
+  unavailable_tickers: string[];
+  correlation: Record<string, Record<string, number>>;
+  covariance: Record<string, Record<string, number>>;
+  /** Present only when `available`; computed server-side from `covariance` and current weights. */
+  portfolio_risk?: PortfolioRiskFromCovariance;
+}
+
+export interface GroupCorrelationMatrix extends CorrelationMatrix {
+  unavailable_groups: string[];
+  unclassified_weight: number;
+  group_metadata: Record<
+    string,
+    {
+      portfolio_weight: number;
+      constituent_coverage: number;
+      constituents: string[];
+      unavailable_constituents: string[];
+    }
+  >;
+}
+
+export interface UpcomingDividend {
+  ticker_id: number;
+  ticker_symbol: string;
+  ex_dividend_date: string;
+  pay_date: string | null;
+  declared_amount: number;
+  frequency: string | null;
+  quantity: number;
+  currency: string;
+  expected_cash: number;
+}
+
+export interface UpcomingEarnings {
+  ticker_id: number;
+  ticker_symbol: string;
+  report_date: string;
+  period: string | null;
+  eps_estimate: number | null;
+  weight: number;
+}
+
+export interface WishlistDeclaration {
+  declared_status: string;
+  rationale: string | null;
+  declared_at: string | null;
+  declared_by: string | null;
+}
+
+export interface WishlistClassification {
+  primary_group: string;
+  confidence: string | null;
+}
+
+export interface WishlistThesis {
+  fundamental_rating: string | null;
+  valuation_stance: string | null;
+  thesis_direction: string | null;
+  thesis_confidence: string | null;
+  analysis_horizon: string | null;
+  as_of: string | null;
+  generated_at: string | null;
+}
+
+export interface WishlistPolicyCheck {
+  name: string;
+  result: string;
+  detail: string;
+}
+
+export interface WishlistDecision {
+  proposed_action: string | null;
+  /** True when `proposed_action` uses the owned PortfolioAction vocabulary
+   * (Buy/Hold/Trim/Sell/Add) instead of the required WishlistAction
+   * vocabulary (Buy/Watch/Wait/Pass) for a not-currently-held security. */
+  action_vocabulary_mismatch: boolean;
+  confidence: string | null;
+  summary: string | null;
+  generated_at: string | null;
+  failing_policy_checks: WishlistPolicyCheck[];
+}
+
+export interface WishlistEntry {
+  ticker: string;
+  ticker_id: number;
+  company_name: string | null;
+  declaration: WishlistDeclaration;
+  classification: WishlistClassification | null;
+  thesis: WishlistThesis | null;
+  decision: WishlistDecision | null;
+}
+
+export interface WishlistOverview {
+  generated_at: string;
+  count: number;
+  wishlist: WishlistEntry[];
+}
+
+export interface UpcomingIncome {
+  horizon_days: number;
+  dividends: UpcomingDividend[];
+  earnings: UpcomingEarnings[];
+  totals_by_currency: Record<string, number>;
+  synced_at: { dividends: string | null; earnings: string | null };
+}

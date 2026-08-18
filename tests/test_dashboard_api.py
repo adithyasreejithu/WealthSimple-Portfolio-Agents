@@ -94,8 +94,9 @@ class ToJsonableTests(unittest.TestCase):
 
 class CorsOriginsTests(unittest.TestCase):
     def test_default_when_env_unset_or_blank(self):
-        self.assertEqual(dashboard_api.cors_origins(None), ["http://localhost:3000"])
-        self.assertEqual(dashboard_api.cors_origins("   "), ["http://localhost:3000"])
+        expected = ["http://localhost:3000", "http://127.0.0.1:3000"]
+        self.assertEqual(dashboard_api.cors_origins(None), expected)
+        self.assertEqual(dashboard_api.cors_origins("   "), expected)
 
     def test_parses_comma_separated_values_stripping_whitespace_and_empties(self):
         self.assertEqual(
@@ -109,6 +110,18 @@ class CorsOriginsTests(unittest.TestCase):
         self.assertEqual(
             response.headers.get("access-control-allow-origin"),
             "http://localhost:3000",
+        )
+
+    def test_cors_header_present_for_127_0_0_1_origin(self):
+        """A browser treats localhost:3000 and 127.0.0.1:3000 as different
+        origins even though they resolve to the same host -- both must be
+        allowed by default or the dashboard's action buttons silently fail
+        for whichever origin the dev server happened to open on."""
+        client = TestClient(dashboard_api.app)
+        response = client.get("/health", headers={"Origin": "http://127.0.0.1:3000"})
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "http://127.0.0.1:3000",
         )
 
 
@@ -268,7 +281,10 @@ class ReportEndpointTests(_EndpointTestCase):
 
     def test_first_call_computes_and_wraps_report(self):
         self._patch_database_path(exists=True)
-        with patch.object(analytics, "portfolio_report", return_value=self.report) as build:
+        with (
+            patch.object(analytics, "portfolio_report", return_value=self.report) as build,
+            patch.object(analytics, "get_data_watermark", return_value=datetime(2026, 1, 1)),
+        ):
             response = self.client.get("/api/portfolio/report")
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -277,20 +293,46 @@ class ReportEndpointTests(_EndpointTestCase):
         self.assertIn("database_mtime", body)
         build.assert_called_once_with(str(config.DATABASE_PATH))
 
-    def test_second_call_with_unchanged_mtime_serves_cache(self):
+    def test_second_call_with_unchanged_watermark_serves_cache(self):
+        """A write that only lands in the .wal sidecar never touches the main
+        file's mtime, so the cache must key off the watermark, not mtime --
+        this holds mtime constant across both calls to prove that."""
         self._patch_database_path(exists=True)
-        with patch.object(analytics, "portfolio_report", return_value=self.report) as build:
+        with (
+            patch.object(analytics, "portfolio_report", return_value=self.report) as build,
+            patch.object(analytics, "get_data_watermark", return_value=datetime(2026, 1, 1)),
+        ):
             first = self.client.get("/api/portfolio/report").json()
             second = self.client.get("/api/portfolio/report").json()
         build.assert_called_once()
         self.assertEqual(first, second)
 
-    def test_changed_mtime_triggers_recompute(self):
-        db_file = self._patch_database_path(exists=True)
-        with patch.object(analytics, "portfolio_report", return_value=self.report) as build:
+    def test_changed_watermark_triggers_recompute(self):
+        """Regression for the mtime-cache bug: the main .duckdb file's mtime
+        is held constant here (only .wal-level commits happened, the
+        realistic case between checkpoints) while the watermark advances --
+        the cache must still invalidate."""
+        self._patch_database_path(exists=True)
+        watermarks = iter([datetime(2026, 1, 1), datetime(2026, 1, 2)])
+        with (
+            patch.object(analytics, "portfolio_report", return_value=self.report) as build,
+            patch.object(analytics, "get_data_watermark", side_effect=lambda *a, **k: next(watermarks)),
+        ):
             self.client.get("/api/portfolio/report")
-            mtime = db_file.stat().st_mtime
-            os.utime(db_file, (mtime + 10, mtime + 10))
+            self.client.get("/api/portfolio/report")
+        self.assertEqual(build.call_count, 2)
+
+    def test_job_completion_invalidates_cache_even_if_watermark_has_not_moved(self):
+        """Belt-and-suspenders: `invalidate_report_cache` (called when any
+        action job finishes) must force a recompute on the very next request
+        even if the watermark query has not yet observed the write."""
+        self._patch_database_path(exists=True)
+        with (
+            patch.object(analytics, "portfolio_report", return_value=self.report) as build,
+            patch.object(analytics, "get_data_watermark", return_value=datetime(2026, 1, 1)),
+        ):
+            self.client.get("/api/portfolio/report")
+            dashboard_api.invalidate_report_cache()
             self.client.get("/api/portfolio/report")
         self.assertEqual(build.call_count, 2)
 
@@ -317,7 +359,10 @@ class ReportEndpointTests(_EndpointTestCase):
                 }
             }
         }
-        with patch.object(analytics, "portfolio_report", return_value=report):
+        with (
+            patch.object(analytics, "portfolio_report", return_value=report),
+            patch.object(analytics, "get_data_watermark", return_value=datetime(2026, 1, 1)),
+        ):
             body = self.client.get("/api/portfolio/report").json()
         point = body["report"]["performance"]["trend_overlays"]["points"][0]
         self.assertEqual(
@@ -358,6 +403,56 @@ class ClassificationsEndpointTests(_EndpointTestCase):
         payload = {"generated_at": None, "count": 0, "review_count": 0, "classifications": []}
         with patch.object(analytics, "get_classification_details", return_value=payload):
             response = self.client.get("/api/portfolio/classifications")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+
+
+class WishlistEndpointTests(_EndpointTestCase):
+    def test_returns_wishlist_overview(self):
+        payload = {
+            "generated_at": "2026-08-17T00:00:00",
+            "count": 1,
+            "wishlist": [
+                {
+                    "ticker": "BSX",
+                    "ticker_id": 1,
+                    "company_name": "Boston Scientific Corporation",
+                    "declaration": {
+                        "declared_status": "wishlist",
+                        "rationale": "medical device research candidate",
+                        "declared_at": "2026-08-15T13:40:27",
+                        "declared_by": "cli",
+                    },
+                    "classification": {"primary_group": "Quality", "confidence": "low"},
+                    "thesis": {
+                        "fundamental_rating": "neutral",
+                        "valuation_stance": "indeterminate",
+                        "thesis_direction": "initial",
+                        "thesis_confidence": "low",
+                        "analysis_horizon": "Medium-term",
+                        "as_of": "2026-08-16T18:05:00Z",
+                        "generated_at": "2026-08-16T18:05:00Z",
+                    },
+                    "decision": {
+                        "proposed_action": "Pass",
+                        "action_vocabulary_mismatch": False,
+                        "confidence": "low",
+                        "summary": "test summary",
+                        "generated_at": "2026-08-16T18:10:00Z",
+                        "failing_policy_checks": [],
+                    },
+                }
+            ],
+        }
+        with patch.object(analytics, "get_wishlist_overview", return_value=payload):
+            response = self.client.get("/api/wishlist")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+
+    def test_empty_wishlist_returns_empty_list(self):
+        payload = {"generated_at": "2026-08-17T00:00:00", "count": 0, "wishlist": []}
+        with patch.object(analytics, "get_wishlist_overview", return_value=payload):
+            response = self.client.get("/api/wishlist")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), payload)
 
@@ -415,6 +510,177 @@ class EtfOverlapEndpointTests(_EndpointTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["available"])
         self.assertIn("two", response.json()["reason"])
+
+
+class CorrelationEndpointTests(_EndpointTestCase):
+    def _matrix(self, **overrides) -> dict:
+        matrix = {
+            "available": True,
+            "window_days": 252,
+            "observations": 200,
+            "start_date": date(2025, 1, 2),
+            "end_date": date(2026, 1, 2),
+            "tickers": ["AAA", "BBB"],
+            "unavailable_tickers": [],
+            "correlation": {"AAA": {"AAA": 1.0, "BBB": 0.4}, "BBB": {"AAA": 0.4, "BBB": 1.0}},
+            "covariance": {"AAA": {"AAA": 0.04, "BBB": 0.01}, "BBB": {"AAA": 0.01, "BBB": 0.09}},
+        }
+        matrix.update(overrides)
+        return matrix
+
+    def test_returns_matrix_with_portfolio_risk_appended(self):
+        holdings = [_make_holding("AAA", "600"), _make_holding("BBB", "400", ticker_id=2)]
+        risk = {
+            "available": True,
+            "portfolio_volatility": 0.18,
+            "covered_weight": 1.0,
+            "risk_contribution": {"AAA": 0.1, "BBB": 0.08},
+        }
+        with (
+            patch.object(analytics, "get_return_correlation", return_value=self._matrix()) as get_corr,
+            patch.object(analytics, "get_holdings", return_value=holdings),
+            patch.object(analytics, "get_portfolio_volatility_from_covariance", return_value=risk) as get_risk,
+        ):
+            response = self.client.get("/api/portfolio/correlation?window=1y&symbols=AAA&symbols=BBB")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["available"])
+        self.assertEqual(body["tickers"], ["AAA", "BBB"])
+        self.assertEqual(body["start_date"], "2025-01-02")
+        self.assertEqual(body["portfolio_risk"]["portfolio_volatility"], 0.18)
+        _, kwargs = get_corr.call_args
+        self.assertEqual(kwargs["symbols"], ["AAA", "BBB"])
+        self.assertEqual(kwargs["window_days"], 252)
+        # Weights passed to the volatility helper are current-portfolio
+        # weights among the tickers actually in the matrix, not the raw
+        # covariance keys.
+        weights_arg = get_risk.call_args.args[1]
+        self.assertAlmostEqual(weights_arg["AAA"], 0.6)
+        self.assertAlmostEqual(weights_arg["BBB"], 0.4)
+
+    def test_symbols_omitted_passes_none_and_default_window_is_one_year(self):
+        with (
+            patch.object(analytics, "get_return_correlation", return_value=self._matrix()) as get_corr,
+            patch.object(analytics, "get_holdings", return_value=[]),
+        ):
+            response = self.client.get("/api/portfolio/correlation")
+        self.assertEqual(response.status_code, 200)
+        _, kwargs = get_corr.call_args
+        self.assertIsNone(kwargs["symbols"])
+        self.assertEqual(kwargs["window_days"], config.CORRELATION_WINDOWS["1y"])
+
+    def test_unavailable_matrix_skips_the_portfolio_risk_lookup(self):
+        unavailable = {
+            "available": False,
+            "reason": "No symbols requested.",
+            "window_days": 252,
+            "observations": 0,
+            "start_date": None,
+            "end_date": None,
+            "tickers": [],
+            "unavailable_tickers": [],
+            "correlation": {},
+            "covariance": {},
+        }
+        with (
+            patch.object(analytics, "get_return_correlation", return_value=unavailable),
+            patch.object(analytics, "get_holdings") as get_holdings,
+        ):
+            response = self.client.get("/api/portfolio/correlation")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["available"])
+        self.assertNotIn("portfolio_risk", body)
+        get_holdings.assert_not_called()
+
+    def test_invalid_window_returns_422(self):
+        with patch.object(analytics, "get_return_correlation") as get_corr:
+            response = self.client.get("/api/portfolio/correlation?window=6m")
+        self.assertEqual(response.status_code, 422)
+        get_corr.assert_not_called()
+
+    def test_group_correlation_appends_risk_using_group_weights(self):
+        matrix = self._matrix(
+            tickers=["Core", "Growth"],
+            correlation={"Core": {"Core": 1.0, "Growth": 0.4}, "Growth": {"Core": 0.4, "Growth": 1.0}},
+            covariance={"Core": {"Core": 0.04, "Growth": 0.01}, "Growth": {"Core": 0.01, "Growth": 0.09}},
+            unavailable_groups=[],
+            group_metadata={
+                "Core": {"portfolio_weight": 0.7, "constituent_coverage": 1.0, "constituents": ["AAA"], "unavailable_constituents": []},
+                "Growth": {"portfolio_weight": 0.3, "constituent_coverage": 1.0, "constituents": ["BBB"], "unavailable_constituents": []},
+            },
+            unclassified_weight=0.0,
+        )
+        risk = {"available": True, "portfolio_volatility": 0.15, "covered_weight": 1.0, "risk_contribution": {"Core": 0.1, "Growth": 0.05}}
+        with (
+            patch.object(analytics, "get_group_return_correlation", return_value=matrix) as get_groups,
+            patch.object(analytics, "get_portfolio_volatility_from_covariance", return_value=risk) as get_risk,
+        ):
+            response = self.client.get("/api/portfolio/group-correlation?window=3m&groups=Core&groups=Growth")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["portfolio_risk"]["portfolio_volatility"], 0.15)
+        self.assertEqual(get_groups.call_args.kwargs["groups"], ["Core", "Growth"])
+        self.assertEqual(get_groups.call_args.kwargs["window_days"], config.CORRELATION_WINDOWS["3m"])
+        self.assertEqual(get_risk.call_args.args[1], {"Core": 0.7, "Growth": 0.3})
+
+    def test_group_correlation_invalid_window_returns_422(self):
+        with patch.object(analytics, "get_group_return_correlation") as get_groups:
+            response = self.client.get("/api/portfolio/group-correlation?window=6m")
+        self.assertEqual(response.status_code, 422)
+        get_groups.assert_not_called()
+
+
+class UpcomingIncomeEndpointTests(_EndpointTestCase):
+    def test_returns_events_with_default_horizon(self):
+        payload = {
+            "horizon_days": 90,
+            "dividends": [
+                {
+                    "ticker_id": 1,
+                    "ticker_symbol": "AAPL",
+                    "ex_dividend_date": date(2026, 9, 15),
+                    "pay_date": date(2026, 9, 30),
+                    "declared_amount": Decimal("0.26"),
+                    "frequency": "quarterly",
+                    "quantity": Decimal("10"),
+                    "currency": "USD",
+                    "expected_cash": Decimal("2.60"),
+                }
+            ],
+            "earnings": [],
+            "totals_by_currency": {"USD": Decimal("2.60")},
+            "synced_at": {"dividends": "2026-08-01T00:00:00", "earnings": None},
+        }
+        with patch.object(analytics, "get_upcoming_income_events", return_value=payload) as fetch:
+            response = self.client.get("/api/income/upcoming")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["dividends"][0]["expected_cash"], 2.6)
+        self.assertEqual(body["dividends"][0]["ex_dividend_date"], "2026-09-15")
+        self.assertIsNone(body["synced_at"]["earnings"])
+        fetch.assert_called_once_with(str(config.DATABASE_PATH), horizon_days=90)
+
+    def test_custom_horizon_is_forwarded(self):
+        empty = {
+            "horizon_days": 30,
+            "dividends": [],
+            "earnings": [],
+            "totals_by_currency": {},
+            "synced_at": {"dividends": None, "earnings": None},
+        }
+        with patch.object(analytics, "get_upcoming_income_events", return_value=empty) as fetch:
+            response = self.client.get("/api/income/upcoming?horizon=30")
+        self.assertEqual(response.status_code, 200)
+        fetch.assert_called_once_with(str(config.DATABASE_PATH), horizon_days=30)
+
+    def test_horizon_out_of_range_returns_422(self):
+        with patch.object(analytics, "get_upcoming_income_events") as fetch:
+            response = self.client.get("/api/income/upcoming?horizon=400")
+        self.assertEqual(response.status_code, 422)
+        fetch.assert_not_called()
 
 
 class StockHistoryEndpointTests(_EndpointTestCase):
@@ -604,6 +870,7 @@ class ActionEndpointTests(_EndpointTestCase):
                 return_value=retry_results,
             ) as retry,
             patch.object(dashboard_api.runner, "submit", side_effect=fake_submit),
+            patch.object(dashboard_api, "_classify_and_sync", return_value={"steps": []}) as classify,
         ):
             response = self.client.post(
                 "/api/actions/resolve-ticker", json=body, headers=self.headers
@@ -611,9 +878,11 @@ class ActionEndpointTests(_EndpointTestCase):
 
         self.assertEqual(response.status_code, 202)
         retry.assert_called_once_with("MDA", db_path=dashboard_api.db_path())
+        classify.assert_called_once()
         result = response.json()["result"]
         self.assertEqual(result["source_symbol"], "MDA")
         self.assertEqual(result["export_retry"][0]["status"], "succeeded")
+        self.assertEqual(result["classification"], {"steps": []})
 
     def test_retry_ticker_action_queues_a_job(self):
         with patch.object(dashboard_api.runner, "submit") as submit:
@@ -670,15 +939,32 @@ class RunCliTests(unittest.TestCase):
 
         self.assertIn("boom: missing input", str(raised.exception))
 
-    def test_classify_action_runs_workflow_then_sync_in_order(self):
+    def test_nonzero_exit_includes_both_stdout_summary_and_stderr(self):
+        """`_print_pipeline_results`'s structured per-domain summary lands on
+        stdout even on failure -- it must not be discarded in favor of raw
+        stderr noise, so the dashboard's failure toast stays diagnostic."""
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="market-data: degraded (5 row(s)) - history fetch failed for: XNDU\n"
+            "financial-snapshots: failed (0 row(s)) - provider down\n",
+            stderr="HTTP Error 404: No fundamentals data found for symbol: LYTE",
+        )
+        with patch.object(dashboard_api.database, "close_connection"):
+            with patch.object(dashboard_api.subprocess, "run", return_value=completed):
+                with self.assertRaises(RuntimeError) as raised:
+                    dashboard_api._run_cli("pipeline")
+
+        message = str(raised.exception)
+        self.assertIn("financial-snapshots: failed", message)
+        self.assertIn("HTTP Error 404", message)
+
+    def test_classify_action_runs_the_standalone_classify_command(self):
         with patch.object(dashboard_api, "_run_cli", side_effect=lambda *a: {"command": " ".join(a)}) as cli:
             result = dashboard_api._classify_and_sync()
 
-        self.assertEqual(
-            [call.args for call in cli.call_args_list],
-            [("portfolio-classify",), ("classification-sync",)],
-        )
-        self.assertEqual(len(result["steps"]), 2)
+        self.assertEqual([call.args for call in cli.call_args_list], [("classify",)])
+        self.assertEqual(len(result["steps"]), 1)
 
 
 class StartupTests(unittest.TestCase):

@@ -30,15 +30,20 @@ Because job state lives in memory, run a single uvicorn worker.
 Configuration:
     DB_PATH                  DuckDB file to serve (default Data/PRD_WealthSimple.duckdb)
     DASHBOARD_CORS_ORIGINS   comma-separated allowed origins
-                             (default http://localhost:3000)
+                             (default http://localhost:3000, http://127.0.0.1:3000)
     DASHBOARD_ACTION_TOKEN   bearer token required for POST /api/actions/*
                              (unset = loopback-only actions)
 
 `/api/portfolio/report` recomputes the full `analytics.portfolio_report`
-on demand, cached against the database file's modification time — it is
-rebuilt at most once per pipeline run, so the dashboard is never stale
-relative to the pipeline and no manual `analytics --export` step is needed.
-An action that rewrites the database therefore invalidates the cache for free.
+on demand, cached against a DB-side data watermark
+(`analytics.get_data_watermark`) rather than the database file's modification
+time -- DuckDB commits land in the `.wal` sidecar and only touch the main
+file's mtime at checkpoint, so an mtime key could serve a stale report
+indefinitely between checkpoints. It is rebuilt at most once per pipeline
+run, so the dashboard is never stale relative to the pipeline and no manual
+`analytics --export` step is needed. Every `POST /api/actions/*` job also
+invalidates the cache directly on completion (`invalidate_report_cache`),
+belt-and-suspenders alongside the watermark key.
 """
 
 from __future__ import annotations
@@ -71,12 +76,20 @@ import database  # noqa: E402
 import manual_overrides  # noqa: E402
 import ticker_mapping  # noqa: E402
 from jobs import Job, JobBusyError, JobRunner  # noqa: E402
+from system_logger import get_logger  # noqa: E402
+
+logger = get_logger(__name__)
 
 
 def cors_origins(raw: str | None) -> list[str]:
-    """Parse DASHBOARD_CORS_ORIGINS (comma-separated) with a localhost default."""
+    """Parse DASHBOARD_CORS_ORIGINS (comma-separated) with a localhost default.
+
+    Both localhost and 127.0.0.1 are allowed by default -- a browser treats
+    them as different origins even though they resolve to the same host, and
+    the dev server or a bookmark can land on either one.
+    """
     if raw is None or not raw.strip():
-        return ["http://localhost:3000"]
+        return ["http://localhost:3000", "http://127.0.0.1:3000"]
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
@@ -89,6 +102,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "DuckDB file. Refusing to start so an empty database is not "
             "silently created."
         )
+    token_mode = "bearer token" if os.getenv("DASHBOARD_ACTION_TOKEN", "").strip() else "loopback-only"
+    logger.info(
+        "Dashboard API starting | cors_origins=%s | action_auth=%s | database=%s",
+        cors_origins(os.getenv("DASHBOARD_CORS_ORIGINS")),
+        token_mode,
+        config.DATABASE_PATH,
+    )
     yield
     database.close_connection()
 
@@ -184,6 +204,18 @@ _report_cache: dict[str, Any] = {}
 _report_lock = threading.Lock()
 
 
+def invalidate_report_cache() -> None:
+    """Drop the cached `/api/portfolio/report` payload.
+
+    Called whenever a job finishes, so a dashboard-initiated refresh/classify
+    always publishes on its very next request instead of waiting for the
+    watermark query to notice (belt-and-suspenders alongside the watermark
+    key below).
+    """
+    with _report_lock:
+        _report_cache.clear()
+
+
 @app.get("/api/portfolio/report")
 def portfolio_report() -> dict[str, Any]:
     database_path = config.DATABASE_PATH
@@ -193,17 +225,26 @@ def portfolio_report() -> dict[str, Any]:
             detail=f"Database not found at {database_path}. "
             "Run the ingestion pipeline, or point DB_PATH at an existing DuckDB file.",
         )
-    mtime = database_path.stat().st_mtime
     with _report_lock:
-        if _report_cache.get("mtime") != mtime:
+        with _db_lock:
+            # Keyed on a DB-side watermark (analytics.get_data_watermark), not
+            # the main .duckdb file's mtime: DuckDB commits land in the .wal
+            # sidecar first and only touch the main file's mtime at
+            # checkpoint, so an mtime key can serve a stale report
+            # indefinitely between checkpoints even though new rows are
+            # already committed and queryable.
+            watermark = analytics.get_data_watermark(db_path())
+        watermark_key = watermark.isoformat() if watermark is not None else None
+        if _report_cache.get("watermark") != watermark_key:
             with _db_lock:
                 report = to_jsonable(analytics.portfolio_report(db_path()))
+            mtime = database_path.stat().st_mtime
             _report_cache["payload"] = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "database_mtime": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
                 "report": report,
             }
-            _report_cache["mtime"] = mtime
+            _report_cache["watermark"] = watermark_key
         return _report_cache["payload"]
 
 
@@ -214,11 +255,90 @@ def portfolio_classifications() -> dict[str, Any]:
         return to_jsonable(analytics.get_classification_details(db_path()))
 
 
+@app.get("/api/wishlist")
+def wishlist() -> dict[str, Any]:
+    """Declared-wishlist tickers with status, classification, and the latest
+    agent research verdict recorded for them under `workspace/runs/*`."""
+    with _db_lock:
+        return to_jsonable(analytics.get_wishlist_overview(db_path()))
+
+
 @app.get("/api/etfs/overlap")
 def etf_overlap() -> dict[str, Any]:
     """How much of the ETF sleeve sits in underlying names more than one fund holds."""
     with _db_lock:
         return to_jsonable(analytics.get_etf_overlap(db_path()))
+
+
+@app.get("/api/portfolio/correlation")
+def portfolio_correlation(
+    symbols: list[str] | None = Query(
+        None, description="Ticker symbols to include, repeated (?symbols=A&symbols=B). Omit for all current holdings."
+    ),
+    window: str = Query("1y", description=f"One of: {', '.join(config.CORRELATION_WINDOWS)}"),
+) -> dict[str, Any]:
+    """Pairwise return correlation/covariance, plus current-weight portfolio volatility.
+
+    Not folded into `/api/portfolio/report`: a full matrix is tens of KB and
+    every route already fetches that report. Local-currency returns -- see
+    `analytics.get_return_correlation` for why CAD conversion is deliberately
+    skipped here.
+    """
+    if window not in config.CORRELATION_WINDOWS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid window '{window}'. Expected one of: {', '.join(config.CORRELATION_WINDOWS)}.",
+        )
+    window_days = config.CORRELATION_WINDOWS[window]
+    with _db_lock:
+        matrix = analytics.get_return_correlation(db_path(), symbols=symbols, window_days=window_days)
+        result = to_jsonable(matrix)
+        if matrix["available"]:
+            holdings = analytics.get_holdings(db_path())
+            total_value = sum((h.market_value for h in holdings), start=Decimal("0"))
+            weights = {
+                h.ticker_symbol.upper(): float(h.market_value / total_value)
+                for h in holdings
+                if total_value > 0
+            }
+            result["portfolio_risk"] = to_jsonable(
+                analytics.get_portfolio_volatility_from_covariance(matrix["covariance"], weights)
+            )
+        return result
+
+
+@app.get("/api/portfolio/group-correlation")
+def portfolio_group_correlation(
+    groups: list[str] | None = Query(None, description="Classification groups to compare, repeated. Omit for all groups."),
+    window: str = Query("1y", description=f"One of: {', '.join(config.CORRELATION_WINDOWS)}"),
+) -> dict[str, Any]:
+    """Current-weight classification-group basket correlation and risk."""
+    if window not in config.CORRELATION_WINDOWS:
+        raise HTTPException(status_code=422, detail=f"Invalid window '{window}'. Expected one of: {', '.join(config.CORRELATION_WINDOWS)}.")
+    with _db_lock:
+        matrix = analytics.get_group_return_correlation(db_path(), groups=groups, window_days=config.CORRELATION_WINDOWS[window])
+        result = to_jsonable(matrix)
+        if matrix["available"]:
+            weights = {group: meta["portfolio_weight"] for group, meta in matrix["group_metadata"].items()}
+            result["portfolio_risk"] = to_jsonable(analytics.get_portfolio_volatility_from_covariance(matrix["covariance"], weights))
+        return result
+
+
+@app.get("/api/income/upcoming")
+def income_upcoming(
+    horizon: int = Query(90, ge=1, le=365, description="Forward-looking window in days."),
+) -> dict[str, Any]:
+    """Upcoming dividend and earnings events for currently-held tickers.
+
+    Filtered by `CURRENT_DATE`, so deliberately not served from
+    `/api/portfolio/report`'s mtime-cached payload -- that cache can be days
+    old and would silently go stale behind a date filter while still looking
+    fresh. See `analytics.get_upcoming_income_events` for the `synced_at`
+    staleness fields this depends on, since the underlying sync is on-demand
+    only.
+    """
+    with _db_lock:
+        return to_jsonable(analytics.get_upcoming_income_events(db_path(), horizon_days=horizon))
 
 
 # Range keyword -> lookback window for the per-ticker price series. `max` (no
@@ -276,10 +396,16 @@ def require_action_auth(request: Request) -> None:
         header = request.headers.get("authorization", "")
         supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
         if not supplied or not secrets.compare_digest(supplied, token):
+            logger.warning("Action request rejected | reason=invalid_token | path=%s", request.url.path)
             raise HTTPException(status_code=401, detail="A valid action token is required.")
         return
     client_host = request.client.host if request.client else None
     if client_host not in _LOOPBACK_HOSTS:
+        logger.warning(
+            "Action request rejected | reason=non_loopback | client=%s | path=%s",
+            client_host,
+            request.url.path,
+        )
         raise HTTPException(
             status_code=403,
             detail=(
@@ -312,9 +438,22 @@ class RetryTickerRequest(BaseModel):
 
 
 def _submit(kind: str, work: Any) -> dict[str, Any]:
-    """Queue an action, mapping the single-flight rule onto HTTP 409."""
+    """Queue an action, mapping the single-flight rule onto HTTP 409.
+
+    Every action writes the database, so the cached report is invalidated the
+    moment the job's work finishes -- on top of the watermark key in
+    `portfolio_report`, this guarantees the very next poll after a job
+    succeeds sees fresh data even if the watermark query races the write.
+    """
+
+    def tracked_work() -> Any:
+        try:
+            return work()
+        finally:
+            invalidate_report_cache()
+
     try:
-        return runner.submit(kind, work).to_dict()
+        return runner.submit(kind, tracked_work).to_dict()
     except JobBusyError as exc:
         raise HTTPException(
             status_code=409,
@@ -341,19 +480,24 @@ def _run_cli(*args: str) -> dict[str, Any]:
         )
     output = (completed.stdout or "").strip()
     if completed.returncode != 0:
-        detail = (completed.stderr or "").strip() or output or "no output"
+        # stdout carries `_print_pipeline_results`'s structured per-domain
+        # summary (which stage failed, how many rows, which symbols) -- put
+        # it first so the dashboard's failure toast is actually diagnostic,
+        # with a trimmed stderr tail after it for raw provider errors.
+        stderr_tail = (completed.stderr or "").strip()[-2000:]
+        detail = "\n\n".join(part for part in (output, stderr_tail) if part) or "no output"
         raise RuntimeError(f"`app.py {' '.join(args)}` exited {completed.returncode}: {detail}")
     return {"command": " ".join(args), "output": output[-2000:]}
 
 
 def _classify_and_sync() -> dict[str, Any]:
-    """Re-run classification, then persist it — the two CLI steps, in order."""
-    return {
-        "steps": [
-            _run_cli("portfolio-classify"),
-            _run_cli("classification-sync"),
-        ]
-    }
+    """Re-run classification and persist it via the standalone `classify` command.
+
+    Classification is not part of `pipeline` (see `run_pipeline`'s docstring
+    in src/app.py) -- it is its own CLI command, so the two lower-level steps
+    (`portfolio-classify` + `classification-sync`) collapse into this one.
+    """
+    return {"steps": [_run_cli("classify")]}
 
 
 @app.post("/api/actions/classify", status_code=202, dependencies=[ActionAuth])
@@ -394,7 +538,9 @@ def action_resolve_ticker(payload: ResolveTickerRequest) -> dict[str, Any]:
     Also retries any export data already quarantined on this symbol in the
     same click, using the mapping just saved -- so the common case (the
     source file is still on disk) clears the pending list immediately
-    instead of leaving the user to press a second button.
+    instead of leaving the user to press a second button. Then reclassifies,
+    matching action_override -- resolving a ticker always introduces a
+    holding that has never been classified, exactly the LYTE gap this closes.
     """
 
     def work() -> dict[str, Any]:
@@ -414,7 +560,8 @@ def action_resolve_ticker(payload: ResolveTickerRequest) -> dict[str, Any]:
                     payload.source_symbol, db_path=db_path()
                 )
             )
-            return resolved
+        resolved["classification"] = _classify_and_sync()
+        return resolved
 
     return _submit("resolve-ticker", work)
 

@@ -70,6 +70,19 @@ decision_rules:
         assign_primary_group: Growth
         confidence: high
 
+      - id: leveraged_or_inverse_trading_etf_to_growth
+        when:
+          asset_class: ETF
+          etf_category_any:
+            - Trading--Leveraged Equity
+            - Trading--Inverse Equity
+            - Trading--Leveraged Commodities
+            - Trading--Inverse Commodities
+            - Trading--Leveraged Debt
+            - Trading--Inverse Debt
+        assign_primary_group: Growth
+        confidence: medium
+
       - id: gold_or_commodity_to_alternatives
         when:
           asset_class_any:

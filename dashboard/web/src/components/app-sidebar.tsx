@@ -8,7 +8,9 @@ import {
   LayoutDashboard,
   Layers,
   PiggyBank,
+  Radar,
   ShieldAlert,
+  Star,
 } from "lucide-react";
 
 import {
@@ -28,7 +30,9 @@ const NAV = [
   { title: "Portfolio", href: "/portfolio", icon: BarChart3 },
   { title: "Stocks", href: "/stocks", icon: CandlestickChart },
   { title: "ETFs", href: "/etfs", icon: Layers },
+  { title: "Risk", href: "/risk", icon: Radar },
   { title: "Income", href: "/income", icon: PiggyBank },
+  { title: "Wishlist", href: "/wishlist", icon: Star },
   { title: "Data Quality", href: "/data-quality", icon: ShieldAlert },
 ];
 
