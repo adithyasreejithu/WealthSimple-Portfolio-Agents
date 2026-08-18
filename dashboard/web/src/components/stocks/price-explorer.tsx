@@ -37,37 +37,33 @@ export function PriceExplorer({ initialSymbol, symbols }: PriceExplorerProps) {
   const [symbol, setSymbol] = useState(initialSymbol);
   const [range, setRange] = useState<HistoryRange>("1y");
   const [compare, setCompare] = useState(false);
-  const [primary, setPrimary] = useState<PriceHistory | null>(null);
-  const [benchmark, setBenchmark] = useState<PriceHistory | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
   const showBenchmark = compare && symbol.toUpperCase() !== BENCHMARK;
+  const requestKey = `${symbol}-${range}-${showBenchmark}`;
+  const [result, setResult] = useState<{ key: string; primary: PriceHistory | null; benchmark: PriceHistory | null; error: string | null } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
-    setError(null);
-    const jobs: Promise<unknown>[] = [
-      getPriceHistory(symbol, range).then((d) => !cancelled && setPrimary(d)),
-    ];
-    if (showBenchmark) {
-      jobs.push(getPriceHistory(BENCHMARK, range).then((d) => !cancelled && setBenchmark(d)));
-    } else {
-      setBenchmark(null);
-    }
-    Promise.all(jobs)
+    Promise.all([
+      getPriceHistory(symbol, range),
+      showBenchmark ? getPriceHistory(BENCHMARK, range) : Promise.resolve(null),
+    ])
+      .then(([primary, benchmark]) => !cancelled && setResult({ key: requestKey, primary, benchmark, error: null }))
       .catch((e) => {
         if (cancelled) return;
         const message = e instanceof Error ? e.message : "Failed to load prices";
-        setError(message);
+        setResult((previous) => ({ key: requestKey, primary: previous?.primary ?? null, benchmark: null, error: message }));
         toast.error(`Couldn't load ${symbol} prices`, { description: message });
-      })
-      .finally(() => !cancelled && setLoading(false));
+      });
     return () => {
       cancelled = true;
     };
-  }, [symbol, range, showBenchmark]);
+  }, [symbol, range, showBenchmark, requestKey]);
+
+  const current = result?.key === requestKey ? result : null;
+  const primary = current?.primary ?? null;
+  const benchmark = current?.benchmark ?? null;
+  const error = current?.error ?? null;
+  const loading = current === null;
 
   const { chartData, config, indexed } = useMemo<{
     chartData: IndexedPoint[];

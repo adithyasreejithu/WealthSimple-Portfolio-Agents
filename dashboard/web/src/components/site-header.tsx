@@ -1,5 +1,6 @@
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
+import { RefreshButtons } from "@/components/actions/refresh-buttons";
 import { FreshnessBadge } from "@/components/freshness-badge";
 import { PageTitle } from "@/components/page-title";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -42,6 +43,7 @@ export async function SiteHeader() {
       <PageTitle />
       <div className="ml-auto flex items-center gap-2">
         {freshness ? <FreshnessBadge {...freshness} /> : null}
+        <RefreshButtons />
         <ThemeToggle />
       </div>
     </header>

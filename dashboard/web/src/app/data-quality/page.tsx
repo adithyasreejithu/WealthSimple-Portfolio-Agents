@@ -4,7 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { FlagsTable } from "@/components/tables/flags-table";
 import { ClassifyDialog } from "@/components/actions/classify-dialog";
-import { RefreshButtons } from "@/components/actions/refresh-buttons";
+import { ClassifyActionButton } from "@/components/actions/classify-action-button";
 import { ResolveTickerForm } from "@/components/actions/resolve-ticker-form";
 import { getClassifications, getHealth, getPendingTickers, getReport } from "@/lib/api";
 import { ASSIGNABLE_GROUPS } from "@/lib/derive";
@@ -32,6 +32,16 @@ export default async function DataQualityPage() {
 
   const provisional = report.holdings.filter((h) => h.has_provisional_activity);
   const review = classifications?.classifications.filter((c) => c.review_needed) ?? [];
+  // A holding with no portfolio_classifications row at all can never appear in
+  // `classifications.classifications` (that list is built by joining FROM the
+  // table) or in `review` above, so it needs its own diff against the report's
+  // holdings -- this is the only place an unclassified holding is reachable
+  // with a Classify action, matching the unclassified_holding data-quality flag.
+  const classifiedIds = new Set((classifications?.classifications ?? []).map((c) => c.ticker_id));
+  const unclassified = report.holdings.filter((h) => !classifiedIds.has(h.ticker_id));
+  const classificationStale = Boolean(
+    classifications?.generated_at && new Date(classifications.generated_at) < new Date(database_mtime),
+  );
 
   return (
     <div className="space-y-4">
@@ -53,19 +63,6 @@ export default async function DataQualityPage() {
       </div>
 
       <Card>
-        <CardHeader className="flex-row items-center justify-between">
-          <CardTitle>Pipeline actions</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          <RefreshButtons />
-          <p className="text-muted-foreground text-xs">
-            Equivalent to <code>app.py portfolio-classify</code> + <code>classification-sync</code>{" "}
-            and <code>app.py pipeline</code>. One runs at a time.
-          </p>
-        </CardContent>
-      </Card>
-
-      <Card>
         <CardHeader>
           <CardTitle>Data-quality flags</CardTitle>
         </CardHeader>
@@ -73,6 +70,30 @@ export default async function DataQualityPage() {
           <FlagsTable flags={flags} />
         </CardContent>
       </Card>
+
+      {unclassified.length ? (
+        <Card className="border-amber-500/50">
+          <CardHeader>
+            <CardTitle>Unclassified holdings</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ul className="space-y-3 text-sm">
+              {unclassified.map((h) => (
+                <li key={h.ticker_id} className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <span className="font-medium">{h.ticker_symbol}</span>
+                    <p className="text-muted-foreground text-xs">
+                      No portfolio_classifications row for this ticker -- excluded from group
+                      allocation until it is classified.
+                    </p>
+                  </div>
+                  <ClassifyActionButton />
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      ) : null}
 
       {pendingTickers.length ? (
         <Card>
@@ -173,6 +194,15 @@ export default async function DataQualityPage() {
       <p className="text-muted-foreground text-xs">
         Cash source: {report.summary.cash.source} · Database updated {fmtDateTime(database_mtime)}
         {health ? ` · ${health.database}` : ""}
+        {classifications?.generated_at ? (
+          <>
+            {" · Classification data "}
+            {fmtDateTime(classifications.generated_at)}
+            {classificationStale ? (
+              <span className="text-amber-500"> (older than the database -- run classification)</span>
+            ) : null}
+          </>
+        ) : null}
       </p>
     </div>
   );

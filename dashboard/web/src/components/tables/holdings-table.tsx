@@ -79,11 +79,6 @@ export function HoldingsTable({ rows }: { rows: HoldingRow[] }) {
         ),
       },
       {
-        accessorKey: "group",
-        header: "Group",
-        cell: ({ getValue }) => getValue<string>() ?? "—",
-      },
-      {
         accessorKey: "weight",
         header: sortHeader("Weight", "right"),
         cell: ({ getValue }) => <div className="text-right tabular-nums">{fmtPct(getValue<number>())}</div>,
@@ -109,6 +104,11 @@ export function HoldingsTable({ rows }: { rows: HoldingRow[] }) {
           const v = getValue<number | null>();
           return <div className={`text-right tabular-nums ${signClass(v)}`}>{v === null ? "—" : fmtSignedPct(v)}</div>;
         },
+      },
+      {
+        accessorKey: "group",
+        header: "Group",
+        cell: ({ getValue }) => getValue<string>() ?? "—",
       },
       {
         accessorKey: "confidence",

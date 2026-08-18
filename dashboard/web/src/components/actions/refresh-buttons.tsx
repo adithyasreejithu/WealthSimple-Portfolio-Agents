@@ -8,9 +8,11 @@ import { useAction } from "@/lib/use-action";
 import type { Job } from "@/lib/types";
 
 /**
- * Kick off the two pipeline commands from the browser. The API runs one job at
- * a time, so both buttons disable while anything is in flight — including a
- * job started from another tab, which is what the initial poll picks up.
+ * Kick off the two standalone commands (`classify`, `pipeline`) from the
+ * browser. Rendered in the site header, so it appears on every page next to
+ * the freshness badge. The API runs one job at a time, so both buttons
+ * disable while anything is in flight — including a job started from
+ * another tab or page, which is what the initial poll picks up.
  */
 export function RefreshButtons() {
   const { run, running } = useAction();
@@ -38,12 +40,12 @@ export function RefreshButtons() {
         disabled={busy}
         onClick={() =>
           run(postClassify, {
-            pending: "Re-classifying holdings…",
+            pending: "Running classification…",
             success: "Classification updated",
           })
         }
       >
-        Re-classify
+        Run Classification
       </Button>
       <Button
         variant="outline"
@@ -51,12 +53,12 @@ export function RefreshButtons() {
         disabled={busy}
         onClick={() =>
           run(postRefresh, {
-            pending: "Running the pipeline…",
+            pending: "Running the data pipeline…",
             success: "Pipeline finished",
           })
         }
       >
-        Run pipeline
+        Run Data Pipeline
       </Button>
       {active ? (
         <span className="text-muted-foreground text-xs">

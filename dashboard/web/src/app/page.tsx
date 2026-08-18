@@ -102,7 +102,11 @@ export default async function OverviewPage() {
         <KpiCard
           label="Cash Balance"
           value={fmtCad(summary.cash.balance)}
-          sub={summary.cash.source.replace(/_/g, " ")}
+          sub={
+            summary.cash.provisional_adjustment !== 0
+              ? `${summary.cash.source.replace(/_/g, " ")} · incl. ${fmtCad(summary.cash.provisional_adjustment)} from unreconciled email trades`
+              : summary.cash.source.replace(/_/g, " ")
+          }
           subClassName="text-muted-foreground"
         />
       </div>

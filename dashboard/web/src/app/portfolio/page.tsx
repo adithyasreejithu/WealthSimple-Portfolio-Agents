@@ -281,7 +281,7 @@ export default async function PortfolioPage() {
               </span>
             </CardHeader>
             <CardContent>
-              <RealizedTable byTicker={realized_gains.by_ticker} />
+              <RealizedTable events={realized_gains.events} />
             </CardContent>
           </Card>
         </div>
